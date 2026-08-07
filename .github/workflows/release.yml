@@ -1,0 +1,53 @@
+name: Publish verified release to PyPI
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: startsWith(github.event.release.tag_name, 'v')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/didimlog
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Require an immutable published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ github.event.release.id }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          immutable="$(gh api "repos/${REPOSITORY}/releases/${RELEASE_ID}" --jq '.immutable')"
+          test "${immutable}" = "true"
+      - name: Download the preserved package and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          mkdir packages verify
+          gh release download "${TAG}" --repo "${REPOSITORY}" --pattern 'didimlog-*.whl' --pattern 'didimlog-*.tar.gz' --dir packages
+          gh release download "${TAG}" --repo "${REPOSITORY}" --pattern 'SHA256SUMS' --dir verify
+      - name: Verify tag, filenames, and checksums
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="${TAG#v}"
+          test -f "packages/didimlog-${version}-py3-none-any.whl"
+          test -f "packages/didimlog-${version}.tar.gz"
+          test "$(find packages -type f | wc -l)" -eq 2
+          cd packages
+          sha256sum --check ../verify/SHA256SUMS
+      - name: Publish with PyPI Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: packages/
+          attestations: true

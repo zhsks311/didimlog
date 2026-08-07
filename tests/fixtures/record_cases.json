@@ -1,0 +1,1113 @@
+{
+  "description": "kh-new record generation matrix (byte-exact goldens + adversarial cases). Placeholders: $WS=workspace abs path, $OUTSIDE=escape dir outside workspace.",
+  "cases": [
+    {
+      "name": "obs_ascii_success",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-01",
+        "--scope": "project",
+        "--title": "Observed retry behavior",
+        "--tags-json": "[\"retry\"]",
+        "--sources-json": "[]",
+        "--body": "Retry stopped after the third attempt.",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-01.md"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": "CREATED OBS-20260714-01\n",
+        "stderr": "",
+        "created": {
+          "path": "knowledge/records/observation/OBS-20260714-01.md",
+          "content": "+++\nschema_version = 1\nid = \"OBS-20260714-01\"\ntype = \"observation\"\ntitle = \"Observed retry behavior\"\nstatus = \"draft\"\nscope = \"project\"\ncreated = \"2026-07-14\"\nupdated = \"2026-07-14\"\nversion = 1\ntags = [\"retry\"]\nsources = []\n+++\n\n## Observation\n\nRetry stopped after the third attempt.\n"
+        }
+      }
+    },
+    {
+      "name": "obs_korean_success",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-02",
+        "--scope": "project",
+        "--title": "재시도 동작 관찰",
+        "--tags-json": "[\"retry\", \"재시도\"]",
+        "--sources-json": "[]",
+        "--body": "세 번째 시도 후 재시도가 멈췄다.",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-02.md"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": "CREATED OBS-20260714-02\n",
+        "stderr": "",
+        "created": {
+          "path": "knowledge/records/observation/OBS-20260714-02.md",
+          "content": "+++\nschema_version = 1\nid = \"OBS-20260714-02\"\ntype = \"observation\"\ntitle = \"재시도 동작 관찰\"\nstatus = \"draft\"\nscope = \"project\"\ncreated = \"2026-07-14\"\nupdated = \"2026-07-14\"\nversion = 1\ntags = [\"retry\", \"재시도\"]\nsources = []\n+++\n\n## Observation\n\n세 번째 시도 후 재시도가 멈췄다.\n"
+        }
+      }
+    },
+    {
+      "name": "obs_nfkc_tag_success",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-03",
+        "--scope": "project",
+        "--title": "fullwidth tag normalization",
+        "--tags-json": "[\"ＲＥＴＲＹ\"]",
+        "--sources-json": "[]",
+        "--body": "x",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-03.md"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": "CREATED OBS-20260714-03\n",
+        "stderr": "",
+        "created": {
+          "path": "knowledge/records/observation/OBS-20260714-03.md",
+          "content": "+++\nschema_version = 1\nid = \"OBS-20260714-03\"\ntype = \"observation\"\ntitle = \"fullwidth tag normalization\"\nstatus = \"draft\"\nscope = \"project\"\ncreated = \"2026-07-14\"\nupdated = \"2026-07-14\"\nversion = 1\ntags = [\"retry\"]\nsources = []\n+++\n\n## Observation\n\nx\n"
+        }
+      }
+    },
+    {
+      "name": "obs_korean_nfd_tag_success",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-04",
+        "--scope": "project",
+        "--title": "한글 NFD 태그 정규화",
+        "--tags-json": "[\"\\u110c\\u1162\\u1109\\u1175\\u1103\\u1169\"]",
+        "--sources-json": "[]",
+        "--body": "분해형 태그를 조합형으로 저장한다.",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-04.md"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": "CREATED OBS-20260714-04\n",
+        "stderr": "",
+        "created": {
+          "path": "knowledge/records/observation/OBS-20260714-04.md",
+          "content": "+++\nschema_version = 1\nid = \"OBS-20260714-04\"\ntype = \"observation\"\ntitle = \"한글 NFD 태그 정규화\"\nstatus = \"draft\"\nscope = \"project\"\ncreated = \"2026-07-14\"\nupdated = \"2026-07-14\"\nversion = 1\ntags = [\"재시도\"]\nsources = []\n+++\n\n## Observation\n\n분해형 태그를 조합형으로 저장한다.\n"
+        }
+      }
+    },
+    {
+      "name": "obs_with_source_success",
+      "type": "observation",
+      "setup": {
+        "files": [
+          {
+            "path": "knowledge/records/evidence/EVD-20260101-01.md",
+            "content": "+++\nschema_version = 1\nid = \"EVD-20260101-01\"\ntype = \"evidence\"\ntitle = \"seed evidence\"\nstatus = \"validated\"\nscope = \"project\"\ncreated = \"2026-01-01\"\nupdated = \"2026-01-01\"\nversion = 1\ntags = []\nsources = []\nartifact_path = \"knowledge/raw/seed.txt\"\nartifact_sha256 = \"4a6689419b00b11700c9b6246bcfa8936c8f5e1e824db3a7e57030e2d1c1a684\"\n+++\n\n## Artifact\n\nknowledge/raw/seed.txt\n\n## Origin\n\nseed\n\n## Collection\n\nseed\n"
+          },
+          {
+            "path": "knowledge/raw/seed.txt",
+            "content": "seed\n"
+          }
+        ]
+      },
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-10",
+        "--scope": "project",
+        "--title": "sourced observation",
+        "--tags-json": "[]",
+        "--sources-json": "[\"EVD-20260101-01\"]",
+        "--body": "references seed evidence",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-10.md"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": "CREATED OBS-20260714-10\n",
+        "stderr": "",
+        "created": {
+          "path": "knowledge/records/observation/OBS-20260714-10.md",
+          "content": "+++\nschema_version = 1\nid = \"OBS-20260714-10\"\ntype = \"observation\"\ntitle = \"sourced observation\"\nstatus = \"draft\"\nscope = \"project\"\ncreated = \"2026-07-14\"\nupdated = \"2026-07-14\"\nversion = 1\ntags = []\nsources = [\"EVD-20260101-01\"]\n+++\n\n## Observation\n\nreferences seed evidence\n"
+        }
+      }
+    },
+    {
+      "name": "exp_contradicts_none_success",
+      "type": "experiment",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "EXP-20260714-01",
+        "--scope": "project",
+        "--title": "재시도 실험",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--hypothesis": "재시도 상한이 원인이다",
+        "--method": "로그를 분석한다",
+        "--result": "failure",
+        "--interpretation": "가설이 지지되지 않았다",
+        "--contradicts": "none",
+        "--output": "$WS/knowledge/records/experiment/EXP-20260714-01.md"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": "CREATED EXP-20260714-01\n",
+        "stderr": "",
+        "created": {
+          "path": "knowledge/records/experiment/EXP-20260714-01.md",
+          "content": "+++\nschema_version = 1\nid = \"EXP-20260714-01\"\ntype = \"experiment\"\ntitle = \"재시도 실험\"\nstatus = \"draft\"\nscope = \"project\"\ncreated = \"2026-07-14\"\nupdated = \"2026-07-14\"\nversion = 1\ntags = []\nsources = []\n+++\n\n## Hypothesis\n\n재시도 상한이 원인이다\n\n## Method\n\n로그를 분석한다\n\n## Result\n\nfailure\n\n## Interpretation\n\nContradicts: none\n\n가설이 지지되지 않았다\n"
+        }
+      }
+    },
+    {
+      "name": "exp_contradiction_link_success",
+      "type": "experiment",
+      "setup": {
+        "files": [
+          {
+            "path": "knowledge/records/evidence/EVD-20260101-01.md",
+            "content": "+++\nschema_version = 1\nid = \"EVD-20260101-01\"\ntype = \"evidence\"\ntitle = \"seed evidence\"\nstatus = \"validated\"\nscope = \"project\"\ncreated = \"2026-01-01\"\nupdated = \"2026-01-01\"\nversion = 1\ntags = []\nsources = []\nartifact_path = \"knowledge/raw/seed.txt\"\nartifact_sha256 = \"4a6689419b00b11700c9b6246bcfa8936c8f5e1e824db3a7e57030e2d1c1a684\"\n+++\n\n## Artifact\n\nknowledge/raw/seed.txt\n\n## Origin\n\nseed\n\n## Collection\n\nseed\n"
+          },
+          {
+            "path": "knowledge/raw/seed.txt",
+            "content": "seed\n"
+          }
+        ]
+      },
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "EXP-20260714-07",
+        "--scope": "project",
+        "--title": "모순 연결 실험",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--hypothesis": "이전 증거와 상충한다",
+        "--method": "재현 시도",
+        "--result": "inconclusive",
+        "--interpretation": "판단 보류",
+        "--contradicts": "EVD-20260101-01",
+        "--output": "$WS/knowledge/records/experiment/EXP-20260714-07.md"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": "CREATED EXP-20260714-07\n",
+        "stderr": "",
+        "created": {
+          "path": "knowledge/records/experiment/EXP-20260714-07.md",
+          "content": "+++\nschema_version = 1\nid = \"EXP-20260714-07\"\ntype = \"experiment\"\ntitle = \"모순 연결 실험\"\nstatus = \"draft\"\nscope = \"project\"\ncreated = \"2026-07-14\"\nupdated = \"2026-07-14\"\nversion = 1\ntags = []\nsources = []\n+++\n\n## Hypothesis\n\n이전 증거와 상충한다\n\n## Method\n\n재현 시도\n\n## Result\n\ninconclusive\n\n## Interpretation\n\nContradicts: EVD-20260101-01\n\n판단 보류\n"
+        }
+      }
+    },
+    {
+      "name": "evd_local_success",
+      "type": "evidence",
+      "setup": {
+        "files": [
+          {
+            "path": "knowledge/raw/log.txt",
+            "content": "hello\n"
+          }
+        ]
+      },
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "EVD-20260714-01",
+        "--scope": "project",
+        "--title": "재시도 로그 증거",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--artifact": "knowledge/raw/log.txt",
+        "--origin": "CI 로그",
+        "--collection": "2026-07-14 수집",
+        "--artifact-sha256": "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03",
+        "--output": "$WS/knowledge/records/evidence/EVD-20260714-01.md"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": "CREATED EVD-20260714-01\n",
+        "stderr": "",
+        "created": {
+          "path": "knowledge/records/evidence/EVD-20260714-01.md",
+          "content": "+++\nschema_version = 1\nid = \"EVD-20260714-01\"\ntype = \"evidence\"\ntitle = \"재시도 로그 증거\"\nstatus = \"draft\"\nscope = \"project\"\ncreated = \"2026-07-14\"\nupdated = \"2026-07-14\"\nversion = 1\ntags = []\nsources = []\nartifact_path = \"knowledge/raw/log.txt\"\nartifact_sha256 = \"5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03\"\n+++\n\n## Artifact\n\nknowledge/raw/log.txt\n\n## Origin\n\nCI 로그\n\n## Collection\n\n2026-07-14 수집\n"
+        }
+      }
+    },
+    {
+      "name": "evd_git_non_repository",
+      "type": "evidence",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "EVD-20260714-02",
+        "--scope": "project",
+        "--title": "git 아티팩트 증거",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--artifact": "knowledge/raw/data.bin",
+        "--origin": "git 저장소",
+        "--collection": "commit 참조",
+        "--artifact-git": "0123456789abcdef0123456789abcdef01234567",
+        "--output": "$WS/knowledge/records/evidence/EVD-20260714-02.md"
+      },
+      "expect": {
+        "exit": 7,
+        "stdout": "",
+        "stderr": "GIT_NOT_A_REPOSITORY EVD-20260714-02\n",
+        "absent": [
+          "knowledge/records/evidence/EVD-20260714-02.md"
+        ]
+      }
+    },
+    {
+      "name": "obs_no_overwrite",
+      "type": "observation",
+      "setup": {
+        "files": [
+          {
+            "path": "knowledge/records/observation/OBS-20260714-20.md",
+            "content": "SENTINEL\n"
+          }
+        ]
+      },
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-20",
+        "--scope": "project",
+        "--title": "no overwrite",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--body": "should not write",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-20.md"
+      },
+      "expect": {
+        "exit": 3,
+        "stderr": "ALREADY_EXISTS OBS-20260714-20\n",
+        "unchanged": {
+          "path": "knowledge/records/observation/OBS-20260714-20.md",
+          "content": "SENTINEL\n"
+        }
+      }
+    },
+    {
+      "name": "obs_collision_duplicate_id",
+      "type": "observation",
+      "setup": {
+        "files": [
+          {
+            "path": "knowledge/records/observation/OBS-20260714-99.md",
+            "content": "+++\nschema_version = 1\nid = \"OBS-20260714-21\"\ntype = \"observation\"\ntitle = \"misfiled duplicate\"\nstatus = \"draft\"\nscope = \"project\"\ncreated = \"2026-07-14\"\nupdated = \"2026-07-14\"\nversion = 1\ntags = []\nsources = []\n+++\n\n## Observation\n\nduplicate id in a different filename\n"
+          }
+        ]
+      },
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-21",
+        "--scope": "project",
+        "--title": "collision",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--body": "collides",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-21.md"
+      },
+      "expect": {
+        "exit": 3,
+        "stderr": "COLLISION OBS-20260714-21\n",
+        "absent": [
+          "knowledge/records/observation/OBS-20260714-21.md"
+        ]
+      }
+    },
+    {
+      "name": "obs_dangling_source",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-11",
+        "--scope": "project",
+        "--title": "dangling source",
+        "--tags-json": "[]",
+        "--sources-json": "[\"EVD-20250101-99\"]",
+        "--body": "missing source",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-11.md"
+      },
+      "expect": {
+        "exit": 3,
+        "stderr": "DANGLING_SOURCE OBS-20260714-11 -> EVD-20250101-99\n",
+        "absent": [
+          "knowledge/records/observation/OBS-20260714-11.md"
+        ]
+      }
+    },
+    {
+      "name": "exp_self_source",
+      "type": "experiment",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "EXP-20260714-05",
+        "--scope": "project",
+        "--title": "self source",
+        "--tags-json": "[]",
+        "--sources-json": "[\"EXP-20260714-05\"]",
+        "--hypothesis": "h",
+        "--method": "m",
+        "--result": "success",
+        "--interpretation": "i",
+        "--contradicts": "none",
+        "--output": "$WS/knowledge/records/experiment/EXP-20260714-05.md"
+      },
+      "expect": {
+        "exit": 3,
+        "stderr": "DANGLING_SOURCE EXP-20260714-05 -> EXP-20260714-05\n",
+        "absent": [
+          "knowledge/records/experiment/EXP-20260714-05.md"
+        ]
+      }
+    },
+    {
+      "name": "exp_contradiction_dangling",
+      "type": "experiment",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "EXP-20260714-08",
+        "--scope": "project",
+        "--title": "contradiction dangling",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--hypothesis": "h",
+        "--method": "m",
+        "--result": "failure",
+        "--interpretation": "i",
+        "--contradicts": "EVD-20250101-99",
+        "--output": "$WS/knowledge/records/experiment/EXP-20260714-08.md"
+      },
+      "expect": {
+        "exit": 3,
+        "stderr": "DANGLING_SOURCE EXP-20260714-08 -> EVD-20250101-99\n",
+        "absent": [
+          "knowledge/records/experiment/EXP-20260714-08.md"
+        ]
+      }
+    },
+    {
+      "name": "exp_contradiction_self",
+      "type": "experiment",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "EXP-20260714-06",
+        "--scope": "project",
+        "--title": "contradiction self",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--hypothesis": "h",
+        "--method": "m",
+        "--result": "failure",
+        "--interpretation": "i",
+        "--contradicts": "EXP-20260714-06",
+        "--output": "$WS/knowledge/records/experiment/EXP-20260714-06.md"
+      },
+      "expect": {
+        "exit": 3,
+        "stderr": "DANGLING_SOURCE EXP-20260714-06 -> EXP-20260714-06\n",
+        "absent": [
+          "knowledge/records/experiment/EXP-20260714-06.md"
+        ]
+      }
+    },
+    {
+      "name": "exp_contradiction_syntax",
+      "type": "experiment",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "EXP-20260714-09",
+        "--scope": "project",
+        "--title": "contradiction syntax",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--hypothesis": "h",
+        "--method": "m",
+        "--result": "failure",
+        "--interpretation": "i",
+        "--contradicts": "not-an-id",
+        "--output": "$WS/knowledge/records/experiment/EXP-20260714-09.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr_prefix": "INVALID_CONTRADICTS",
+        "absent": [
+          "knowledge/records/experiment/EXP-20260714-09.md"
+        ]
+      }
+    },
+    {
+      "name": "exp_contradiction_unsorted",
+      "type": "experiment",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "EXP-20260714-10",
+        "--scope": "project",
+        "--title": "contradiction unsorted",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--hypothesis": "h",
+        "--method": "m",
+        "--result": "failure",
+        "--interpretation": "i",
+        "--contradicts": "EXP-20260714-02,EXP-20260714-01",
+        "--output": "$WS/knowledge/records/experiment/EXP-20260714-10.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr": "UNSORTED contradicts\n"
+      }
+    },
+    {
+      "name": "evd_artifact_digest_mismatch",
+      "type": "evidence",
+      "setup": {
+        "files": [
+          {
+            "path": "knowledge/raw/log.txt",
+            "content": "hello\n"
+          }
+        ]
+      },
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "EVD-20260714-03",
+        "--scope": "project",
+        "--title": "digest mismatch",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--artifact": "knowledge/raw/log.txt",
+        "--origin": "o",
+        "--collection": "c",
+        "--artifact-sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "--output": "$WS/knowledge/records/evidence/EVD-20260714-03.md"
+      },
+      "expect": {
+        "exit": 3,
+        "stderr": "ARTIFACT_DIGEST_MISMATCH EVD-20260714-03 knowledge/raw/log.txt\n",
+        "absent": [
+          "knowledge/records/evidence/EVD-20260714-03.md"
+        ]
+      }
+    },
+    {
+      "name": "evd_artifact_absolute_escape",
+      "type": "evidence",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "EVD-20260714-04",
+        "--scope": "project",
+        "--title": "abs escape",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--artifact": "/etc/passwd",
+        "--origin": "o",
+        "--collection": "c",
+        "--artifact-git": "0123456789abcdef0123456789abcdef01234567",
+        "--output": "$WS/knowledge/records/evidence/EVD-20260714-04.md"
+      },
+      "expect": {
+        "exit": 3,
+        "stderr": "ARTIFACT_PATH_ESCAPE EVD-20260714-04 /etc/passwd\n",
+        "absent": [
+          "knowledge/records/evidence/EVD-20260714-04.md"
+        ]
+      }
+    },
+    {
+      "name": "evd_artifact_dotdot_escape",
+      "type": "evidence",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "EVD-20260714-05",
+        "--scope": "project",
+        "--title": "dotdot escape",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--artifact": "../outside.txt",
+        "--origin": "o",
+        "--collection": "c",
+        "--artifact-git": "0123456789abcdef0123456789abcdef01234567",
+        "--output": "$WS/knowledge/records/evidence/EVD-20260714-05.md"
+      },
+      "expect": {
+        "exit": 3,
+        "stderr": "ARTIFACT_PATH_ESCAPE EVD-20260714-05 ../outside.txt\n",
+        "absent": [
+          "knowledge/records/evidence/EVD-20260714-05.md"
+        ]
+      }
+    },
+    {
+      "name": "evd_artifact_symlink_escape",
+      "type": "evidence",
+      "setup": {
+        "outside_files": [
+          {
+            "path": "secret.txt",
+            "content": "top secret\n"
+          }
+        ],
+        "symlinks": [
+          {
+            "path": "knowledge/raw/log.txt",
+            "target": "$OUTSIDE/secret.txt"
+          }
+        ]
+      },
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "EVD-20260714-06",
+        "--scope": "project",
+        "--title": "symlink escape",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--artifact": "knowledge/raw/log.txt",
+        "--origin": "o",
+        "--collection": "c",
+        "--artifact-sha256": "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03",
+        "--output": "$WS/knowledge/records/evidence/EVD-20260714-06.md"
+      },
+      "expect": {
+        "exit": 3,
+        "stderr": "ARTIFACT_PATH_ESCAPE EVD-20260714-06 knowledge/raw/log.txt\n",
+        "absent": [
+          "knowledge/records/evidence/EVD-20260714-06.md"
+        ]
+      }
+    },
+    {
+      "name": "evd_artifact_both_modes",
+      "type": "evidence",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "EVD-20260714-07",
+        "--scope": "project",
+        "--title": "both modes",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--artifact": "knowledge/raw/x",
+        "--origin": "o",
+        "--collection": "c",
+        "--artifact-sha256": "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03",
+        "--artifact-git": "0123456789abcdef0123456789abcdef01234567",
+        "--output": "$WS/knowledge/records/evidence/EVD-20260714-07.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr_prefix": "ARTIFACT_MODE"
+      }
+    },
+    {
+      "name": "evd_artifact_no_mode",
+      "type": "evidence",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "EVD-20260714-08",
+        "--scope": "project",
+        "--title": "no mode",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--artifact": "knowledge/raw/x",
+        "--origin": "o",
+        "--collection": "c",
+        "--output": "$WS/knowledge/records/evidence/EVD-20260714-08.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr_prefix": "ARTIFACT_MODE"
+      }
+    },
+    {
+      "name": "obs_bad_date",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-13-40",
+        "--id": "OBS-20261340-01",
+        "--scope": "project",
+        "--title": "bad date",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--body": "b",
+        "--output": "$WS/knowledge/records/observation/OBS-20261340-01.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr": "INVALID_DATE 2026-13-40\n"
+      }
+    },
+    {
+      "name": "obs_id_date_mismatch",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260715-01",
+        "--scope": "project",
+        "--title": "id date mismatch",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--body": "b",
+        "--output": "$WS/knowledge/records/observation/OBS-20260715-01.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr": "ID_DATE_MISMATCH OBS-20260715-01 2026-07-14\n"
+      }
+    },
+    {
+      "name": "obs_id_type_mismatch",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "EXP-20260714-01",
+        "--scope": "project",
+        "--title": "id type mismatch",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--body": "b",
+        "--output": "$WS/knowledge/records/observation/EXP-20260714-01.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr": "ID_TYPE_MISMATCH EXP-20260714-01 observation\n"
+      }
+    },
+    {
+      "name": "obs_bad_id_format",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-2026071-01",
+        "--scope": "project",
+        "--title": "bad id",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--body": "b",
+        "--output": "$WS/knowledge/records/observation/OBS-2026071-01.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr_prefix": "INVALID_ID"
+      }
+    },
+    {
+      "name": "forbidden_future_type",
+      "type": "finding",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "FIN-20260714-01",
+        "--scope": "project",
+        "--title": "forbidden",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--body": "b",
+        "--output": "$WS/knowledge/records/finding/FIN-20260714-01.md"
+      },
+      "expect": {
+        "exit": 2
+      }
+    },
+    {
+      "name": "obs_malformed_tags_json",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-30",
+        "--scope": "project",
+        "--title": "malformed tags",
+        "--tags-json": "[retry]",
+        "--sources-json": "[]",
+        "--body": "b",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-30.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr": "INVALID_JSON tags\n"
+      }
+    },
+    {
+      "name": "obs_sources_not_array",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-31",
+        "--scope": "project",
+        "--title": "sources not array",
+        "--tags-json": "[]",
+        "--sources-json": "{\"a\": 1}",
+        "--body": "b",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-31.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr": "INVALID_JSON sources\n"
+      }
+    },
+    {
+      "name": "obs_unsorted_tags",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-32",
+        "--scope": "project",
+        "--title": "unsorted tags",
+        "--tags-json": "[\"b\", \"a\"]",
+        "--sources-json": "[]",
+        "--body": "b",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-32.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr": "UNSORTED tags\n"
+      }
+    },
+    {
+      "name": "obs_duplicate_tags",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-33",
+        "--scope": "project",
+        "--title": "duplicate tags",
+        "--tags-json": "[\"retry\", \"ＲＥＴＲＹ\"]",
+        "--sources-json": "[]",
+        "--body": "b",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-33.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr": "DUPLICATE tags\n"
+      }
+    },
+    {
+      "name": "obs_tag_over_scalar_limit",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-34",
+        "--scope": "project",
+        "--title": "tag too long",
+        "--tags-json": "[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]",
+        "--sources-json": "[]",
+        "--body": "b",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-34.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr_prefix": "INVALID_TAG"
+      }
+    },
+    {
+      "name": "obs_tag_bad_first_char",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-35",
+        "--scope": "project",
+        "--title": "tag bad first",
+        "--tags-json": "[\".hidden\"]",
+        "--sources-json": "[]",
+        "--body": "b",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-35.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr_prefix": "INVALID_TAG"
+      }
+    },
+    {
+      "name": "obs_missing_date_arg",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--id": "OBS-20260714-36",
+        "--scope": "project",
+        "--title": "missing date",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--body": "b",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-36.md"
+      },
+      "expect": {
+        "exit": 2
+      }
+    },
+    {
+      "name": "relative_workspace",
+      "type": "observation",
+      "args": {
+        "--workspace": "relative-ws",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-37",
+        "--scope": "project",
+        "--title": "relative ws",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--body": "b",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-37.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr": "RELATIVE_PATH workspace\n"
+      }
+    },
+    {
+      "name": "relative_output",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-38",
+        "--scope": "project",
+        "--title": "relative output",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--body": "b",
+        "--output": "relative-out.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr": "RELATIVE_PATH output\n"
+      }
+    },
+    {
+      "name": "output_basename_mismatch",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-41",
+        "--scope": "project",
+        "--title": "basename mismatch",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--body": "b",
+        "--output": "$WS/knowledge/records/observation/WRONG.md"
+      },
+      "expect": {
+        "exit": 3,
+        "stderr": "BASENAME_MISMATCH OBS-20260714-41 $WS/knowledge/records/observation/WRONG.md\n"
+      }
+    },
+    {
+      "name": "output_wrong_type_dir",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-42",
+        "--scope": "project",
+        "--title": "wrong dir",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--body": "b",
+        "--output": "$WS/knowledge/records/experiment/OBS-20260714-42.md"
+      },
+      "expect": {
+        "exit": 3,
+        "stderr": "PATH_ESCAPE $WS/knowledge/records/experiment/OBS-20260714-42.md\n",
+        "absent": [
+          "knowledge/records/experiment/OBS-20260714-42.md"
+        ]
+      }
+    },
+    {
+      "name": "output_symlink_escape",
+      "type": "observation",
+      "setup": {
+        "symlinks": [
+          {
+            "path": "knowledge/records/observation",
+            "target": "$OUTSIDE"
+          }
+        ]
+      },
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-43",
+        "--scope": "project",
+        "--title": "symlink escape",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--body": "b",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-43.md"
+      },
+      "expect": {
+        "exit": 3,
+        "stderr": "PATH_ESCAPE $WS/knowledge/records/observation/OBS-20260714-43.md\n"
+      }
+    },
+    {
+      "name": "obs_forbidden_scope_global",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-44",
+        "--scope": "global",
+        "--title": "forbidden scope",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--body": "b",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-44.md"
+      },
+      "expect": {
+        "exit": 3,
+        "stderr": "FORBIDDEN_SCOPE global\n"
+      }
+    },
+    {
+      "name": "obs_bad_scope_pattern",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-45",
+        "--scope": "task:has space",
+        "--title": "bad scope",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--body": "b",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-45.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr_prefix": "INVALID_SCOPE"
+      }
+    },
+    {
+      "name": "obs_empty_body",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-46",
+        "--scope": "project",
+        "--title": "empty body",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--body": "",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-46.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr": "MISSING_SECTION body\n"
+      }
+    },
+    {
+      "name": "obs_unexpected_flag",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-47",
+        "--scope": "project",
+        "--title": "unexpected flag",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--body": "b",
+        "--hypothesis": "should not be here",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-47.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr_prefix": "UNEXPECTED_FLAG"
+      }
+    },
+    {
+      "name": "obs_title_control_char",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-48",
+        "--scope": "project",
+        "--title": "line1\nline2",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--body": "b",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-48.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr_prefix": "INVALID_TITLE"
+      }
+    },
+    {
+      "name": "obs_whitespace_body",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-49",
+        "--scope": "project",
+        "--title": "whitespace body",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--body": "  \n  \n",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-49.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr": "MISSING_SECTION body\n",
+        "absent": [
+          "knowledge/records/observation/OBS-20260714-49.md"
+        ]
+      }
+    },
+    {
+      "name": "obs_embedded_h2",
+      "type": "observation",
+      "args": {
+        "--workspace": "$WS",
+        "--date": "2026-07-14",
+        "--id": "OBS-20260714-50",
+        "--scope": "project",
+        "--title": "embedded heading",
+        "--tags-json": "[]",
+        "--sources-json": "[]",
+        "--body": "first\n## Extra\nsecond",
+        "--output": "$WS/knowledge/records/observation/OBS-20260714-50.md"
+      },
+      "expect": {
+        "exit": 2,
+        "stderr": "INVALID_SECTION body\n",
+        "absent": [
+          "knowledge/records/observation/OBS-20260714-50.md"
+        ]
+      }
+    }
+  ]
+}

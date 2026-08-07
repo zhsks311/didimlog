@@ -1,0 +1,44 @@
+[build-system]
+requires = ["uv_build>=0.12.2,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "didimlog"
+version = "0.0.1"
+description = "Local-first, evidence-led personal and project knowledge CLI"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+keywords = ["claude-code", "knowledge-management", "local-first"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Utilities",
+]
+dependencies = ["Markdown==3.10.2"]
+
+[project.urls]
+Homepage = "https://github.com/zhsks311/didimlog"
+Documentation = "https://github.com/zhsks311/didimlog#readme"
+Issues = "https://github.com/zhsks311/didimlog/issues"
+Source = "https://github.com/zhsks311/didimlog"
+
+[project.scripts]
+didim = "didimlog.cli:main"
+
+[tool.uv.build-backend]
+source-include = [
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "uv.lock",
+]
