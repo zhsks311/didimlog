@@ -1,0 +1,7 @@
+.gjc-kh/
+.gjc/
+__pycache__/
+*.py[cod]
+
+/docs/
+CLAUDE.local.md
