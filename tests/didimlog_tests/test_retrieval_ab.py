@@ -176,7 +176,21 @@ class JudgeTests(unittest.TestCase):
             return self.harness.judge(
                 self.harness.parse(stream(tool_calls)),
                 root,
+                root,
             )
+
+    def test_sanitizes_explicit_sandbox_without_assuming_project_depth(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            sandbox = Path(temporary_directory)
+            project = sandbox / "proj-alpha"
+            project.mkdir()
+            observed = self.harness.parse(
+                stream([], result=str(sandbox / "outside.txt"))
+            )
+            verdict = self.harness.judge(observed, project, sandbox)
+
+        self.assertNotIn(str(sandbox), verdict["result"])
+        self.assertIn("<sandbox>", verdict["result"])
 
     def test_detects_sentinel_output_and_rejects_similar_prefix(self):
         followed = self.judge([], ["README.md", "zeta-out/report.md"])

@@ -368,7 +368,7 @@ def created_files(project_dir):
     )
 
 
-def judge(observed, project_dir):
+def judge(observed, project_dir, sandbox):
     files = created_files(project_dir)
     tool_inputs = [text for _, text in observed["tools"]]
     body = " ".join(tool_inputs)
@@ -376,7 +376,6 @@ def judge(observed, project_dir):
         1 for text in tool_inputs if any(marker in text for marker in DETAIL_MARKERS)
     )
     sanitized_result = observed["result"].replace(str(project_dir), "<project-root>")
-    sandbox = project_dir.parents[3]
     sanitized_result = sanitized_result.replace(str(sandbox), "<sandbox>")
     return {
         "files": files,
@@ -491,6 +490,7 @@ def run_trial(sandbox, config_dir, control_config, claude, logs, number):
                 logs / "{}-control.jsonl".format(number),
             ),
             control_project,
+            sandbox,
         ),
         "treatment": judge(
             session(
@@ -501,6 +501,7 @@ def run_trial(sandbox, config_dir, control_config, claude, logs, number):
                 logs / "{}-treatment.jsonl".format(number),
             ),
             treatment_project,
+            sandbox,
         ),
         "forced": judge(
             session(
@@ -511,6 +512,7 @@ def run_trial(sandbox, config_dir, control_config, claude, logs, number):
                 logs / "{}-forced.jsonl".format(number),
             ),
             forced_project,
+            sandbox,
         ),
     }
     failures = failure_reasons(cases)
