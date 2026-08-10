@@ -10,6 +10,7 @@ import secrets
 import stat
 import sys
 
+from didimlog.locking import path_lock
 from .lesson import SLUG, parse_lesson_text
 from .paths import lessons_dir, resolve_project
 
@@ -181,29 +182,20 @@ def _refresh_index(base: Path) -> None:
         from . import index
 
         data_root = base.parent
-        index.write_all(data_root=data_root, target=data_root / "index")
+        index._write_all_locked(
+            data_root=data_root,
+            target=data_root / "index",
+        )
     except Exception:
         print("KNOWLEDGE_INDEX_STALE: run didim index", file=sys.stderr)
 
 
-def publish_lesson(slug, text, project=None, root=None, cwd=None) -> Path:
-    """Validate and atomically create one project lesson, then refresh indexes."""
-
-    if not isinstance(slug, str) or SLUG.fullmatch(slug) is None:
-        raise LessonInvalid("slug must use letters, digits, and hyphens")
-    try:
-        selected = resolve_project(project, cwd=cwd, allow_global=True)
-    except ValueError as error:
-        raise LessonInvalid(str(error)) from error
-
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n") if isinstance(text, str) else text
-    data = _encode_input(normalized)
-    _reject_secrets(data)
-    name = slug + ".md"
-    if parse_lesson_text(name, normalized) is None:
-        raise LessonInvalid("lesson does not satisfy the frontmatter contract")
-
-    base = Path(lessons_dir() if root is None else root)
+def _publish_lesson_locked(
+    base: Path,
+    selected: str,
+    name: str,
+    data: bytes,
+) -> Path:
     base_descriptor = _open_real_directory(
         base,
         "lessons directory must be a real directory",
@@ -256,6 +248,36 @@ def publish_lesson(slug, text, project=None, root=None, cwd=None) -> Path:
 
     _refresh_index(base)
     return Path(base.name) / selected / name
+
+
+def publish_lesson(slug, text, project=None, root=None, cwd=None) -> Path:
+    """Validate and atomically create one lesson and its derived index."""
+    if not isinstance(slug, str) or SLUG.fullmatch(slug) is None:
+        raise LessonInvalid("slug must use letters, digits, and hyphens")
+    try:
+        selected = resolve_project(project, cwd=cwd, allow_global=True)
+    except ValueError as error:
+        raise LessonInvalid(str(error)) from error
+
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n") if isinstance(text, str) else text
+    data = _encode_input(normalized)
+    _reject_secrets(data)
+    name = slug + ".md"
+    if parse_lesson_text(name, normalized) is None:
+        raise LessonInvalid("lesson does not satisfy the frontmatter contract")
+
+    base = Path(lessons_dir() if root is None else root)
+    lock = path_lock(base.parent)
+    try:
+        lock.__enter__()
+    except OSError as error:
+        raise LessonInvalid(
+            "lessons parent must be a real directory"
+        ) from error
+    try:
+        return _publish_lesson_locked(base, selected, name, data)
+    finally:
+        lock.__exit__(None, None, None)
 
 
 def _read_stdin() -> str:

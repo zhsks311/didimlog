@@ -9,6 +9,8 @@ import shutil
 import stat
 import subprocess
 
+from didimlog.file_io import UnsafePathError, read_regular_file_beneath
+from didimlog.locking import path_lock
 from didimlog.personal import index as personal_index
 from didimlog.personal.paths import data_home
 from didimlog.project import index as project_index
@@ -78,17 +80,15 @@ def _prepared_project(root: Path) -> bool:
             if stat.S_ISLNK(linked.st_mode) or not stat.S_ISDIR(linked.st_mode):
                 return False
         for path, expected in plan.files:
-            linked = path.lstat()
-            if stat.S_ISLNK(linked.st_mode) or not stat.S_ISREG(linked.st_mode):
+            relative = path.relative_to(root)
+            if read_regular_file_beneath(root, relative, len(expected)) != expected:
                 return False
-            if path.read_bytes() != expected:
-                return False
-    except (OSError, ValueError):
+    except (OSError, UnsafePathError, ValueError):
         return False
     return True
 
 
-def _personal_check(root: Path) -> str:
+def _personal_check_locked(root: Path) -> str:
     destination = root / "index"
     if not root.exists():
         return _status("개인 지식", "PERSONAL_INDEX_MISSING")
@@ -119,17 +119,35 @@ def _personal_check(root: Path) -> str:
             linked = path.lstat()
             if stat.S_ISLNK(linked.st_mode) or not stat.S_ISREG(linked.st_mode):
                 return _status("개인 지식", "PERSONAL_INDEX_EXTRA")
-            if path.read_bytes() != text.encode("utf-8"):
+            expected = text.encode("utf-8")
+            if (
+                read_regular_file_beneath(
+                    root,
+                    Path("index") / path.name,
+                    len(expected),
+                )
+                != expected
+            ):
                 return _status("개인 지식", "PERSONAL_INDEX_STALE")
-        except OSError:
+        except (OSError, UnsafePathError):
             return _status("개인 지식", "PERSONAL_INDEX_MISSING")
     return _status("개인 지식", "PERSONAL_INDEX_CURRENT")
+
+
+def _personal_check(root: Path) -> str:
+    if not root.exists():
+        return _status("개인 지식", "PERSONAL_INDEX_MISSING")
+    try:
+        with path_lock(root, shared=True):
+            return _personal_check_locked(root)
+    except OSError:
+        return _status("개인 지식", "PERSONAL_INDEX_INVALID_SOURCE")
 
 
 def _project_check(root: Path) -> str:
     output = root / "knowledge" / "index" / "INDEX.md"
     try:
-        expected = project_index.build_index_bytes(root)
+        current = project_index.check_index(root)
     except (OSError, ValueError):
         return _status("프로젝트 근거", "PROJECT_INDEX_INVALID_SOURCE")
     try:
@@ -143,14 +161,7 @@ def _project_check(root: Path) -> str:
         return _status("프로젝트 근거", "PROJECT_INDEX_MISSING")
     if names != {"INDEX.md"}:
         return _status("프로젝트 근거", "PROJECT_INDEX_EXTRA")
-    try:
-        linked = output.lstat()
-        if stat.S_ISLNK(linked.st_mode) or not stat.S_ISREG(linked.st_mode):
-            return _status("프로젝트 근거", "PROJECT_INDEX_EXTRA")
-        actual = output.read_bytes()
-    except OSError:
-        return _status("프로젝트 근거", "PROJECT_INDEX_MISSING")
-    if actual != expected:
+    if current != 0:
         return _status("프로젝트 근거", "PROJECT_INDEX_STALE")
     return _status("프로젝트 근거", "PROJECT_INDEX_CURRENT")
 

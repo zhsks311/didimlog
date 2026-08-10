@@ -1,8 +1,7 @@
-"""Didimlog v1 project record scalar, document, and write contracts."""
+"""Didimlog v1 project record scalar and document contracts."""
 
 import datetime
 import json
-import os
 import re
 import unicodedata
 from pathlib import PurePosixPath
@@ -508,14 +507,3 @@ def serialize_record(
         raise SchemaError("RECORD_TOO_MANY_LINES {}".format(record_id))
     return document
 
-
-def write_atomic(path, data, record_id):
-    """Create a record with ``O_EXCL`` and never overwrite an existing path."""
-    try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    except FileExistsError:
-        raise PolicyError("ALREADY_EXISTS {}".format(record_id)) from None
-    with os.fdopen(descriptor, "wb") as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())

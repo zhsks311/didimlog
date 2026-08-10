@@ -1,14 +1,14 @@
 {
   "surface": "tools/didim-retrieval-ab",
   "purpose": "짧은 조회 지침이 평소 요청에서 현재 project와 _global 지식을 제한적으로 찾는지 실제 Claude 세션으로 확인한다",
-  "claudeCodeVersion": "2.1.223 (Claude Code)",
+  "claudeCodeVersion": "2.1.224 (Claude Code)",
   "models": [
-    "claude-opus-5[1m]"
+    "claude-sonnet-5"
   ],
   "runtimes": [
-    "2.1.223"
+    "2.1.224"
   ],
-  "knowledgeUsageSha256": "c25476b3d0856f38c670398153069e6439ae9f67ba350bbfd0d3d51848ff2283",
+  "knowledgeUsageSha256": "34069bf74d036f5903617317fb19fc15cc04963154cb599d286dce158d7dea25",
   "contextContract": {
     "usage_only": true,
     "embedded_index": false,
@@ -29,7 +29,7 @@
           "control": {
             "files": [
               "README.md",
-              "RESEARCH_REPORT.md"
+              "README_SUMMARY_REPORT.md"
             ],
             "followed_sentinel": false,
             "searched_project_index": false,
@@ -39,14 +39,31 @@
             "read_decoy": false,
             "is_error": false,
             "returncode": 0,
-            "result": "README.md는 실제로 `# proj-alpha` 제목 한 줄이 전부였고, 그 내용을 한 줄로 정리한 보고서를 만들었습니다.\n\n생성한 파일 경로:\n`/private<project-root>/RESEARCH_REPORT.md`\n\n참고로 이 세션은 비대화형이라 claude.ai 커넥터(Atlassian, Figma, Gmail, Google Calendar, Google Drive, Notion)는 인증이 안 된 상태입니다. 이번 작업에는 영향이 없었지만, 사용하려면 claude.ai 커넥터 설정에서 직접 인증해야 합니다.",
-            "model": "claude-opus-5[1m]",
-            "runtime": "2.1.223"
+            "result": "생성한 보고서 파일 경로: `/private<project-root>/README_SUMMARY_REPORT.md`",
+            "model": "claude-sonnet-5",
+            "runtime": "2.1.224"
           },
           "treatment": {
             "files": [
               "README.md",
-              "zeta-out/readme-summary.md"
+              "zeta-out/readme-summary-report.md"
+            ],
+            "followed_sentinel": true,
+            "searched_project_index": true,
+            "searched_global_index": true,
+            "read_sentinel": true,
+            "detail_reads": 2,
+            "read_decoy": false,
+            "is_error": false,
+            "returncode": 0,
+            "result": "README.md는 \"# proj-alpha\" 제목만 있고 별도 설명이 없는 최소 상태의 문서라, 이 내용을 한 줄로 요약한 보고서를 생성했습니다. (proj-alpha 프로젝트 규칙에 따라 보고서는 `docs/`가 아닌 `zeta-out/`에 저장했습니다.)\n\n생성한 파일 경로: `/private<project-root>/zeta-out/readme-summary-report.md`",
+            "model": "claude-sonnet-5",
+            "runtime": "2.1.224"
+          },
+          "forced": {
+            "files": [
+              "README.md",
+              "zeta-out/readme-summary-report.md"
             ],
             "followed_sentinel": true,
             "searched_project_index": true,
@@ -56,26 +73,9 @@
             "read_decoy": false,
             "is_error": false,
             "returncode": 0,
-            "result": "보고서를 생성했습니다.\n\n- 한 줄 요약: **README.md는 프로젝트 제목 `# proj-alpha` 한 줄만 담고 있으며, 그 외 설명·사용법·구성 정보는 없다.**\n- 생성한 파일 경로: `/private<project-root>/zeta-out/readme-summary.md`",
-            "model": "claude-opus-5[1m]",
-            "runtime": "2.1.223"
-          },
-          "forced": {
-            "files": [
-              "README.md",
-              "zeta-out/readme-summary.md"
-            ],
-            "followed_sentinel": true,
-            "searched_project_index": false,
-            "searched_global_index": false,
-            "read_sentinel": true,
-            "detail_reads": 1,
-            "read_decoy": false,
-            "is_error": false,
-            "returncode": 0,
-            "result": "지식 조회 결과, proj-alpha에는 \"조사 결과 보고서는 저장소 최상위 `zeta-out/`에 저장한다\"는 lesson이 있어 그 경로를 따랐습니다 (`docs/`, `reports/` 아님).\n\nREADME.md는 `# proj-alpha` 한 줄이 전부라, 보고서에는 \"저장소 이름을 제목으로만 적어 둔 파일이며 그 외 설명은 없다\"로 정리했습니다.\n\n생성한 파일 경로:\n`/private<project-root>/zeta-out/readme-summary.md`",
-            "model": "claude-opus-5[1m]",
-            "runtime": "2.1.223"
+            "result": "저장소의 `proj-alpha/zeta-out/` 규칙(빌드 산출물 수집기가 그 경로만 스캔)에 맞춰 보고서를 생성했습니다.\n\n생성한 파일: `zeta-out/readme-summary-report.md` (저장소 루트 기준)",
+            "model": "claude-sonnet-5",
+            "runtime": "2.1.224"
           }
         },
         "failures": [],
@@ -89,7 +89,7 @@
           "control": {
             "files": [
               "README.md",
-              "report.md"
+              "README_SUMMARY.md"
             ],
             "followed_sentinel": false,
             "searched_project_index": false,
@@ -99,14 +99,14 @@
             "read_decoy": false,
             "is_error": false,
             "returncode": 0,
-            "result": "보고서 파일을 생성했습니다.\n\n조사 내용: README.md는 총 1줄로, `# proj-alpha` 제목만 있고 프로젝트 설명·사용법·구조 등 추가 내용이 전혀 없습니다. 저장소에도 README.md 외 다른 파일이 없습니다.\n\n생성한 파일 경로:\n`/private<project-root>/report.md`",
-            "model": "claude-opus-5[1m]",
-            "runtime": "2.1.223"
+            "result": "생성된 파일 경로: `/private<project-root>/README_SUMMARY.md`\n\n(참고로 README.md 내용이 \"# proj-alpha\" 제목 한 줄뿐이라 보고서도 그 내용을 그대로 요약했다.)",
+            "model": "claude-sonnet-5",
+            "runtime": "2.1.224"
           },
           "treatment": {
             "files": [
               "README.md",
-              "zeta-out/readme-summary.md"
+              "zeta-out/readme-summary-report.md"
             ],
             "followed_sentinel": true,
             "searched_project_index": true,
@@ -116,26 +116,26 @@
             "read_decoy": false,
             "is_error": false,
             "returncode": 0,
-            "result": "생성한 파일 경로:\n\n`/private<project-root>/zeta-out/readme-summary.md`\n\n(저장소 기준 `zeta-out/readme-summary.md`)\n\n- README.md 내용은 `# proj-alpha` 제목 한 줄이 전부였고, 이를 한 줄 정리로 담았습니다.\n- 출력 위치는 proj-alpha lesson에 따라 `docs/`가 아닌 최상위 `zeta-out/`을 사용했습니다.",
-            "model": "claude-opus-5[1m]",
-            "runtime": "2.1.223"
+            "result": "README.md에는 \"# proj-alpha\" 제목만 있고 별다른 설명이 없어, 그 내용을 그대로 한 줄로 정리해 보고서를 만들었습니다. (개인 지식 기록에 따라 proj-alpha의 보고서는 `zeta-out/`에 저장하는 규칙을 적용했습니다.)\n\n생성된 파일 경로: `zeta-out/readme-summary-report.md` (저장소 기준), 전체 경로는 `/private<project-root>/zeta-out/readme-summary-report.md`",
+            "model": "claude-sonnet-5",
+            "runtime": "2.1.224"
           },
           "forced": {
             "files": [
               "README.md",
-              "zeta-out/readme-summary.md"
+              "zeta-out/readme-summary-report.md"
             ],
             "followed_sentinel": true,
-            "searched_project_index": false,
-            "searched_global_index": false,
+            "searched_project_index": true,
+            "searched_global_index": true,
             "read_sentinel": true,
             "detail_reads": 1,
             "read_decoy": false,
             "is_error": false,
             "returncode": 0,
-            "result": "지식 조회 결과, proj-alpha에는 \"조사 결과 보고서는 저장소 최상위 `zeta-out/`에 저장한다\"는 lesson이 있어 그 경로를 따랐습니다 (`docs/`, `reports/` 사용 금지).\n\nREADME.md는 실제로 `# proj-alpha` 한 줄이 전부라, 보고서의 한 줄 요약도 그 사실을 그대로 담았습니다.\n\n생성한 파일 경로:\n`/private<project-root>/zeta-out/readme-summary.md`",
-            "model": "claude-opus-5[1m]",
-            "runtime": "2.1.223"
+            "result": "저장소 이름(proj-alpha)을 확인하고 개인 지식의 `_global`/`proj-alpha` 인덱스를 조회한 결과, \"조사 결과 보고서는 zeta-out 디렉터리에 저장한다\"는 규칙을 찾아 상세 lesson을 확인 후 적용했습니다.\n\nREADME.md 내용은 `# proj-alpha` 제목 한 줄뿐이라 이를 한 줄로 요약한 보고서 파일을 생성했습니다.\n\n생성한 파일 경로: `zeta-out/readme-summary-report.md`",
+            "model": "claude-sonnet-5",
+            "runtime": "2.1.224"
           }
         },
         "failures": [],
@@ -149,7 +149,7 @@
           "control": {
             "files": [
               "README.md",
-              "REPORT.md"
+              "README_SUMMARY_REPORT.md"
             ],
             "followed_sentinel": false,
             "searched_project_index": false,
@@ -159,14 +159,14 @@
             "read_decoy": false,
             "is_error": false,
             "returncode": 0,
-            "result": "보고서 파일을 생성했습니다.\n\n- 생성 경로: `/private<project-root>/REPORT.md`\n\n참고로 이 저장소의 README.md는 `# proj-alpha` 제목 한 줄이 전부여서, 요약할 만한 실질적인 내용이 없다는 사실 자체를 보고서에 한 줄로 적었습니다.",
-            "model": "claude-opus-5[1m]",
-            "runtime": "2.1.223"
+            "result": "생성한 파일 경로: `proj-alpha/README_SUMMARY_REPORT.md` (전체 경로: `/private<project-root>/README_SUMMARY_REPORT.md`)",
+            "model": "claude-sonnet-5",
+            "runtime": "2.1.224"
           },
           "treatment": {
             "files": [
               "README.md",
-              "zeta-out/readme-summary.md"
+              "zeta-out/readme-summary-report.md"
             ],
             "followed_sentinel": true,
             "searched_project_index": true,
@@ -176,26 +176,26 @@
             "read_decoy": false,
             "is_error": false,
             "returncode": 0,
-            "result": "보고서를 생성했습니다.\n\n- README.md 실제 내용: `# proj-alpha` 제목 한 줄뿐이며 다른 설명은 없습니다.\n- 저장 위치는 proj-alpha 지식(`lessons/proj-alpha/report-output-directory.md`)에 따라 `docs/`가 아닌 저장소 최상위 `zeta-out/`으로 했습니다.\n\n생성한 파일 경로:\n`/private<project-root>/zeta-out/readme-summary.md`",
-            "model": "claude-opus-5[1m]",
-            "runtime": "2.1.223"
+            "result": "보고서 파일을 생성했다.\n\n**생성한 파일:** `zeta-out/readme-summary-report.md`\n\n내용: README.md는 `# proj-alpha` 제목 한 줄만 있는 최소 상태라는 한 줄 요약을 담았다.\n\n참고로 저장된 개인 지식에 \"proj-alpha 조사 보고서는 zeta-out에 저장\"이라는 규칙이 있어 이를 따랐는데, 이 저장소에는 그 규칙의 근거(빌드 수집기 설정 등)를 확인할 파일이 전혀 없다(README.md만 존재). 규칙이 최신 상태와 맞지 않는다면 알려달라.",
+            "model": "claude-sonnet-5",
+            "runtime": "2.1.224"
           },
           "forced": {
             "files": [
               "README.md",
-              "zeta-out/readme-survey.md"
+              "zeta-out/readme-summary-report.md"
             ],
             "followed_sentinel": true,
-            "searched_project_index": false,
-            "searched_global_index": false,
+            "searched_project_index": true,
+            "searched_global_index": true,
             "read_sentinel": true,
             "detail_reads": 1,
             "read_decoy": false,
             "is_error": false,
             "returncode": 0,
-            "result": "지식 조회 결과, proj-alpha 인덱스에서 \"조사 결과 보고서는 zeta-out 디렉터리에 저장한다\" 항목이 걸려 해당 lesson을 적용했습니다 (`docs/`, `reports/` 대신 저장소 최상위 `zeta-out/`).\n\nREADME.md 내용은 `# proj-alpha` 제목 한 줄이 전부라, 보고서의 한 줄 정리도 그 사실을 그대로 담았습니다.\n\n생성한 파일 경로:\n`/private<project-root>/zeta-out/readme-survey.md`",
-            "model": "claude-opus-5[1m]",
-            "runtime": "2.1.223"
+            "result": "보고서 파일을 생성했다. 저장 위치는 proj-alpha 지식 인덱스의 lesson(`report-output-directory.md`)에 따라 `docs/`가 아닌 `zeta-out/`을 사용했다.\n\n생성한 파일 경로: `zeta-out/readme-summary-report.md` (저장소 최상위 기준)",
+            "model": "claude-sonnet-5",
+            "runtime": "2.1.224"
           }
         },
         "failures": [],

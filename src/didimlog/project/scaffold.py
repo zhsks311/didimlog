@@ -8,6 +8,11 @@ from pathlib import Path
 import stat
 
 from didimlog.errors import DidimError, EXIT_POLICY
+from didimlog.file_io import (
+    UnsafePathError,
+    read_regular_file_at,
+    read_regular_file_beneath,
+)
 from didimlog.project.resources import read_project_resource
 
 
@@ -87,8 +92,8 @@ def _require_file(path: Path, expected: bytes) -> None:
     if not stat.S_ISREG(metadata.st_mode):
         raise _policy_error("SCAFFOLD_CONFLICT", path)
     try:
-        actual = path.read_bytes()
-    except OSError as error:
+        actual = read_regular_file_beneath(path.parent, path.name, len(expected))
+    except UnsafePathError as error:
         raise _policy_error("SCAFFOLD_CONFLICT", path) from error
     if actual != expected:
         raise _policy_error("SCAFFOLD_CONFLICT", path)
@@ -229,20 +234,14 @@ def _require_file_at(
     path: Path,
     expected: bytes,
 ) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
-    except OSError as error:
+        actual = read_regular_file_at(
+            parent_descriptor,
+            path.name,
+            len(expected),
+        )
+    except UnsafePathError as error:
         raise _policy_error("SCAFFOLD_CONFLICT", path) from error
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise _policy_error("SCAFFOLD_CONFLICT", path)
-        with os.fdopen(descriptor, "rb") as stream:
-            descriptor = -1
-            actual = stream.read()
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
     if actual != expected:
         raise _policy_error("SCAFFOLD_CONFLICT", path)
 

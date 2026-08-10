@@ -6,11 +6,16 @@ from collections.abc import Iterable
 import os
 from pathlib import Path
 import stat
-import tempfile
-from didimlog.locking import acquire_directory_lock
+from didimlog.file_io import (
+    UnsafePathError,
+    read_regular_file_beneath,
+    replace_regular_file_at_if_unchanged,
+)
+from didimlog.locking import path_lock
 
 
 from .lesson import (
+    LESSON_MAX_BYTES,
     REQUIRED,
     SLUG,
     parse_booked,
@@ -36,29 +41,10 @@ def _project_lessons(project, root, cwd) -> Path | None:
 def _read_regular_file(path: Path) -> bytes | None:
     """심볼릭 링크와 파일 교체 경쟁을 따라가지 않고 일반 파일만 읽는다."""
     try:
-        entry = path.lstat()
-        if stat.S_ISLNK(entry.st_mode) or not stat.S_ISREG(entry.st_mode):
-            return None
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except OSError:
+        data = read_regular_file_beneath(path.parent, path.name, LESSON_MAX_BYTES)
+    except (UnsafePathError, ValueError):
         return None
-
-    try:
-        opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or opened.st_dev != entry.st_dev
-            or opened.st_ino != entry.st_ino
-        ):
-            return None
-        chunks = bytearray()
-        while chunk := os.read(descriptor, 64 * 1024):
-            chunks.extend(chunk)
-        return bytes(chunks)
-    except OSError:
-        return None
-    finally:
-        os.close(descriptor)
+    return None if len(data) > LESSON_MAX_BYTES else data
 
 
 def _parse_lesson(path: Path, data: bytes):
@@ -153,13 +139,11 @@ def _booked_bytes(data: bytes, parsed) -> bytes:
     return b"\n".join(byte_lines)
 
 
-def _replace_regular_file(path: Path, original: bytes, replacement: bytes) -> bool:
+def _replace_regular_file_locked(path: Path, original: bytes, replacement: bytes) -> bool:
     if replacement == original:
         return True
 
     parent_descriptor: int | None = None
-    lock_descriptor: int | None = None
-    temporary: Path | None = None
     try:
         parent_descriptor = os.open(
             path.parent,
@@ -167,49 +151,29 @@ def _replace_regular_file(path: Path, original: bytes, replacement: bytes) -> bo
             | getattr(os, "O_DIRECTORY", 0)
             | getattr(os, "O_NOFOLLOW", 0),
         )
-        lock_descriptor = acquire_directory_lock(parent_descriptor)
-        entry = path.lstat()
+        entry = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
         if stat.S_ISLNK(entry.st_mode) or not stat.S_ISREG(entry.st_mode):
             return False
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        return replace_regular_file_at_if_unchanged(
+            parent_descriptor,
+            path.name,
+            original,
+            replacement,
+            stat.S_IMODE(entry.st_mode),
+            expected_info=entry,
         )
-        temporary = Path(temporary_name)
-        with os.fdopen(descriptor, "wb") as handle:
-            os.fchmod(handle.fileno(), stat.S_IMODE(entry.st_mode))
-            handle.write(replacement)
-            handle.flush()
-            os.fsync(handle.fileno())
-
-        # The directory lock serializes Didimlog writers; this final comparison
-        # also rejects edits made by other programs before replacement.
-        if _read_regular_file(path) != original:
-            return False
-        os.replace(temporary, path)
-        temporary = None
-        os.fsync(parent_descriptor)
-        return True
-    except OSError:
+    except (OSError, UnsafePathError):
         return False
     finally:
-        if temporary is not None:
-            try:
-                temporary.unlink()
-            except OSError:
-                pass
-        if lock_descriptor is not None:
-            os.close(lock_descriptor)
         if parent_descriptor is not None:
             os.close(parent_descriptor)
 
 
-def mark_booked(slugs: Iterable[str], project=None, root=None, cwd=None):
-    """선택한 lesson의 자체 topic을 canonical ``booked`` 값에 기록한다."""
-    values = list(slugs)
-    directory = _project_lessons(project, root, cwd)
-    if directory is None:
-        return {"marked": [], "skipped": values}
-
+def _mark_booked_locked(values, directory):
     selected = []
     skipped = []
     for slug in values:
@@ -230,8 +194,19 @@ def mark_booked(slugs: Iterable[str], project=None, root=None, cwd=None):
     marked = []
     for slug, path, data, parsed in selected:
         replacement = _booked_bytes(data, parsed)
-        if not _replace_regular_file(path, data, replacement):
+        if not _replace_regular_file_locked(path, data, replacement):
             skipped.append(slug)
             continue
         marked.append(str(path))
     return {"marked": marked, "skipped": skipped}
+
+
+def mark_booked(slugs: Iterable[str], project=None, root=None, cwd=None):
+    """선택한 lesson의 자체 topic을 canonical ``booked`` 값에 기록한다."""
+    values = list(slugs)
+    directory = _project_lessons(project, root, cwd)
+    if directory is None:
+        return {"marked": [], "skipped": values}
+
+    with path_lock(directory.parent.parent):
+        return _mark_booked_locked(values, directory)

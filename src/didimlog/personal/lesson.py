@@ -3,6 +3,9 @@
 import datetime
 import os
 import re
+from pathlib import Path
+
+from didimlog.file_io import UnsafePathError, read_regular_file_beneath
 
 
 SLUG = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$")
@@ -13,6 +16,7 @@ TITLE_MAX_SCALARS = 120
 INDEX_TERM_MAX_SCALARS = 32
 INDEX_TERM_MAX_BYTES = 96
 INDEX_TERMS_MAX_ITEMS = 20
+LESSON_MAX_BYTES = 64 * 1024
 
 
 def valid_index_title(value):
@@ -136,10 +140,15 @@ def parse_lesson_text(name, text):
     return fields, lines, closing
 
 
-def parse_lesson(path):
+def parse_lesson(path, root=None):
+    candidate = Path(path)
+    base = Path(root) if root is not None else candidate.parent
     try:
-        with open(path, encoding="utf-8", newline="") as handle:
-            text = handle.read()
-    except (OSError, UnicodeDecodeError):
+        relative = candidate.relative_to(base)
+        data = read_regular_file_beneath(base, relative, LESSON_MAX_BYTES)
+        if len(data) > LESSON_MAX_BYTES:
+            return None
+        text = data.decode("utf-8")
+    except (UnsafePathError, UnicodeDecodeError, ValueError):
         return None
-    return parse_lesson_text(os.path.basename(path), text)
+    return parse_lesson_text(candidate.name, text)

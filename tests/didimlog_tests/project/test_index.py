@@ -116,7 +116,7 @@ def _write_record(
 ):
     if record_type == "evidence":
         artifact_path = options.setdefault(
-            "artifact_path", "artifacts/data/{}.bin".format(record_id)
+            "artifact_path", "knowledge/raw/data/{}.bin".format(record_id)
         )
         if artifact_git is None:
             artifact = workspace / artifact_path

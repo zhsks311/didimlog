@@ -2,6 +2,7 @@ import dataclasses
 import json
 import os
 import pathlib
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -104,6 +105,10 @@ class ScaffoldTests(unittest.TestCase):
         self.assertTrue(planned[pathlib.Path("knowledge/README.md")].startswith(
             b"# Knowledge Harness (v1)"
         ))
+        self.assertNotIn(
+            b"knowledge-harness-tutorial.html",
+            planned[pathlib.Path("knowledge/README.md")],
+        )
         self.assertEqual(planned[pathlib.Path("knowledge/POINTER.md")], POINTER)
         schema = json.loads(
             planned[pathlib.Path("knowledge/schema/record.schema.json")].decode("utf-8")
@@ -117,6 +122,37 @@ class ScaffoldTests(unittest.TestCase):
             planned[pathlib.Path("knowledge/active/harness.md")],
             ACTIVE_GUIDANCE,
         )
+
+    def test_artifact_path_schema_matches_runtime_component_rules(self):
+        plan = plan_scaffold(self.workspace)
+        planned = self._planned_bytes(plan)
+        schema = json.loads(
+            planned[pathlib.Path("knowledge/schema/record.schema.json")].decode("utf-8")
+        )
+        artifact_schema = schema["properties"]["artifact_path"]
+
+        def accepts(value):
+            if re.search(artifact_schema["pattern"], value) is None:
+                return False
+            excluded = artifact_schema.get("not")
+            return excluded is None or re.search(excluded["pattern"], value) is None
+
+        for value in (
+            "knowledge/raw/a.txt",
+            "knowledge/raw/data/foo..bar",
+            "knowledge/raw/data/.hidden",
+        ):
+            with self.subTest(valid=value):
+                self.assertTrue(accepts(value))
+
+        for value in (
+            "knowledge/raw/a//b",
+            "knowledge/raw/a/./b",
+            "knowledge/raw/a/../b",
+            "knowledge/raw/a/",
+        ):
+            with self.subTest(invalid=value):
+                self.assertFalse(accepts(value))
 
     def test_apply_creates_only_the_planned_scaffold(self):
         plan = plan_scaffold(self.workspace)

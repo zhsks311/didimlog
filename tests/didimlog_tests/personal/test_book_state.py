@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from didimlog import file_io
 from didimlog.personal import book_state
 
 
@@ -187,6 +188,36 @@ class BookStateTests(unittest.TestCase):
             )
 
         self.assertEqual(path.read_bytes(), original)
+
+    def test_change_after_final_recheck_is_preserved(self):
+        original = lesson_bytes()
+        concurrent = lesson_bytes(title="사용자 최신 변경")
+        path = self.write_lesson("app", "new", original)
+        real_read = file_io.read_regular_file_at_with_stat
+        calls = 0
+
+        def save_while_original_is_moved(parent_descriptor, name, maximum_bytes):
+            nonlocal calls
+            result = real_read(parent_descriptor, name, maximum_bytes)
+            calls += 1
+            if calls == 1:
+                path.write_bytes(concurrent)
+            return result
+
+        with mock.patch.object(
+            file_io,
+            "read_regular_file_at_with_stat",
+            side_effect=save_while_original_is_moved,
+        ):
+            result = book_state.mark_booked(
+                ["new"],
+                project="app",
+                root=self.lessons_root,
+            )
+
+        self.assertEqual(result["marked"], [])
+        self.assertEqual(result["skipped"], ["new"])
+        self.assertEqual(path.read_bytes(), concurrent)
 
 
 @unittest.skipUnless(GIT, "git is required for current-project discovery tests")

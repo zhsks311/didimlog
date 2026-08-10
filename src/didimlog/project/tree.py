@@ -8,6 +8,11 @@ from pathlib import Path
 import stat
 import tomllib
 
+from didimlog.file_io import (
+    UnsafePathError,
+    open_child_directory,
+    read_regular_file_at,
+)
 from .artifacts import verify_artifact_git, verify_artifact_local
 from .record import (
     CONTRADICTS_PREFIXES,
@@ -44,28 +49,9 @@ def _open_child_directory(
     path: Path,
 ) -> int:
     try:
-        linked = os.stat(
-            name,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-        descriptor = os.open(
-            name,
-            _directory_flags(),
-            dir_fd=parent_descriptor,
-        )
-    except OSError as error:
+        return open_child_directory(parent_descriptor, name)
+    except UnsafePathError as error:
         raise _path_escape(path) from error
-    opened = os.fstat(descriptor)
-    if (
-        stat.S_ISLNK(linked.st_mode)
-        or not stat.S_ISDIR(opened.st_mode)
-        or opened.st_dev != linked.st_dev
-        or opened.st_ino != linked.st_ino
-    ):
-        os.close(descriptor)
-        raise _path_escape(path)
-    return descriptor
 
 
 def _open_directory_path(path: Path) -> tuple[int, Path]:
@@ -93,34 +79,13 @@ def _read_regular_file_at(
     path: Path,
 ) -> bytes:
     try:
-        linked = os.stat(
+        return read_regular_file_at(
+            directory_descriptor,
             name,
-            dir_fd=directory_descriptor,
-            follow_symlinks=False,
+            RECORD_MAX_BYTES,
         )
-        descriptor = os.open(
-            name,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=directory_descriptor,
-        )
-    except OSError as error:
+    except UnsafePathError as error:
         raise _path_escape(path) from error
-
-    try:
-        opened = os.fstat(descriptor)
-        if (
-            stat.S_ISLNK(linked.st_mode)
-            or not stat.S_ISREG(opened.st_mode)
-            or opened.st_dev != linked.st_dev
-            or opened.st_ino != linked.st_ino
-        ):
-            raise _path_escape(path)
-        chunks = bytearray()
-        while chunk := os.read(descriptor, 64 * 1024):
-            chunks.extend(chunk)
-        return bytes(chunks)
-    finally:
-        os.close(descriptor)
 
 
 def _walk_record_documents(directory_descriptor: int, directory: Path):

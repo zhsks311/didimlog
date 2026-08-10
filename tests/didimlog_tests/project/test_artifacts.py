@@ -23,7 +23,7 @@ from didimlog.project.record import (
 
 
 RECORD_ID = "EVD-20260714-01"
-ARTIFACT_PATH = "artifacts/data/report.bin"
+ARTIFACT_PATH = "knowledge/raw/data/report.bin"
 ARTIFACT_BYTES = b"didimlog artifact\n"
 ARTIFACT_SHA256 = hashlib.sha256(ARTIFACT_BYTES).hexdigest()
 
@@ -50,16 +50,16 @@ class ArtifactPathContractTests(ErrorContractMixin, unittest.TestCase):
         invalid_values = (
             None,
             "",
-            "/artifacts/data/report.bin",
-            "./artifacts/data/report.bin",
-            "artifacts//data/report.bin",
-            "artifacts/./data/report.bin",
-            "artifacts/../outside.bin",
-            "artifacts/data/",
-            "artifacts\\data\\report.bin",
-            "artifacts/data/\x00report.bin",
-            "artifacts/data/\nreport.bin",
-            "artifacts/" + "x" * 1_025,
+            "/knowledge/raw/data/report.bin",
+            "./knowledge/raw/data/report.bin",
+            "knowledge//raw/data/report.bin",
+            "knowledge/./raw/data/report.bin",
+            "knowledge/raw/../outside.bin",
+            "knowledge/raw/data/",
+            "knowledge\\raw\\data\\report.bin",
+            "knowledge/raw/data/\x00report.bin",
+            "knowledge/raw/data/\nreport.bin",
+            "knowledge/raw/" + "x" * 1_025,
         )
         for value in invalid_values:
             with self.subTest(value=value):
@@ -70,7 +70,7 @@ class ArtifactPathContractTests(ErrorContractMixin, unittest.TestCase):
                     lambda value=value: check_artifact_path_format(value, RECORD_ID),
                 )
 
-    def test_policy_requires_artifacts_prefix_and_returns_workspace_path(self):
+    def test_policy_requires_knowledge_raw_prefix_and_returns_workspace_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp) / "project"
             workspace.mkdir()
@@ -81,14 +81,14 @@ class ArtifactPathContractTests(ErrorContractMixin, unittest.TestCase):
 
             self.assertEqual(Path(checked), workspace / ARTIFACT_PATH)
 
-    def test_policy_rejects_non_artifacts_and_escape_paths(self):
+    def test_policy_rejects_old_artifacts_and_escape_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp) / "project"
             workspace.mkdir()
             paths = (
-                "knowledge/raw/report.bin",
-                "artifact/report.bin",
-                "artifacts/../outside.bin",
+                "artifacts/report.bin",
+                "knowledge/report.bin",
+                "knowledge/raw/../outside.bin",
                 str(Path(tmp) / "outside.bin"),
             )
             for artifact_path in paths:
@@ -105,7 +105,7 @@ class ArtifactPathContractTests(ErrorContractMixin, unittest.TestCase):
     def test_policy_rejects_symlinks_even_when_target_stays_in_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp) / "project"
-            artifact_dir = workspace / "artifacts" / "data"
+            artifact_dir = workspace / "knowledge" / "raw" / "data"
             artifact_dir.mkdir(parents=True)
             target = artifact_dir / "target.bin"
             target.write_bytes(ARTIFACT_BYTES)
@@ -125,7 +125,7 @@ class ArtifactPathContractTests(ErrorContractMixin, unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workspace = root / "project"
-            artifact_root = workspace / "artifacts"
+            artifact_root = workspace / "knowledge" / "raw"
             outside = root / "outside"
             artifact_root.mkdir(parents=True)
             outside.mkdir()
@@ -175,10 +175,10 @@ class LocalArtifactContractTests(ErrorContractMixin, unittest.TestCase):
     def test_missing_or_non_file_artifact_is_stable_policy_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp) / "project"
-            (workspace / "artifacts" / "data").mkdir(parents=True)
+            (workspace / "knowledge" / "raw" / "data").mkdir(parents=True)
             cases = (
                 ARTIFACT_PATH,
-                "artifacts/data",
+                "knowledge/raw/data",
             )
             for artifact_path in cases:
                 with self.subTest(artifact_path=artifact_path):
@@ -245,7 +245,7 @@ class LocalArtifactContractTests(ErrorContractMixin, unittest.TestCase):
             workspace = root / "project"
             workspace.mkdir()
             (root / "outside.bin").write_bytes(ARTIFACT_BYTES)
-            artifact_path = "artifacts/../../outside.bin"
+            artifact_path = "knowledge/raw/../../outside.bin"
 
             self.assert_didim_error(
                 PolicyError,
@@ -343,7 +343,7 @@ class GitArtifactContractTests(ErrorContractMixin, unittest.TestCase):
     def test_commit_must_bind_the_exact_artifact_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace, commit, _ = self._seed_repository(tmp)
-            missing_path = "artifacts/data/missing.bin"
+            missing_path = "knowledge/raw/data/missing.bin"
 
             self.assert_didim_error(
                 PolicyError,
@@ -357,7 +357,7 @@ class GitArtifactContractTests(ErrorContractMixin, unittest.TestCase):
     def test_git_binding_rejects_tree_at_artifact_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace, commit, _ = self._seed_repository(tmp)
-            directory_path = "artifacts/data"
+            directory_path = "knowledge/raw/data"
 
             self.assert_didim_error(
                 PolicyError,
@@ -411,10 +411,10 @@ class GitArtifactContractTests(ErrorContractMixin, unittest.TestCase):
                 ),
             )
 
-    def test_git_verification_enforces_artifacts_path_policy(self):
+    def test_git_verification_rejects_old_artifacts_path_policy(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace, commit, _ = self._seed_repository(tmp)
-            artifact_path = "knowledge/raw/report.bin"
+            artifact_path = "artifacts/report.bin"
 
             self.assert_didim_error(
                 PolicyError,

@@ -22,13 +22,20 @@ from didimlog.claude.hook import session_start
 from didimlog.claude.setup import apply_setup, plan_setup
 from didimlog.claude.status import doctor_text, status_text
 from didimlog.claude.transaction import InstallJournal
-from didimlog.errors import DidimError, EXIT_POLICY, EXIT_USAGE, emit_error
+from didimlog.errors import (
+    DidimError,
+    EXIT_POLICY,
+    EXIT_SECRET,
+    EXIT_USAGE,
+    emit_error,
+)
 from didimlog.indexing import run_index
 from didimlog.personal.lesson import parse_lesson_text
 from didimlog.personal.lesson_writing import (
     LessonError,
     LessonExists,
     LessonInvalid,
+    LessonSecret,
     publish_lesson,
 )
 from didimlog.project.capture import CaptureRequest, capture
@@ -395,6 +402,8 @@ def _session_start(args) -> int:
 def _as_didim_error(error: Exception) -> DidimError:
     if isinstance(error, DidimError):
         return error
+    if isinstance(error, LessonSecret):
+        return DidimError("LESSON_SECRET", exit_code=EXIT_SECRET)
     if isinstance(error, LessonExists):
         return DidimError("LESSON_EXISTS", exit_code=EXIT_POLICY)
     if isinstance(error, LessonInvalid):

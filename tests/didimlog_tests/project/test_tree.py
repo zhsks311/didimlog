@@ -68,7 +68,7 @@ def _record_document(
         fields.append(("superseded_by", superseded_by))
     if record_type == "evidence":
         if artifact_path is None:
-            artifact_path = "artifacts/data/{}.bin".format(record_id)
+            artifact_path = "knowledge/raw/data/{}.bin".format(record_id)
         if artifact_sha256 is None:
             artifact_sha256 = hashlib.sha256(b"artifact\n").hexdigest()
         fields.extend(
@@ -126,7 +126,7 @@ def _write_record(
     artifact_path = document_options.get("artifact_path")
     if record_type == "evidence":
         if artifact_path is None:
-            artifact_path = "artifacts/data/{}.bin".format(record_id)
+            artifact_path = "knowledge/raw/data/{}.bin".format(record_id)
             document_options["artifact_path"] = artifact_path
         if create_artifact:
             artifact = workspace / artifact_path
@@ -615,7 +615,7 @@ class RecordTreeValidationTests(unittest.TestCase):
                 workspace = Path(temp_dir) / "workspace"
                 workspace.mkdir()
                 record_id = "EVD-20260714-01"
-                artifact_path = "artifacts/data/{}.bin".format(record_id)
+                artifact_path = "knowledge/raw/data/{}.bin".format(record_id)
                 _write_record(
                     workspace,
                     record_id,

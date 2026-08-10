@@ -1,5 +1,7 @@
 import contextlib
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import io
+import multiprocessing
 import os
 import shutil
 import tempfile
@@ -7,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from didimlog.personal import index as knowledge_index
+from didimlog.personal.lesson_writing import publish_lesson
 
 
 GENERATED_NOTICE = "<!-- Didimlog Personal Knowledge가 자동 생성한다. 직접 수정하지 마라. -->"
@@ -32,6 +35,23 @@ find_when: [mongodb, recovery]
 ---
 장문 해설 본문 표식
 """
+
+def _write_paused_stale_index(root, snapshot_ready, release_snapshot):
+    data_root = Path(root)
+    original_build_all = knowledge_index.build_all
+
+    def blocked_build_all(candidate_root=None):
+        outputs = original_build_all(candidate_root)
+        snapshot_ready.set()
+        release_snapshot.wait(5)
+        return outputs
+
+    knowledge_index.build_all = blocked_build_all
+    knowledge_index.write_all(
+        data_root=data_root,
+        target=data_root / "index",
+    )
+
 
 
 class KnowledgeIndexTests(unittest.TestCase):
@@ -413,6 +433,47 @@ body
 
         self.assertFalse((target / "demo-api.md").exists())
         self.assertEqual(knowledge_index.check(self.root, target), 0)
+
+    def test_lesson_publish_cannot_be_overwritten_by_an_older_index_snapshot(self):
+        project_lessons = self.root / "lessons" / "demo-api"
+        project_lessons.mkdir()
+        context = multiprocessing.get_context("spawn")
+        snapshot_ready = context.Event()
+        release_snapshot = context.Event()
+        stale_writer = context.Process(
+            target=_write_paused_stale_index,
+            args=(self.root, snapshot_ready, release_snapshot),
+        )
+        stale_writer.start()
+        self.addCleanup(
+            lambda: stale_writer.kill() if stale_writer.is_alive() else None
+        )
+        self.assertTrue(snapshot_ready.wait(5))
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            publisher = executor.submit(
+                publish_lesson,
+                "new-rule",
+                LESSON.replace(
+                    "부분수정에서 null은 해제다",
+                    "가장 최근 규칙",
+                ),
+                "demo-api",
+                self.root / "lessons",
+            )
+            try:
+                with self.assertRaises(TimeoutError):
+                    publisher.result(timeout=0.1)
+            finally:
+                release_snapshot.set()
+            stale_writer.join(5)
+            publisher.result(timeout=5)
+
+        self.assertEqual(stale_writer.exitcode, 0)
+        index_text = (self.root / "index" / "demo-api.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("가장 최근 규칙", index_text)
 
     def test_project_index_remains_when_only_one_source_section_is_removed(self):
         self.write("lessons/demo-api/one.md", LESSON)

@@ -1,8 +1,7 @@
-# Knowledge Harness (v1) — `improver` 프로젝트 지식 저장소
+# Knowledge Harness (v1) — 프로젝트 지식 저장소
 
-이 디렉터리는 `improver` 프로젝트가 학습한 내용을 **결정론적 파일**로 남기고 다시
-찾아 쓰기 위한 최소 저장소다. 처음 보는 사람도 이 문서 하나로 무엇을 어떻게
-기록하고 조회하는지 알 수 있도록 작성했다. 사람이 읽는 본문은 한국어로 쓰고,
+이 디렉터리는 현재 프로젝트에서 확인한 내용을 **결정론적 파일**로 남기고 다시
+찾아 쓰기 위한 저장소다. 사람이 읽는 본문은 한국어로 쓰고,
 코드·명령·식별자·schema key·enum 값(예: `observation`, `draft`)은 영어 원형을
 그대로 둔다.
 
@@ -13,21 +12,16 @@
 
 ---
 
-## 0. 처음이라면 이 순서로 읽으세요 (first-reader path)
-명령어와 용어가 낯설다면 먼저 프로젝트 루트의
-`knowledge-harness-tutorial.html`을 브라우저로 여세요. Codex·Claude Code에 보낼
-작업 전·후 문장부터 설명하는 실전 사용 안내서이며, 이 README는 세부 계약을 확인할 때
-사용합니다.
+## 0. 처음이라면 이 순서로 읽으세요
 
+1. `knowledge/POINTER.md` — 조회 순서와 금지사항만 담은 짧은 안내.
+2. 이 `README.md` — 용어·구조·명령·수명주기 전체 설명.
+3. `knowledge/schema/record.schema.json` — 기록 frontmatter의 정확한 형식.
+4. `knowledge/records/` 아래 실제 기록. 현재 비어 있다면 이후 실제 작업에서 채운다.
 
-1. `knowledge-harness-tutorial.html` — 에이전트 채팅부터 시작하는 한국어 사용 설명서.
-2. `knowledge/POINTER.md` — 조회 순서와 금지사항만 담은 짧은 안내(규칙 아님).
-3. 이 `README.md` — 용어·구조·명령·수명주기 전체 설명.
-4. `knowledge/schema/record.schema.json` — 기록 frontmatter의 정확한 형식.
-5. `knowledge/records/` 아래 실제 기록. 현재 비어 있다면 이후 실제 작업에서 채운다.
-
-조회(retrieve)할 때의 순서는 항상: **POINTER.md → active/harness.md →
-index/INDEX.md → 선택한 기록(최대 5건)**. 이 순서는 POINTER.md에도 요약돼 있다.
+조회할 때의 순서는 항상 **POINTER.md → active/harness.md →
+index/INDEX.md → 선택한 기록(최대 5건)**이다. `POINTER.md`에도 같은 순서가
+요약돼 있다.
 
 ---
 
@@ -134,8 +128,8 @@ didim index --help
 모든 EVD 기록은 산출물을 **반드시** 선언한다(빈 provenance는 허용하지 않는다).
 frontmatter에 다음 key가 붙는다.
 
-- `artifact_path`: project 상대경로(필수). 절대경로, `..`, NUL, backslash,
-  project 밖 symlink target은 금지한다.
+- `artifact_path`: `knowledge/raw/` 아래의 project 상대경로(필수). 절대경로,
+  `..`, NUL, backslash, 빈 path segment, symlink는 금지한다.
 - **local 모드:** `artifact_sha256`(소문자 64-hex)이 필수이고 `artifact_git`은
   없다. `didim add evidence`와 `didim index`가 실제 파일의 SHA-256을 다시 계산해 비교한다.
   불일치 시 exit `3`, `ARTIFACT_DIGEST_MISMATCH <evidence-id> <artifact-path>`.

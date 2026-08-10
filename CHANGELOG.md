@@ -2,6 +2,19 @@
 
 이 문서는 Didimlog의 사용자에게 보이는 변경을 기록합니다. 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/)를 따르고, 버전은 [Semantic Versioning](https://semver.org/lang/ko/)을 따릅니다.
 
+## [Unreleased]
+
+### 변경
+
+- 프로젝트 evidence 경로를 `knowledge/raw/` 아래로 제한하고 scaffold 문서를 현재 CLI 기준으로 정리했습니다.
+- 프로젝트 record와 개인 lesson·index를 같은 source snapshot 잠금 안에서 처리합니다.
+
+### 수정
+
+- 경로를 검사한 뒤 파일이 교체되는 경쟁과 부분 record가 최종 파일명으로 노출될 수 있는 문제를 막았습니다.
+- 조회 A/B의 각 case가 독립된 `HOME`과 Claude 설정을 사용하고, Claude 자식 프로세스에는 검증된 OAuth access token과 실행에 필요한 환경만 전달하도록 격리했습니다.
+- 비밀값이 포함된 lesson은 값을 출력하지 않고 `LESSON_SECRET`과 exit `5`로 거부합니다.
+
 ## [0.0.1] - 2026-08-05
 
 ### 추가

@@ -1,8 +1,10 @@
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
+from didimlog.claude import config
 from didimlog.claude.config import (
     plan_claude_md,
     plan_settings,
@@ -324,6 +326,35 @@ class ConditionalWriteTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 write_if_unchanged(target, planned_original, b"managed result\n")
+
+            self.assertEqual(target.read_bytes(), concurrent_bytes)
+
+    def test_change_after_final_recheck_is_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            target = Path(temporary_directory) / "CLAUDE.md"
+            original = b"# before planning\n"
+            concurrent_bytes = b"# user saved during publish\n"
+            target.write_bytes(original)
+            real_read_target = config._read_target
+            calls = 0
+
+            def change_after_recheck(parent_descriptor, name):
+                nonlocal calls
+                result = real_read_target(parent_descriptor, name)
+                calls += 1
+                if calls == 2:
+                    target.write_bytes(concurrent_bytes)
+                return result
+
+            with (
+                mock.patch.object(
+                    config,
+                    "_read_target",
+                    side_effect=change_after_recheck,
+                ),
+                self.assertRaises(ValueError),
+            ):
+                write_if_unchanged(target, original, b"managed result\n")
 
             self.assertEqual(target.read_bytes(), concurrent_bytes)
 

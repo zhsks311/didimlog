@@ -18,7 +18,6 @@ from didimlog.project.record import (
     serialize_record,
     validate_body,
     validate_frontmatter,
-    write_atomic,
 )
 
 
@@ -225,9 +224,9 @@ class FrontmatterContractTests(unittest.TestCase):
     def test_evidence_artifact_path_is_canonical_project_relative(self):
         for artifact_path in (
             "/etc/passwd",
-            "artifacts/../outside.bin",
-            "./artifacts/report.bin",
-            "artifacts//report.bin",
+            "knowledge/raw/../outside.bin",
+            "./knowledge/raw/report.bin",
+            "knowledge//raw/report.bin",
         ):
             fields = frontmatter("evidence")
             fields["artifact_path"] = artifact_path
@@ -396,27 +395,6 @@ class SerializationContractTests(unittest.TestCase):
             observation_document("\n".join(["x"] * 185))
 
 
-class AtomicWriteContractTests(unittest.TestCase):
-    def test_write_atomic_creates_exact_bytes(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "OBS-20260714-01.md"
-            data = b"exact\nbytes\n"
-
-            write_atomic(path, data, IDS["observation"])
-
-            self.assertEqual(path.read_bytes(), data)
-
-    def test_write_atomic_collision_preserves_existing_file(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "OBS-20260714-01.md"
-            path.write_bytes(b"ORIGINAL\n")
-
-            with self.assertRaisesRegex(
-                PolicyError, r"^ALREADY_EXISTS OBS-20260714-01$"
-            ):
-                write_atomic(path, b"replacement\n", IDS["observation"])
-
-            self.assertEqual(path.read_bytes(), b"ORIGINAL\n")
 
 
 if __name__ == "__main__":

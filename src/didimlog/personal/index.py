@@ -8,6 +8,12 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Iterable, Mapping
+from didimlog.file_io import (
+    UnsafePathError,
+    open_directory_path,
+    read_regular_file_beneath,
+)
+from didimlog.locking import path_lock
 
 from .lesson import (
     parse_frontmatter_text,
@@ -24,6 +30,7 @@ SECTIONS = (
     ("book", "해설 자료"),
 )
 GENERATED_NOTICE = "<!-- Didimlog Personal Knowledge가 자동 생성한다. 직접 수정하지 마라. -->"
+SOURCE_MAX_BYTES = 4 * 1024 * 1024
 
 
 class KnowledgeIndexError(ValueError):
@@ -144,7 +151,7 @@ def _validate_nonrecursive_layout(
 
 
 def _lesson_item(path: Path, data_root: Path) -> dict[str, object]:
-    parsed = parse_lesson(path)
+    parsed = parse_lesson(path, data_root)
     if parsed is None:
         raise KnowledgeIndexError(
             "KNOWLEDGE_INDEX_INVALID {}: invalid lesson metadata".format(path)
@@ -171,9 +178,12 @@ def _lesson_item(path: Path, data_root: Path) -> dict[str, object]:
 
 def _document_item(path: Path, kind: str, data_root: Path) -> dict[str, object]:
     try:
-        with path.open(encoding="utf-8", newline="") as handle:
-            text = handle.read()
-    except (OSError, UnicodeDecodeError) as exc:
+        relative = path.relative_to(data_root)
+        data = read_regular_file_beneath(data_root, relative, SOURCE_MAX_BYTES)
+        if len(data) > SOURCE_MAX_BYTES:
+            raise UnsafePathError("source exceeds read limit")
+        text = data.decode("utf-8")
+    except (UnsafePathError, UnicodeDecodeError, ValueError) as exc:
         raise KnowledgeIndexError(
             "KNOWLEDGE_INDEX_INVALID {}: unreadable Markdown".format(path)
         ) from exc
@@ -390,9 +400,18 @@ def _validate_index_directory(target: Path, expected: set[str]) -> None:
             continue
         try:
             validate_project(entry.stem, allow_global=True)
-            with entry.open(encoding="utf-8", newline="") as handle:
-                first_line = handle.readline().removesuffix("\n").removesuffix("\r")
-        except (ValueError, OSError, UnicodeDecodeError) as exc:
+            notice_limit = len(GENERATED_NOTICE.encode("utf-8")) + 2
+            data = read_regular_file_beneath(
+                target,
+                entry.name,
+                notice_limit,
+            )
+            first_line = (
+                data.decode("utf-8")
+                .split("\n", 1)[0]
+                .removesuffix("\r")
+            )
+        except (ValueError, UnsafePathError, UnicodeDecodeError) as exc:
             raise KnowledgeIndexError(
                 "KNOWLEDGE_INDEX_INVALID {}: unknown index entry".format(entry)
             ) from exc
@@ -404,8 +423,16 @@ def _validate_index_directory(target: Path, expected: set[str]) -> None:
             )
 
 
-def write_all(outputs=None, data_root=None, target=None) -> Path:
-    """전체 출력을 준비한 뒤 각 인덱스를 원자적으로 교체한다."""
+def _domain_root(data_root=None, target=None) -> Path:
+    if data_root is not None:
+        return Path(data_root)
+    if target is not None:
+        return Path(target).parent
+    return lessons_dir().parent
+
+
+def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
+    """잠금을 보유한 호출자가 전체 인덱스를 원자적으로 교체한다."""
     built = build_all(data_root) if outputs is None else outputs
     normalized = _normalized_outputs(built)
     destination = Path(target) if target is not None else index_dir()
@@ -469,6 +496,11 @@ def write_all(outputs=None, data_root=None, target=None) -> Path:
                             entry
                         )
                     ) from exc
+        directory_descriptor = open_directory_path(destination)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     finally:
         for temporary in prepared.values():
             if temporary is not None:
@@ -479,8 +511,15 @@ def write_all(outputs=None, data_root=None, target=None) -> Path:
     return destination
 
 
-def check(data_root=None, target=None) -> int:
-    """파일을 바꾸지 않고 현재 인덱스가 전체 원본과 정확히 같은지 검사한다."""
+def write_all(outputs=None, data_root=None, target=None) -> Path:
+    """하나의 개인 지식 snapshot에서 전체 인덱스를 교체한다."""
+    root = _domain_root(data_root, target)
+    with path_lock(root):
+        return _write_all_locked(outputs, data_root, target)
+
+
+def _check_locked(data_root=None, target=None) -> int:
+    """잠금을 보유한 호출자가 현재 개인 인덱스를 검사한다."""
     destination = Path(target) if target is not None else index_dir()
     try:
         outputs = _normalized_outputs(build_all(data_root))
@@ -492,7 +531,15 @@ def check(data_root=None, target=None) -> int:
         if actual != expected:
             raise KnowledgeIndexError("index file set is out of date")
         for project, text in outputs.items():
-            if (destination / (project + ".md")).read_bytes() != text.encode("utf-8"):
+            expected_bytes = text.encode("utf-8")
+            if (
+                read_regular_file_beneath(
+                    destination,
+                    project + ".md",
+                    len(expected_bytes),
+                )
+                != expected_bytes
+            ):
                 raise KnowledgeIndexError("{} is out of date".format(project))
     except (KnowledgeIndexError, OSError, UnicodeDecodeError) as exc:
         print(
@@ -502,3 +549,10 @@ def check(data_root=None, target=None) -> int:
         )
         return 1
     return 0
+
+
+def check(data_root=None, target=None) -> int:
+    """공유 잠금으로 일관된 개인 지식 snapshot을 검사한다."""
+    root = _domain_root(data_root, target)
+    with path_lock(root, shared=True):
+        return _check_locked(data_root, target)

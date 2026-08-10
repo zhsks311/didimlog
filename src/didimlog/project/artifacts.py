@@ -35,8 +35,8 @@ def check_artifact_path_format(value, record_id):
     """Return a canonical project-relative path or raise a schema error.
 
     This validates the path scalar used by either exclusive evidence binding
-    mode. Filesystem placement below ``artifacts/`` is enforced separately by
-    :func:`check_artifact_path_policy`.
+    mode. Filesystem placement below ``knowledge/raw/`` is enforced separately
+    by :func:`check_artifact_path_policy`.
     """
     if not isinstance(value, str) or not 1 <= len(value) <= ARTIFACT_PATH_MAX:
         raise _invalid_artifact_path(record_id)
@@ -62,7 +62,7 @@ def check_artifact_path_format(value, record_id):
 
 
 def check_artifact_path_policy(workspace, artifact_path, record_id):
-    """Return an ``artifacts/`` path that cannot escape through a symlink.
+    """Return a ``knowledge/raw/`` path that cannot escape through a symlink.
 
     The caller must first apply :func:`check_artifact_path_format` when
     validating record schema. Policy failures deliberately remain exit-code 3
@@ -79,8 +79,8 @@ def check_artifact_path_policy(workspace, artifact_path, record_id):
     if (
         os.path.isabs(artifact_path)
         or not 1 <= len(artifact_path) <= ARTIFACT_PATH_MAX
-        or len(parts) < 2
-        or parts[0] != "artifacts"
+        or len(parts) < 3
+        or parts[:2] != ["knowledge", "raw"]
         or any(part in ("", ".", "..") for part in parts)
         or "\\" in artifact_path
         or any(

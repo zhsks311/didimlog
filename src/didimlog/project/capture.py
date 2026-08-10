@@ -6,12 +6,15 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import shutil
+import secrets
 import stat
 import subprocess
 import sys
 import unicodedata
 
 from didimlog.errors import DidimError, EXIT_GIT, EXIT_POLICY
+from didimlog.locking import path_lock
+from didimlog.file_io import UnsafePathError, read_regular_file_beneath
 from .artifacts import (
     check_artifact_path_format,
     verify_artifact_git,
@@ -110,12 +113,15 @@ def _require_scaffold(workspace: Path) -> None:
             if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
                 raise OSError("unsafe scaffold directory")
         for path, content in expected.files:
-            entry = path.lstat()
-            if stat.S_ISLNK(entry.st_mode) or not stat.S_ISREG(entry.st_mode):
-                raise OSError("unsafe scaffold file")
-            if path.read_bytes() != content:
+            relative = path.relative_to(workspace)
+            actual = read_regular_file_beneath(
+                workspace,
+                relative,
+                len(content),
+            )
+            if actual != content:
                 raise OSError("stale scaffold file")
-    except (DidimError, OSError):
+    except (DidimError, OSError, UnsafePathError, ValueError):
         raise _project_error(
             "PROJECT_SCAFFOLD_MISSING",
             "먼저 didim setup을 실행해 프로젝트 지식 저장소를 준비하세요.",
@@ -319,10 +325,16 @@ def _write_create_only(path: Path, data: bytes) -> None:
             directory,
             os.O_RDONLY
             | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
         )
     except OSError as error:
         raise PolicyError("PATH_ESCAPE {}".format(directory)) from error
+
+    temporary_name: str | None = None
+    temporary_descriptor: int | None = None
+    published_identity: tuple[int, int] | None = None
+    published = False
     try:
         opened = os.fstat(directory_descriptor)
         if (
@@ -332,28 +344,73 @@ def _write_create_only(path: Path, data: bytes) -> None:
             or opened.st_ino != linked.st_ino
         ):
             raise PolicyError("PATH_ESCAPE {}".format(directory))
-        descriptor = os.open(
+
+        for _ in range(32):
+            candidate = ".didim-record-{}.tmp".format(secrets.token_hex(12))
+            try:
+                temporary_descriptor = os.open(
+                    candidate,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o644,
+                    dir_fd=directory_descriptor,
+                )
+                temporary_name = candidate
+                break
+            except FileExistsError:
+                continue
+        if temporary_descriptor is None or temporary_name is None:
+            raise OSError("could not allocate record temporary file")
+
+        remaining = memoryview(data)
+        while remaining:
+            written = os.write(temporary_descriptor, remaining)
+            if written <= 0:
+                raise OSError("short write")
+            remaining = remaining[written:]
+        os.fsync(temporary_descriptor)
+        temporary_info = os.fstat(temporary_descriptor)
+        published_identity = (temporary_info.st_dev, temporary_info.st_ino)
+        os.close(temporary_descriptor)
+        temporary_descriptor = None
+
+        os.link(
+            temporary_name,
             path.name,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-            0o644,
-            dir_fd=directory_descriptor,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+            follow_symlinks=False,
         )
-        try:
-            remaining = memoryview(data)
-            while remaining:
-                written = os.write(descriptor, remaining)
-                if written <= 0:
-                    raise OSError("short write")
-                remaining = remaining[written:]
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        published = True
         os.fsync(directory_descriptor)
+        os.unlink(temporary_name, dir_fd=directory_descriptor)
+        temporary_name = None
+        os.fsync(directory_descriptor)
+    except BaseException:
+        if published and published_identity is not None:
+            try:
+                current = os.stat(
+                    path.name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                if (current.st_dev, current.st_ino) == published_identity:
+                    os.unlink(path.name, dir_fd=directory_descriptor)
+                    os.fsync(directory_descriptor)
+            except OSError:
+                pass
+        raise
     finally:
+        if temporary_descriptor is not None:
+            os.close(temporary_descriptor)
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_descriptor)
+            except OSError:
+                pass
         os.close(directory_descriptor)
 
 
@@ -361,27 +418,16 @@ def _refresh_index(workspace: Path) -> None:
     try:
         from . import index
 
-        index.write_index(workspace)
+        index._write_index_locked(workspace)
     except Exception:
         print("PROJECT_INDEX_STALE: run didim index", file=sys.stderr)
 
 
-def capture(
-    workspace: Path,
+def _capture_locked(
+    root: Path,
     request: CaptureRequest,
-    *,
-    max_id_retries: int = 8,
+    max_id_retries: int,
 ) -> Path:
-    """Validate and create one record without exposing its ID or output path."""
-    if not isinstance(request, CaptureRequest):
-        raise SchemaError("INVALID_CAPTURE_REQUEST")
-    if not isinstance(max_id_retries, int) or isinstance(max_id_retries, bool):
-        raise SchemaError("INVALID_ID_RETRIES")
-    if max_id_retries < 1:
-        raise SchemaError("INVALID_ID_RETRIES")
-
-    root = _require_git_root(Path(workspace))
-    _require_scaffold(root)
     record_type = request.type
     if record_type not in _PREFIX_BY_TYPE:
         raise SchemaError("FUTURE_TYPE {}".format(record_type))
@@ -434,3 +480,24 @@ def capture(
         return path
 
     raise PolicyError("ID_ALLOCATION_RETRY_EXHAUSTED")
+
+
+def capture(
+    workspace: Path,
+    request: CaptureRequest,
+    *,
+    max_id_retries: int = 8,
+) -> Path:
+    """Validate and create one record from one exclusive project snapshot."""
+    if not isinstance(request, CaptureRequest):
+        raise SchemaError("INVALID_CAPTURE_REQUEST")
+    if not isinstance(max_id_retries, int) or isinstance(max_id_retries, bool):
+        raise SchemaError("INVALID_ID_RETRIES")
+    if max_id_retries < 1:
+        raise SchemaError("INVALID_ID_RETRIES")
+
+    root = _require_git_root(Path(workspace))
+    _require_scaffold(root)
+    with path_lock(root / "knowledge") as _knowledge_descriptor:
+        _require_scaffold(root)
+        return _capture_locked(root, request, max_id_retries)

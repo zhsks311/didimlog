@@ -9,6 +9,8 @@ import stat
 
 from .record import PolicyError
 from .tree import record_tree_digest, validate_record_tree
+from didimlog.file_io import UnsafePathError, read_regular_file_beneath
+from didimlog.locking import path_lock
 
 
 INDEX_BANNER = (
@@ -198,8 +200,8 @@ def _write_all(descriptor: int, data: bytes) -> None:
     os.fsync(descriptor)
 
 
-def write_index(workspace: Path) -> Path:
-    """Replace the fixed project index only after complete tree validation."""
+def _write_index_locked(workspace: Path) -> Path:
+    """Build and replace the index while the caller owns the project lock."""
     _validate_output_target(Path(workspace), _output_path(Path(workspace)))
     data = build_index_bytes(workspace)
     directory_descriptor, output = _open_index_directory(Path(workspace))
@@ -247,8 +249,15 @@ def write_index(workspace: Path) -> Path:
         os.close(directory_descriptor)
 
 
-def check_index(workspace: Path) -> int:
-    """Return zero only when the fixed index already matches current records."""
+def write_index(workspace: Path) -> Path:
+    """Replace the fixed project index from one exclusive source snapshot."""
+    root = Path(os.path.abspath(workspace))
+    with path_lock(root / "knowledge"):
+        return _write_index_locked(root)
+
+
+def _check_index_locked(workspace: Path) -> int:
+    """Compare the fixed index while the caller owns the project lock."""
     expected = build_index_bytes(workspace)
     output = _output_path(Path(workspace))
     _validate_output_target(Path(workspace), output)
@@ -259,7 +268,18 @@ def check_index(workspace: Path) -> int:
     if stat.S_ISLNK(linked.st_mode) or not stat.S_ISREG(linked.st_mode):
         raise PolicyError("INDEX_PATH_UNSAFE {}".format(output))
     try:
-        actual = output.read_bytes()
-    except OSError as error:
+        actual = read_regular_file_beneath(
+            Path(workspace),
+            Path("knowledge") / "index" / "INDEX.md",
+            len(expected),
+        )
+    except UnsafePathError as error:
         raise PolicyError("INDEX_PATH_UNSAFE {}".format(output)) from error
     return 0 if actual == expected else 1
+
+
+def check_index(workspace: Path) -> int:
+    """Return zero only for one shared-lock-consistent project snapshot."""
+    root = Path(os.path.abspath(workspace))
+    with path_lock(root / "knowledge", shared=True):
+        return _check_index_locked(root)

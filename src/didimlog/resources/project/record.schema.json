@@ -114,13 +114,10 @@
     },
     "artifact_path": {
       "type": "string",
-      "minLength": 1,
+      "minLength": 15,
       "maxLength": 1024,
-      "pattern": "^[^/\\u0000-\\u001F\\\\][^\\u0000-\\u001F\\\\]*$",
-      "not": {
-        "pattern": "\\.\\."
-      },
-      "$comment": "Evidence only. Project-relative path to the bound artifact: it may not be absolute (no leading '/'), may not contain a backslash, control char, or NUL, and may not contain the '..' substring. Symlink escape outside the workspace cannot be expressed here and is rejected by kh-index (exit 3)."
+      "pattern": "^knowledge/raw/(?:(?!\\.{1,2}(?:/|$))[^/\\u0000-\\u001F\\\\]+/)*(?!\\.{1,2}$)[^/\\u0000-\\u001F\\\\]+$",
+      "$comment": "Evidence only. Project-relative path below knowledge/raw/ to the bound artifact: it may not contain a backslash, control char, NUL, empty path segment, '.', or '..'. Every path component must be a regular directory or the final regular file; symlinks are rejected by didim add evidence and didim index (exit 3)."
     },
     "artifact_sha256": {
       "type": "string",

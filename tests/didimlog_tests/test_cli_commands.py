@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from didimlog import cli
+from didimlog.personal.lesson_writing import LessonSecret
 from didimlog.project.capture import CaptureRequest
 
 
@@ -272,9 +273,9 @@ class AddCommandTests(unittest.TestCase):
             ),
             (
                 "evidence",
-                '{"artifact":"artifacts/a.txt","origin":"local","collection":"test","artifact_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}',
+                '{"artifact":"knowledge/raw/a.txt","origin":"local","collection":"test","artifact_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}',
                 {
-                    "artifact": "artifacts/a.txt",
+                    "artifact": "knowledge/raw/a.txt",
                     "origin": "local",
                     "collection": "test",
                     "artifact_sha256": "a" * 64,
@@ -352,6 +353,44 @@ body
         )
         self.assertEqual(code, 2)
         self.assertEqual(stderr, "LESSON_DATE_MISMATCH\n")
+
+    def test_secret_lesson_returns_exit_five_without_echoing_the_value(self):
+        secret = ("g" + "hp_") + "abcdefghijklmnopqrstuvwxyz123456"
+        document = """---
+topic: cli
+title: Secret contract
+summary: contract
+tags: [cli]
+date: 2026-08-05
+---
+## 교훈
+{}
+""".format(secret)
+
+        with mock.patch(
+            "didimlog.cli.publish_lesson",
+            side_effect=LessonSecret("detected " + secret),
+        ):
+            code, stdout, stderr = invoke(
+                ["add", "lesson", "secret", "--date", "2026-08-05"],
+                stdin=document,
+            )
+            explained_code, _, explained_stderr = invoke(
+                [
+                    "--explain-errors",
+                    "add",
+                    "lesson",
+                    "secret",
+                    "--date",
+                    "2026-08-05",
+                ],
+                stdin=document,
+            )
+
+        self.assertEqual((code, stdout, stderr), (5, "", "LESSON_SECRET\n"))
+        self.assertEqual(explained_code, 5)
+        self.assertTrue(explained_stderr.startswith("LESSON_SECRET\n도움말: "))
+        self.assertNotIn(secret, explained_stderr)
 
 
 class InstalledConsoleScriptTests(unittest.TestCase):

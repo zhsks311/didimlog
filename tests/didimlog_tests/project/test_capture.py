@@ -1,5 +1,6 @@
 import contextlib
 import dataclasses
+from concurrent.futures import ThreadPoolExecutor
 import errno
 import hashlib
 import importlib
@@ -10,7 +11,9 @@ import os
 import pathlib
 import shutil
 import subprocess
+import stat
 import sys
+import threading
 import tempfile
 import tomllib
 import types
@@ -19,9 +22,11 @@ from unittest import mock
 
 import didimlog.project.record as record_module
 import didimlog.project as project_package
+from didimlog.project import index as project_index_module
+import didimlog.project.capture as capture_module
 
 from didimlog.errors import DidimError, EXIT_POLICY
-from didimlog.project.capture import CaptureRequest, capture
+from didimlog.project.capture import CaptureRequest, _write_create_only, capture
 from didimlog.project.record import PolicyError, SchemaError, serialize_record
 from didimlog.project.scaffold import apply_scaffold, plan_scaffold
 from didimlog.project.tree import validate_record_tree
@@ -105,8 +110,8 @@ class CaptureTests(unittest.TestCase):
         )
 
     def _capture_local_evidence(self, name="local.txt", content=b"local evidence\n"):
-        artifact = self.workspace / "artifacts" / name
-        artifact.parent.mkdir(exist_ok=True)
+        artifact = self.workspace / "knowledge" / "raw" / name
+        artifact.parent.mkdir(parents=True, exist_ok=True)
         artifact.write_bytes(content)
         digest = hashlib.sha256(content).hexdigest()
         request = CaptureRequest(
@@ -117,7 +122,7 @@ class CaptureTests(unittest.TestCase):
             tags=("evidence",),
             sources=(),
             fields={
-                "artifact": f"artifacts/{name}",
+                "artifact": f"knowledge/raw/{name}",
                 "origin": "격리 테스트 fixture",
                 "collection": "테스트가 직접 생성",
                 "artifact_sha256": digest,
@@ -226,12 +231,12 @@ class CaptureTests(unittest.TestCase):
         )
         self.assertEqual(
             evidence_body,
-            "## Artifact\n\nartifacts/local.txt\n\n"
+            "## Artifact\n\nknowledge/raw/local.txt\n\n"
             "## Origin\n\n격리 테스트 fixture\n\n"
             "## Collection\n\n테스트가 직접 생성\n",
         )
         self.assertEqual(experiment_meta["sources"], ["EVD-20260714-01"])
-        self.assertEqual(evidence_meta["artifact_path"], "artifacts/local.txt")
+        self.assertEqual(evidence_meta["artifact_path"], "knowledge/raw/local.txt")
         self.assertEqual(
             evidence_meta["artifact_sha256"],
             hashlib.sha256(b"local evidence\n").hexdigest(),
@@ -243,10 +248,10 @@ class CaptureTests(unittest.TestCase):
         )
 
     def test_evidence_git_binding_uses_the_exact_committed_artifact(self):
-        artifact = self.workspace / "artifacts" / "committed.txt"
-        artifact.parent.mkdir(exist_ok=True)
+        artifact = self.workspace / "knowledge" / "raw" / "committed.txt"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
         artifact.write_bytes(b"committed evidence\n")
-        self._git("add", "--", "artifacts/committed.txt")
+        self._git("add", "--", "knowledge/raw/committed.txt")
         self._git("commit", "-q", "-m", "add evidence")
         commit = self._git("rev-parse", "HEAD")
 
@@ -260,7 +265,7 @@ class CaptureTests(unittest.TestCase):
                 tags=(),
                 sources=(),
                 fields={
-                    "artifact": "artifacts/committed.txt",
+                    "artifact": "knowledge/raw/committed.txt",
                     "origin": "fixture commit",
                     "collection": "git commit",
                     "artifact_git": commit,
@@ -273,7 +278,7 @@ class CaptureTests(unittest.TestCase):
         self.assertNotIn("artifact_sha256", frontmatter)
         self.assertEqual(
             body,
-            "## Artifact\n\nartifacts/committed.txt\n\n"
+            "## Artifact\n\nknowledge/raw/committed.txt\n\n"
             "## Origin\n\nfixture commit\n\n"
             "## Collection\n\ngit commit\n",
         )
@@ -400,7 +405,7 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(sentinel.read_bytes(), b"user data\n")
 
     def test_atomic_collision_retries_with_the_next_id(self):
-        real_open = os.open
+        real_link = os.link
         collided = []
         competitor = serialize_record(
             "OBS-20260714-01",
@@ -413,23 +418,28 @@ class CaptureTests(unittest.TestCase):
             {"body": "## Observation\n\n경쟁 프로세스 원문\n"},
         ).encode("utf-8")
 
-        def collide_once(path, flags, *args, **kwargs):
-            if (
-                not collided
-                and flags & os.O_EXCL
-                and pathlib.Path(path).name == "OBS-20260714-01.md"
-            ):
-                collided.append(pathlib.Path(path).name)
-                descriptor = real_open(path, flags, *args, **kwargs)
+        def collide_once(source, destination, *args, **kwargs):
+            if not collided and destination == "OBS-20260714-01.md":
+                collided.append(destination)
+                descriptor = os.open(
+                    destination,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o644,
+                    dir_fd=kwargs["dst_dir_fd"],
+                )
                 try:
                     os.write(descriptor, competitor)
                     os.fsync(descriptor)
                 finally:
                     os.close(descriptor)
-                raise FileExistsError(errno.EEXIST, "simulated collision", path)
-            return real_open(path, flags, *args, **kwargs)
+                raise FileExistsError(
+                    errno.EEXIST,
+                    "simulated collision",
+                    destination,
+                )
+            return real_link(source, destination, *args, **kwargs)
 
-        with mock.patch.object(record_module.os, "open", side_effect=collide_once):
+        with mock.patch.object(capture_module.os, "link", side_effect=collide_once):
             path = capture(self.workspace, _observation_request("재시도 원문"))
 
         collision_path = self._record_path("observation", "OBS-20260714-01")
@@ -439,16 +449,15 @@ class CaptureTests(unittest.TestCase):
         self.assertIn("재시도 원문", path.read_text(encoding="utf-8"))
 
     def test_collision_retry_cap_stops_without_deleting_or_overwriting_data(self):
-        real_open = os.open
+        real_link = os.link
         attempts = []
         sentinel = self.workspace / "knowledge" / "records" / "observation" / "mine.txt"
         sentinel.write_bytes(b"user-owned\n")
 
-        def always_collide(path, flags, *args, **kwargs):
-            candidate = pathlib.Path(path)
-            if flags & os.O_EXCL and candidate.suffix == ".md":
-                attempts.append(candidate.name)
-                record_id = candidate.stem
+        def always_collide(source, destination, *args, **kwargs):
+            if destination.endswith(".md"):
+                attempts.append(destination)
+                record_id = pathlib.Path(destination).stem
                 competitor = serialize_record(
                     record_id,
                     "observation",
@@ -459,16 +468,25 @@ class CaptureTests(unittest.TestCase):
                     [],
                     {"body": f"## Observation\n\n경쟁 원문 {record_id}\n"},
                 ).encode("utf-8")
-                descriptor = real_open(path, flags, *args, **kwargs)
+                descriptor = os.open(
+                    destination,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o644,
+                    dir_fd=kwargs["dst_dir_fd"],
+                )
                 try:
                     os.write(descriptor, competitor)
                     os.fsync(descriptor)
                 finally:
                     os.close(descriptor)
-                raise FileExistsError(errno.EEXIST, "simulated collision", path)
-            return real_open(path, flags, *args, **kwargs)
+                raise FileExistsError(
+                    errno.EEXIST,
+                    "simulated collision",
+                    destination,
+                )
+            return real_link(source, destination, *args, **kwargs)
 
-        with mock.patch.object(record_module.os, "open", side_effect=always_collide):
+        with mock.patch.object(capture_module.os, "link", side_effect=always_collide):
             with self.assertRaises(PolicyError):
                 capture(
                     self.workspace,
@@ -490,6 +508,151 @@ class CaptureTests(unittest.TestCase):
                 f"경쟁 원문 {record_id}",
                 self._record_path("observation", record_id).read_text(encoding="utf-8"),
             )
+
+    def test_partial_write_failure_never_exposes_a_final_record(self):
+        target = self.workspace / "knowledge" / "records" / "observation" / "OBS-20260714-01.md"
+        real_write = os.write
+        writes = []
+
+        def partial_then_fail(descriptor, data):
+            if not writes:
+                writes.append(True)
+                return real_write(descriptor, data[:3])
+            raise OSError("injected write failure")
+
+        with mock.patch.object(
+            capture_module.os,
+            "write",
+            side_effect=partial_then_fail,
+        ):
+            with self.assertRaises(OSError):
+                _write_create_only(target, b"complete record bytes")
+
+        self.assertFalse(target.exists())
+        self.assertEqual(list(target.parent.iterdir()), [])
+
+    def test_link_failure_removes_the_complete_temporary_record(self):
+        target = self.workspace / "knowledge" / "records" / "observation" / "OBS-20260714-01.md"
+        with mock.patch.object(
+            capture_module.os,
+            "link",
+            side_effect=OSError("injected link failure"),
+        ):
+            with self.assertRaises(OSError):
+                _write_create_only(target, b"complete record bytes")
+
+        self.assertFalse(target.exists())
+        self.assertEqual(list(target.parent.iterdir()), [])
+
+    def test_directory_fsync_failure_rolls_back_the_published_record(self):
+        target = self.workspace / "knowledge" / "records" / "observation" / "OBS-20260714-01.md"
+        real_fsync = os.fsync
+        failed = []
+
+        def fail_first_directory_fsync(descriptor):
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode) and not failed:
+                failed.append(True)
+                raise OSError("injected directory fsync failure")
+            return real_fsync(descriptor)
+
+        with mock.patch.object(
+            capture_module.os,
+            "fsync",
+            side_effect=fail_first_directory_fsync,
+        ):
+            with self.assertRaises(OSError):
+                _write_create_only(target, b"complete record bytes")
+
+        self.assertFalse(target.exists())
+        self.assertEqual(list(target.parent.iterdir()), [])
+
+    def test_two_publishers_expose_one_complete_winner(self):
+        target = self.workspace / "knowledge" / "records" / "observation" / "OBS-20260714-01.md"
+        payloads = (b"first complete record", b"second complete record")
+
+        def publish(payload):
+            try:
+                _write_create_only(target, payload)
+                return "created"
+            except FileExistsError:
+                return "collision"
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(publish, payloads))
+
+        self.assertCountEqual(outcomes, ["created", "collision"])
+        self.assertIn(target.read_bytes(), payloads)
+        self.assertEqual(
+            [path.name for path in target.parent.iterdir()],
+            [target.name],
+        )
+
+    def test_capture_cannot_be_overwritten_by_an_older_index_snapshot(self):
+        project_index_module.write_index(self.workspace)
+        real_build = project_index_module.build_index_bytes
+        real_publish = capture_module._write_create_only
+        snapshot_ready = threading.Event()
+        capture_reached_publish = threading.Event()
+        capture_finished = threading.Event()
+        errors = []
+
+        def pause_old_snapshot(workspace):
+            data = real_build(workspace)
+            if threading.current_thread().name == "old-index-writer":
+                snapshot_ready.set()
+                if capture_reached_publish.wait(0.3):
+                    capture_finished.wait(5)
+            return data
+
+        def observe_capture_publish(path, data):
+            capture_reached_publish.set()
+            return real_publish(path, data)
+
+        def write_old_index():
+            try:
+                project_index_module.write_index(self.workspace)
+            except BaseException as error:
+                errors.append(error)
+
+        def publish_record():
+            try:
+                capture(self.workspace, _observation_request("최신 기록"))
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                capture_finished.set()
+
+        with (
+            mock.patch.object(
+                project_index_module,
+                "build_index_bytes",
+                side_effect=pause_old_snapshot,
+            ),
+            mock.patch.object(
+                capture_module,
+                "_write_create_only",
+                side_effect=observe_capture_publish,
+            ),
+        ):
+            old_writer = threading.Thread(
+                target=write_old_index,
+                name="old-index-writer",
+            )
+            old_writer.start()
+            self.assertTrue(snapshot_ready.wait(5))
+            record_writer = threading.Thread(target=publish_record)
+            record_writer.start()
+            old_writer.join(10)
+            record_writer.join(10)
+
+        self.assertFalse(old_writer.is_alive())
+        self.assertFalse(record_writer.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(project_index_module.check_index(self.workspace), 0)
+        index_text = (
+            self.workspace / "knowledge" / "index" / "INDEX.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("OBS-20260714-01", index_text)
 
     def test_two_processes_receive_distinct_ids_and_preserve_both_bodies(self):
         context = multiprocessing.get_context("spawn")
@@ -551,10 +714,14 @@ class CaptureTests(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             if real_index_module:
                 stack.enter_context(
-                    mock.patch.object(index_module, "write_index", side_effect=fail_index)
+                    mock.patch.object(
+                        index_module,
+                        "_write_index_locked",
+                        side_effect=fail_index,
+                    )
                 )
             else:
-                index_module.write_index = fail_index
+                index_module._write_index_locked = fail_index
                 stack.enter_context(
                     mock.patch.dict(
                         sys.modules,

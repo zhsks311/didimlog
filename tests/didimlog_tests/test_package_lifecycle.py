@@ -146,8 +146,8 @@ date: 2026-08-05
             self.assertTrue(lesson_result.stdout.strip().endswith("package-data-survives-uninstall.md"))
             steps.append("add-lesson")
 
-            artifact = workspace / "artifacts" / "lifecycle.txt"
-            artifact.parent.mkdir()
+            artifact = workspace / "knowledge" / "raw" / "lifecycle.txt"
+            artifact.parent.mkdir(parents=True, exist_ok=True)
             artifact.write_bytes(b"didimlog lifecycle evidence\n")
             digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
             evidence_result = run(
@@ -161,7 +161,7 @@ date: 2026-08-05
                 "lifecycle,package",
                 stdin=json.dumps(
                     {
-                        "artifact": "artifacts/lifecycle.txt",
+                        "artifact": "knowledge/raw/lifecycle.txt",
                         "origin": "격리 package lifecycle smoke",
                         "collection": "테스트가 직접 생성",
                         "artifact_sha256": digest,

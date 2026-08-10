@@ -5,11 +5,13 @@ import sys
 
 EXIT_USAGE = 2
 EXIT_POLICY = 3
+EXIT_SECRET = 5
 EXIT_GIT = 7
 
 _DEFAULT_HELP = {
     EXIT_USAGE: "명령과 옵션을 확인하고 didim --help로 사용법을 살펴보세요.",
     EXIT_POLICY: "경로와 지식 무결성 정책을 확인한 뒤 다시 시도하세요.",
+    EXIT_SECRET: "비밀값을 제거하거나 안전한 라벨로 바꾼 뒤 다시 시도하세요.",
     EXIT_GIT: "Git 설치와 현재 저장소 상태를 확인한 뒤 다시 시도하세요.",
 }
 

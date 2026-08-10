@@ -9,6 +9,11 @@ import secrets
 import stat
 from pathlib import Path
 from typing import Any
+from didimlog.file_io import (
+    UnsafePathError,
+    read_regular_file_at_with_stat,
+    replace_regular_file_at_if_unchanged,
+)
 from didimlog.locking import acquire_directory_lock
 
 
@@ -18,6 +23,7 @@ _START_PREFIX = b"<!-- DIDIMLOG:START"
 _END_PREFIX = b"<!-- DIDIMLOG:END"
 _SESSION_START_SUFFIX = " hook session-start"
 _MISSING = object()
+_TARGET_MAX_BYTES = 4 * 1024 * 1024
 
 
 def _absolute_path_bytes(path: Path, *, label: str) -> bytes:
@@ -242,25 +248,17 @@ def _read_target(
     if stat.S_ISLNK(entry.st_mode) or not stat.S_ISREG(entry.st_mode):
         raise ValueError("target must be a regular file")
 
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor: int | None = None
     try:
-        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or _revision(opened) != _revision(entry):
-            raise ValueError("target changed while it was opened")
-        chunks = bytearray()
-        while chunk := os.read(descriptor, 64 * 1024):
-            chunks.extend(chunk)
-        finished = os.fstat(descriptor)
-        if _revision(finished) != _revision(opened):
+        data, finished = read_regular_file_at_with_stat(
+            parent_descriptor,
+            name,
+            _TARGET_MAX_BYTES,
+        )
+        if len(data) > _TARGET_MAX_BYTES or _revision(finished) != _revision(entry):
             raise ValueError("target changed while it was read")
-        return bytes(chunks), finished
-    except OSError as exc:
+        return data, finished
+    except UnsafePathError as exc:
         raise ValueError("target could not be read safely") from exc
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
 
 
 def _same_content(current: bytes, expected: bytes) -> bool:
@@ -343,21 +341,24 @@ def write_if_unchanged(
                 return
             mode = stat.S_IMODE(current[1].st_mode)
 
-        temporary_name, temporary_descriptor = _temporary_file(
-            parent_descriptor, mode
-        )
-        try:
-            _write_all(temporary_descriptor, intended)
-        except OSError as exc:
-            raise ValueError("intended content could not be written safely") from exc
-        finally:
-            os.close(temporary_descriptor)
 
         _verify_parent(target, parent_descriptor)
         rechecked = _read_target(parent_descriptor, target.name)
         if original is None:
             if rechecked is not None:
                 raise ValueError("target was created before write")
+            temporary_name, temporary_descriptor = _temporary_file(
+                parent_descriptor,
+                mode,
+            )
+            try:
+                _write_all(temporary_descriptor, intended)
+            except OSError as exc:
+                raise ValueError(
+                    "intended content could not be written safely"
+                ) from exc
+            finally:
+                os.close(temporary_descriptor)
             try:
                 os.link(
                     temporary_name,
@@ -377,13 +378,21 @@ def write_if_unchanged(
                 or not _same_content(rechecked[0], original)
             ):
                 raise ValueError("target changed before write")
-            os.replace(
-                temporary_name,
-                target.name,
-                src_dir_fd=parent_descriptor,
-                dst_dir_fd=parent_descriptor,
-            )
-            temporary_name = None
+            try:
+                replaced = replace_regular_file_at_if_unchanged(
+                    parent_descriptor,
+                    target.name,
+                    original,
+                    intended,
+                    mode,
+                    expected_info=current[1],
+                )
+            except UnsafePathError as exc:
+                raise ValueError(
+                    "target could not be written atomically"
+                ) from exc
+            if not replaced:
+                raise ValueError("target changed before write")
         os.fsync(parent_descriptor)
     except ValueError:
         raise
