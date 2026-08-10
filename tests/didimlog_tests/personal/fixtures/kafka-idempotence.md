@@ -1,5 +1,4 @@
 ---
-project: demo-api
 topic: kafka
 title: Kafka 멱등성은 acks=all과 세트다
 summary: enable.idempotence=true라도 acks≠all이면 client가 조용히 멱등성을 끈다

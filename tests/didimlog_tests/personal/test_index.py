@@ -201,16 +201,17 @@ class KnowledgeIndexTests(unittest.TestCase):
         self.assertNotIn("전역 규칙", outputs["demo-api"])
         self.assertNotIn("전역 문서", outputs["demo-api"])
 
-    def test_legacy_lesson_tags_are_sorted_and_deduplicated(self):
-        legacy = LESSON.replace(
+    def test_noncanonical_lesson_tags_are_rejected(self):
+        invalid = LESSON.replace(
             "tags: [nullable, partial-update]",
             "tags: [partial-update, nullable, partial-update]",
         )
-        self.write("lessons/demo-api/legacy.md", legacy)
+        self.write("lessons/demo-api/invalid.md", invalid)
 
-        output = knowledge_index.build_all(self.root)["demo-api"]
+        with self.assertRaises(knowledge_index.KnowledgeIndexError) as caught:
+            knowledge_index.build_all(self.root)
 
-        self.assertIn("찾을 때: nullable, partial-update", output)
+        self.assertIn("invalid lesson metadata", str(caught.exception))
 
     def test_titles_paths_and_projects_use_deterministic_utf8_byte_order_and_lf(self):
         self.write(

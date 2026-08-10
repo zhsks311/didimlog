@@ -157,7 +157,7 @@ def _lesson_item(path: Path, data_root: Path) -> dict[str, object]:
             "KNOWLEDGE_INDEX_INVALID {}: invalid lesson metadata".format(path)
         )
     fields, _, _ = parsed
-    tags = parse_inline_list(fields.get("tags", "[]"), unique=False)
+    tags = parse_inline_list(fields.get("tags", "[]"), canonical=True)
     if tags is None:
         raise KnowledgeIndexError(
             "KNOWLEDGE_INDEX_INVALID {}: invalid tags".format(path)

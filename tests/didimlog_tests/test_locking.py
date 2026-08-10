@@ -130,21 +130,6 @@ class DirectoryLockTests(unittest.TestCase):
             replacement.join(5)
             self.assertEqual(replacement.exitcode, 0)
 
-    def test_legacy_lock_file_is_ignored_and_preserved(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            directory = Path(temporary_directory)
-            legacy = directory / ".didimlog.lock"
-            legacy.write_bytes(b"legacy")
-            legacy.chmod(0o644)
-            parent_descriptor = os.open(directory, os.O_RDONLY)
-            try:
-                lock_descriptor = acquire_directory_lock(parent_descriptor)
-                os.close(lock_descriptor)
-            finally:
-                os.close(parent_descriptor)
-
-            self.assertEqual(legacy.read_bytes(), b"legacy")
-            self.assertEqual(legacy.stat().st_mode & 0o777, 0o644)
 
     def test_process_termination_releases_the_directory_lock(self):
         context = multiprocessing.get_context("spawn")

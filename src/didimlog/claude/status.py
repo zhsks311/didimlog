@@ -15,14 +15,6 @@ from didimlog.indexing import (
 )
 from didimlog.personal.paths import data_home
 
-from . import config as config_module
-from .connect import (
-    _LEGACY_END,
-    _LEGACY_START,
-    _is_legacy_hook,
-    _read_optional,
-)
-from .paths import config_dir, config_target
 from .probe import Problem, inspect
 
 
@@ -47,44 +39,6 @@ def _safe_label(value: str) -> str:
         character if ord(character) >= 32 and ord(character) != 127 else "?"
         for character in value
     )
-
-
-def _legacy_present(home: Path, selected_config: Path | None) -> bool:
-    legacy_root = home / ".local" / "share" / "improver" / "personal-knowledge"
-    try:
-        if legacy_root.exists() or legacy_root.is_symlink():
-            return True
-    except OSError:
-        return True
-    if selected_config is None:
-        return False
-    try:
-        claude = _read_optional(
-            config_target(selected_config, "CLAUDE.md", home=home)
-        )
-        if claude is not None and (
-            _LEGACY_START in claude or _LEGACY_END in claude
-        ):
-            return True
-        settings = _read_optional(
-            config_target(selected_config, "settings.json", home=home)
-        )
-        if settings is None:
-            return False
-        value = config_module._load_settings(settings)
-        hooks = value.get("hooks", {})
-        session_start = hooks.get("SessionStart", []) if isinstance(hooks, dict) else []
-        for matcher in session_start if isinstance(session_start, list) else ():
-            if not isinstance(matcher, dict):
-                continue
-            matcher_hooks = matcher.get("hooks", ())
-            if not isinstance(matcher_hooks, list):
-                continue
-            if any(_is_legacy_hook(hook, legacy_root) for hook in matcher_hooks):
-                return True
-    except (OSError, ValueError):
-        return False
-    return False
 
 
 def _diagnostic_problems(*, home: Path, cwd, config) -> tuple[Problem, ...]:
@@ -130,15 +84,6 @@ def status_text(*, home=None, cwd=None, config=None) -> str:
         for problem in problems
     )
     claude_label = "문제 있음" if wiring_problem else "정상"
-    try:
-        selected_config = config_dir(config, home=selected_home)
-    except ValueError:
-        selected_config = None
-    legacy_label = (
-        "감지됨"
-        if _legacy_present(selected_home, selected_config)
-        else "없음"
-    )
     return "\n".join(
         (
             "Didimlog {}".format(didimlog_version()),
@@ -146,7 +91,6 @@ def status_text(*, home=None, cwd=None, config=None) -> str:
             "현재 프로젝트: {}".format(project_name),
             "프로젝트 근거: {}".format(project_label),
             "Claude 연결: {}".format(claude_label),
-            "legacy Personal Knowledge: {}".format(legacy_label),
             "",
         )
     )
@@ -159,18 +103,6 @@ def doctor_text(*, home=None, cwd=None, config=None) -> tuple[int, str]:
     problems = list(
         _diagnostic_problems(home=selected_home, cwd=cwd, config=config)
     )
-    try:
-        selected_config = config_dir(config, home=selected_home)
-    except ValueError:
-        selected_config = None
-    if _legacy_present(selected_home, selected_config):
-        problems.append(
-            Problem(
-                token="LEGACY_WIRING_PRESENT",
-                impact="이전 Personal Knowledge 연결과 Didimlog 연결이 함께 남아 있습니다.",
-                action="didim setup",
-            )
-        )
     if not problems:
         return 0, "DOCTOR_OK\n문제 없음\n"
 

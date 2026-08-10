@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://improver.local/knowledge/schema/record.schema.json",
+  "$id": "https://didimlog.local/knowledge/schema/record.schema.json",
   "title": "Knowledge Harness Stage-1 record frontmatter",
   "description": "Stage-1 frontmatter object for observation/experiment/evidence records. This project copy is a review copy; records under knowledge/records/ are the only source of truth.",
   "$comment": "draft-07. Validates the JSON object produced from restricted TOML frontmatter for OBS/EXP/EVD records only. It cannot express the cross-field invariant ID YYYYMMDD == created; the runtime parser enforces that linkage. It intentionally does NOT and cannot portably enforce: NFKC normalization; calendar validity of dates; created<=updated ordering; UTF-8 byte budgets; array UTF-8-byte sort order (only uniqueness is checked here); the full Unicode general-category (L*/N*) tag rule; symlink escape; path traversal beyond a literal '..' substring; existence/non-self-reference of sources and Contradicts IDs; body heading order and section content; and lifecycle edge legality. Those are enforced by the parser, kh-new, and kh-index policy, never by this schema. No future record types (finding/decision/playbook/failure_pattern/improvement_proposal) are permitted in v1.",

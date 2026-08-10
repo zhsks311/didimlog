@@ -97,9 +97,8 @@ class ParseInlineListTests(unittest.TestCase):
 
 
 class ParseFrontmatterTextTests(unittest.TestCase):
-    def test_fields_preserve_source_order_and_unknown_project_scalar(self):
+    def test_fields_preserve_source_order(self):
         text = """---
-project: ../legacy-project-value
 topic: parser
 title: 단일 행 파서
 summary: 필드 순서를 그대로 보존한다
@@ -116,11 +115,10 @@ review_by: 2026-12-31
         fields, lines, closing = parsed
         self.assertEqual(
             list(fields),
-            ["project", "topic", "title", "summary", "tags", "date", "review_by"],
+            ["topic", "title", "summary", "tags", "date", "review_by"],
         )
-        self.assertEqual(fields["project"], "../legacy-project-value")
         self.assertEqual(lines[closing], "---")
-        self.assertEqual(closing, 8)
+        self.assertEqual(closing, 7)
 
     def test_required_fields_must_be_present_and_nonempty(self):
         missing = lesson_text().replace("summary: 검증된 내용만 저장한다\n", "")
@@ -195,7 +193,6 @@ class ParseLessonTextTests(unittest.TestCase):
             "jpa-n-plus-one.md",
             "kafka-idempotence.md",
             "korean-lesson.md",
-            "other-project.md",
         )
 
         for name in valid_fixtures:
@@ -208,6 +205,7 @@ class ParseLessonTextTests(unittest.TestCase):
             "malformed-no-close.md",
             "malformed-no-colon.md",
             "multiline-attempt.md",
+            "other-project.md",
         )
 
         for name in invalid_fixtures:
@@ -215,23 +213,15 @@ class ParseLessonTextTests(unittest.TestCase):
                 text = (FIXTURES / name).read_text(encoding="utf-8")
                 self.assertIsNone(parse_lesson_text(name, text))
 
-    def test_project_is_preserved_but_not_owned_by_lesson_parser(self):
-        legacy = parse_lesson_text(
-            "other-project.md",
-            (FIXTURES / "other-project.md").read_text(encoding="utf-8"),
-        )
-        current = parse_lesson_text("without-project.md", lesson_text())
-        unknown = parse_lesson_text(
-            "unknown-project.md",
-            lesson_text(extra_fields=("project: ../not-a-parser-slug",)),
-        )
+    def test_project_and_unknown_fields_are_rejected(self):
+        for field in ("project: old-project", "unexpected: value"):
+            with self.subTest(field=field):
+                parsed = parse_lesson_text(
+                    "lesson.md",
+                    lesson_text(extra_fields=(field,)),
+                )
 
-        self.assertIsNotNone(legacy)
-        self.assertEqual(legacy[0]["project"], "other-app")
-        self.assertIsNotNone(current)
-        self.assertNotIn("project", current[0])
-        self.assertIsNotNone(unknown)
-        self.assertEqual(unknown[0]["project"], "../not-a-parser-slug")
+                self.assertIsNone(parsed)
 
     def test_title_scalar_boundary_is_inclusive_and_not_a_byte_limit(self):
         self.assertIsNotNone(
@@ -308,15 +298,20 @@ class ParseLessonTextTests(unittest.TestCase):
             parse_lesson_text("delete-summary.md", lesson_text(summary="요약\x7f삽입"))
         )
 
-    def test_legacy_tags_preserve_unsorted_duplicates(self):
-        text = lesson_text(
-            extra_fields=("tags: [zeta, alpha, zeta]",),
+    def test_tags_must_be_canonical_and_unique(self):
+        invalid_tags = (
+            "tags: [zeta, alpha]",
+            "tags: [alpha, zeta, alpha]",
         )
 
-        parsed = parse_lesson_text("legacy-tags.md", text)
-
-        self.assertIsNotNone(parsed)
-        self.assertEqual(parsed[0]["tags"], "[zeta, alpha, zeta]")
+        for field in invalid_tags:
+            with self.subTest(field=field):
+                self.assertIsNone(
+                    parse_lesson_text(
+                        "invalid-tags.md",
+                        lesson_text(extra_fields=(field,)),
+                    )
+                )
 
     def test_invalid_tags_are_rejected(self):
         invalid_tags = (

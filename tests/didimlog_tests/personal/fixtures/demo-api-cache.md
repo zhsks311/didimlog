@@ -1,5 +1,4 @@
 ---
-project: demo-api
 topic: redis
 title: 캐시 TTL 없으면 메모리 누수
 summary: TTL 없는 캐시 키는 영구 잔존해 used_memory를 밀어올린다

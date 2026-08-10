@@ -12,6 +12,7 @@ SLUG = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$")
 DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 BLOCK_VALUE = re.compile(r"^[|>][+-]?$")
 REQUIRED = ("topic", "title", "summary", "date")
+ALLOWED = frozenset((*REQUIRED, "tags", "review_by", "booked"))
 TITLE_MAX_SCALARS = 120
 INDEX_TERM_MAX_SCALARS = 32
 INDEX_TERM_MAX_BYTES = 96
@@ -115,6 +116,8 @@ def parse_lesson_text(name, text):
     if parsed is None:
         return None
     fields, lines, closing = parsed
+    if not fields.keys() <= ALLOWED:
+        return None
     if not SLUG.fullmatch(fields["topic"]):
         return None
     if not valid_index_term(fields["topic"]):
@@ -130,7 +133,7 @@ def parse_lesson_text(name, text):
     if fields.get("review_by") and not _valid_date(fields["review_by"]):
         return None
     if fields.get("tags") is not None and parse_inline_list(
-        fields["tags"], unique=False
+        fields["tags"], canonical=True
     ) is None:
         return None
     if fields.get("booked") is not None:

@@ -137,7 +137,7 @@ didim status
 didim doctor
 ```
 
-`status`는 버전, 개인 index, 현재 프로젝트, Claude 연결, legacy 설치 흔적을 한 화면에 요약합니다. `doctor`는 문제가 미치는 영향과 다음 실행 명령을 함께 보여 줍니다.
+`status`는 버전, 개인 index, 현재 프로젝트, Claude 연결을 한 화면에 요약합니다. `doctor`는 문제가 미치는 영향과 다음 실행 명령을 함께 보여 줍니다.
 
 오류 첫 줄의 영문 token과 exit code는 자동화 계약입니다. 실제 TTY에서는 다음 줄에 한국어 `도움말:`이 표시됩니다. non-TTY 로그에서도 설명이 필요하면 전역 옵션을 사용합니다.
 

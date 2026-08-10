@@ -1,5 +1,4 @@
 ---
-project: demo-api
 topic: misc
 title: 한글 제목도 단일 행으로 안전하게
 summary: 비ASCII 값도 물리적 단일 행이면 파싱에 문제없다

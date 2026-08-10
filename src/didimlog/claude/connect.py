@@ -14,16 +14,13 @@ from collections.abc import Mapping
 
 from . import config as config_module
 from . import resources as resource_module
-from .config import plan_claude_md, plan_settings, render_managed_block, write_if_unchanged
+from .config import plan_claude_md, plan_settings, write_if_unchanged
 from .paths import config_dir, config_target
 from .transaction import InstallJournal
 
 
-_LEGACY_START = b"<!-- IMPROVER_PERSONAL_KNOWLEDGE:START version=1 -->\n"
-_LEGACY_END = b"<!-- IMPROVER_PERSONAL_KNOWLEDGE:END -->\n"
 _RESOURCE_NAMES = ("KNOWLEDGE_USAGE.md", "LESSON_WRITING_RULES.md")
 _RESOURCE_PACKAGE = "didimlog.resources.personal"
-_LEGACY_HOOK_SUFFIX = " -m personal_knowledge.wiring"
 
 
 @dataclass(frozen=True)
@@ -59,87 +56,6 @@ def _read_optional(path: Path) -> bytes | None:
 def _packaged_resources() -> tuple[tuple[str, bytes], ...]:
     root = importlib.resources.files(_RESOURCE_PACKAGE)
     return tuple((name, root.joinpath(name).read_bytes()) for name in _RESOURCE_NAMES)
-
-
-def _migrate_legacy_claude(original: bytes, config: Path) -> tuple[bytes, bool]:
-    starts = original.count(_LEGACY_START)
-    ends = original.count(_LEGACY_END)
-    if starts == 0 and ends == 0:
-        return plan_claude_md(original, config), False
-    if starts != 1 or ends != 1:
-        raise ValueError("CLAUDE.md has invalid legacy Personal Knowledge markers")
-    begin = original.index(_LEGACY_START)
-    end_begin = original.index(_LEGACY_END)
-    if end_begin < begin + len(_LEGACY_START):
-        raise ValueError("CLAUDE.md has mismatched legacy Personal Knowledge markers")
-    finish = end_begin + len(_LEGACY_END)
-    without_legacy = original[:begin] + original[finish:]
-    if (
-        config_module._START_PREFIX in without_legacy
-        or config_module._END_PREFIX in without_legacy
-    ):
-        intended = plan_claude_md(without_legacy, config)
-    else:
-        intended = original[:begin] + render_managed_block(config) + original[finish:]
-    return intended, True
-
-
-def _is_legacy_hook(hook, legacy_root: Path) -> bool:
-    if not isinstance(hook, dict) or hook.get("type") != "command":
-        return False
-    command = hook.get("command")
-    if not isinstance(command, str) or not command.endswith(_LEGACY_HOOK_SUFFIX):
-        return False
-    executable = Path(command[: -len(_LEGACY_HOOK_SUFFIX)])
-    try:
-        return executable.is_absolute() and executable.resolve(
-            strict=False
-        ).is_relative_to(legacy_root.resolve(strict=False))
-    except (OSError, ValueError):
-        return False
-
-
-def _remove_legacy_hooks(original: bytes, legacy_root: Path) -> tuple[bytes, bool]:
-    value = config_module._load_settings(original)
-    hooks = value.get("hooks")
-    if hooks is None:
-        return original, False
-    if not isinstance(hooks, dict):
-        raise ValueError("settings.json hooks must be an object")
-    session_start = hooks.get("SessionStart")
-    if session_start is None:
-        return original, False
-    if not isinstance(session_start, list):
-        raise ValueError("settings.json SessionStart must be an array")
-
-    changed = False
-    planned = []
-    for matcher in session_start:
-        if not isinstance(matcher, dict):
-            raise ValueError("settings.json SessionStart entries must be objects")
-        matcher_hooks = matcher.get("hooks")
-        if not isinstance(matcher_hooks, list) or any(
-            not isinstance(hook, dict) for hook in matcher_hooks
-        ):
-            raise ValueError("settings.json SessionStart hooks must be objects")
-        remaining = [
-            hook for hook in matcher_hooks if not _is_legacy_hook(hook, legacy_root)
-        ]
-        if len(remaining) == len(matcher_hooks):
-            planned.append(matcher)
-            continue
-        changed = True
-        if remaining or set(matcher) != {"hooks"}:
-            replacement = dict(matcher)
-            replacement["hooks"] = remaining
-            planned.append(replacement)
-    if not changed:
-        return original, False
-    hooks["SessionStart"] = planned
-    encoded = (
-        json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
-    ).encode("utf-8")
-    return encoded, True
 
 
 def _validate_launcher(launcher: Path) -> Path:
@@ -182,9 +98,6 @@ def plan_connect(
         home=home,
     )
     launcher_path = _validate_launcher(launcher)
-    legacy_root = (
-        selected_home / ".local" / "share" / "improver" / "personal-knowledge"
-    )
     changes: list[str] = []
     file_changes: list[_FileChange] = []
 
@@ -200,7 +113,7 @@ def plan_connect(
     claude_path = _target(selected, "CLAUDE.md", selected_home)
     claude_original = _read_optional(claude_path)
     claude_input = b"" if claude_original is None else claude_original
-    claude_intended, legacy_block = _migrate_legacy_claude(claude_input, selected)
+    claude_intended = plan_claude_md(claude_input, selected)
     if claude_original != claude_intended:
         file_changes.append(
             _FileChange(
@@ -215,8 +128,7 @@ def plan_connect(
     settings_path = _target(selected, "settings.json", selected_home)
     settings_original = _read_optional(settings_path)
     settings_input = b"" if settings_original is None else settings_original
-    without_legacy, legacy_hook = _remove_legacy_hooks(settings_input, legacy_root)
-    settings_intended = plan_settings(without_legacy, launcher_path)
+    settings_intended = plan_settings(settings_input, launcher_path)
     if settings_original != settings_intended:
         file_changes.append(
             _FileChange(
@@ -228,11 +140,6 @@ def plan_connect(
         )
         changes.append("SessionStart hook 연결: {}".format(settings_path))
 
-    if legacy_block or legacy_hook:
-        changes.insert(
-            0,
-            "legacy Personal Knowledge 연결 교체: {}".format(selected),
-        )
     return ClaudeChangePlan(selected, tuple(changes), tuple(file_changes))
 
 

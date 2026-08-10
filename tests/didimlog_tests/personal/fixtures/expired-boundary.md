@@ -1,5 +1,4 @@
 ---
-project: demo-api
 topic: misc
 title: 만료 경계 테스트 교훈
 summary: review_by가 어제라 만료 표시가 붙어야 한다

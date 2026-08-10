@@ -15,8 +15,6 @@ from didimlog.claude.config import render_managed_block
 from didimlog.claude.transaction import InstallJournal
 
 
-LEGACY_START = b"<!-- IMPROVER_PERSONAL_KNOWLEDGE:START version=1 -->\n"
-LEGACY_END = b"<!-- IMPROVER_PERSONAL_KNOWLEDGE:END -->\n"
 RESOURCE_NAMES = (
     "KNOWLEDGE_USAGE.md",
     "LESSON_WRITING_RULES.md",
@@ -189,137 +187,33 @@ class ConnectTests(unittest.TestCase):
             }
             self.assertEqual(after, before)
 
-    def test_known_legacy_block_and_hook_are_replaced_without_touching_user_content(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
-            home = root / "home"
-            config = home / ".claude-work"
-            config.mkdir(parents=True)
-            launcher = make_launcher(home)
-            old_install = home / ".local" / "share" / "improver" / "personal-knowledge"
-            old_python = old_install / "current" / ".venv" / "bin" / "python"
-            old_python.parent.mkdir(parents=True)
-            old_python.write_bytes(b"legacy executable bytes\n")
-            old_sentinel = old_install / "versions" / "v1" / "KEEP"
-            old_sentinel.parent.mkdir(parents=True)
-            old_sentinel.write_bytes(b"old program must remain\n")
-            old_install_before = tree_bytes(old_install)
-
-            user_prefix = b"\xff# user bytes before legacy\r\n"
-            legacy_block = (
-                LEGACY_START
-                + b"@~/knowledge/MY-RULES.md\n"
-                + b"@~/.local/share/improver/personal-knowledge/current/KNOWLEDGE_USAGE.md\n"
-                + b"@~/.local/share/improver/personal-knowledge/current/LESSON_WRITING_RULES.md\n"
-                + LEGACY_END
-            )
-            user_suffix = (
-                b"\r\n<!-- USER_PERSONAL_KNOWLEDGE:START -->\n"
-                b"user-owned marker bytes\n"
-                b"<!-- USER_PERSONAL_KNOWLEDGE:END -->\n"
-            )
-            original_claude = user_prefix + legacy_block + user_suffix
-            (config / "CLAUDE.md").write_bytes(original_claude)
-
-            user_hook = {"type": "command", "command": "/user/bin/session-start"}
-            unknown_similar_hook = {
-                "type": "command",
-                "command": "/user/bin/python -m personal_knowledge.wiring_custom",
-            }
-            legacy_hook = {
-                "type": "command",
-                "command": f"{old_python} -m personal_knowledge.wiring",
-            }
-            user_matcher = {
-                "matcher": "startup",
-                "note": "preserve matcher metadata",
-                "hooks": [user_hook, legacy_hook, unknown_similar_hook],
-            }
-            stop_hooks = [
-                {"hooks": [{"type": "command", "command": "/user/bin/on-stop"}]}
-            ]
-            original_settings_value = {
-                "env": {"KEEP": "한글 값"},
-                "hooks": {
-                    "SessionStart": [user_matcher],
-                    "Stop": stop_hooks,
-                },
-            }
-            original_settings = json.dumps(
-                original_settings_value,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-            (config / "settings.json").write_bytes(original_settings)
-
-            plan = plan_connect(
-                config,
-                launcher=launcher,
-                environ={"CLAUDE_CONFIG_DIR": str(home / ".claude-other")},
-                home=home,
-            )
-
-            summary = assert_summary_mentions_config(self, plan, config, home)
-            folded_summary = summary.casefold()
-            self.assertIn("legacy", folded_summary)
-            self.assertIn("personal knowledge", folded_summary)
-            self.assertTrue(
-                any(
-                    token in folded_summary
-                    for token in ("replace", "replacement", "교체", "전환", "migration")
-                ),
-                summary,
-            )
-            self.assertEqual((config / "CLAUDE.md").read_bytes(), original_claude)
-            self.assertEqual((config / "settings.json").read_bytes(), original_settings)
-            self.assertEqual(tree_bytes(old_install), old_install_before)
-
-            apply_connect(plan, make_journal(root, "legacy-connect"))
-
-            self.assertEqual(
-                (config / "CLAUDE.md").read_bytes(),
-                user_prefix + render_managed_block(config.resolve()) + user_suffix,
-            )
-            settings_value = json.loads((config / "settings.json").read_bytes())
-            self.assertEqual(settings_value["env"], original_settings_value["env"])
-            self.assertEqual(settings_value["hooks"]["Stop"], stop_hooks)
-            session_start = settings_value["hooks"]["SessionStart"]
-            self.assertIn(
-                {
-                    "matcher": "startup",
-                    "note": "preserve matcher metadata",
-                    "hooks": [user_hook, unknown_similar_hook],
-                },
-                session_start,
-            )
-            commands = session_start_commands(config / "settings.json")
-            self.assertNotIn(legacy_hook["command"], commands)
-            self.assertIn(user_hook["command"], commands)
-            self.assertIn(unknown_similar_hook["command"], commands)
-            self.assertEqual(commands.count(f"{launcher} hook session-start"), 1)
-            self.assertEqual(tree_bytes(old_install), old_install_before)
-
-    def test_legacy_and_current_blocks_collapse_to_one_managed_block(self):
+    def test_unowned_markers_are_preserved_as_user_content(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             home = root / "home"
             config = home / ".claude"
             config.mkdir(parents=True)
-            launcher = make_launcher(home)
-            legacy = LEGACY_START + b"legacy imports\n" + LEGACY_END
-            current = render_managed_block(config.resolve())
-            original = b"user prefix\n" + legacy + b"between\n" + current + b"user suffix\n"
+            original = (
+                b"# user rules\n"
+                b"<!-- IMPROVER-PERSONAL-KNOWLEDGE:START version=1 -->\n"
+                b"@/old/RULES.md\n"
+                b"<!-- IMPROVER-PERSONAL-KNOWLEDGE:END -->\n"
+            )
             (config / "CLAUDE.md").write_bytes(original)
+            launcher = make_launcher(home)
 
-            plan = plan_connect(config, launcher=launcher, environ={}, home=home)
-            apply_connect(plan, make_journal(root, "mixed-marker-connect"))
+            plan = plan_connect(
+                config,
+                launcher=launcher,
+                environ={},
+                home=home,
+            )
+            apply_connect(plan, make_journal(root, "unowned-markers"))
 
-            migrated = (config / "CLAUDE.md").read_bytes()
-            self.assertNotIn(LEGACY_START, migrated)
-            self.assertEqual(migrated.count(b"<!-- DIDIMLOG:START"), 1)
-            self.assertIn(b"user prefix\n", migrated)
-            self.assertIn(b"between\n", migrated)
-            self.assertIn(b"user suffix\n", migrated)
+            self.assertEqual(
+                (config / "CLAUDE.md").read_bytes(),
+                original + b"\n" + render_managed_block(config.resolve()),
+            )
 
     def test_explicit_profile_is_the_only_selected_profile(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -403,11 +297,6 @@ class DisconnectTests(unittest.TestCase):
             rules.write_bytes(custom_rules)
             user_resource = config / "didimlog" / "USER_NOTES.md"
             user_resource.write_bytes(b"user resource must remain\n")
-            old_install = home / ".local" / "share" / "improver" / "personal-knowledge"
-            old_sentinel = old_install / "current" / "KEEP"
-            old_sentinel.parent.mkdir(parents=True)
-            old_sentinel.write_bytes(b"legacy program remains\n")
-            old_install_before = tree_bytes(old_install)
             before_plan = tree_bytes(config)
 
             disconnect_plan = plan_disconnect(config, environ={}, home=home)
@@ -416,7 +305,6 @@ class DisconnectTests(unittest.TestCase):
             self.assertTrue(disconnect_plan.changes)
             assert_summary_mentions_config(self, disconnect_plan, config, home)
             self.assertEqual(tree_bytes(config), before_plan)
-            self.assertEqual(tree_bytes(old_install), old_install_before)
 
             apply_disconnect(
                 disconnect_plan,
@@ -434,7 +322,6 @@ class DisconnectTests(unittest.TestCase):
             self.assertFalse(usage.exists())
             self.assertEqual(rules.read_bytes(), custom_rules)
             self.assertEqual(user_resource.read_bytes(), b"user resource must remain\n")
-            self.assertEqual(tree_bytes(old_install), old_install_before)
 
     def test_disconnect_of_an_unconnected_profile_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -476,19 +363,7 @@ class ConnectRollbackTests(unittest.TestCase):
             personal_data = home / "knowledge" / "lessons" / "private.md"
             personal_data.parent.mkdir(parents=True)
             personal_data.write_bytes(b"private lesson data\n")
-            old_program = (
-                home
-                / ".local"
-                / "share"
-                / "improver"
-                / "personal-knowledge"
-                / "current"
-                / "KEEP"
-            )
-            old_program.parent.mkdir(parents=True)
-            old_program.write_bytes(b"old installed program\n")
             user_data_before = personal_data.read_bytes()
-            old_program_before = old_program.read_bytes()
             launcher = make_launcher(home)
             plan = plan_connect(
                 config,
@@ -517,7 +392,6 @@ class ConnectRollbackTests(unittest.TestCase):
                 stale_resources,
             )
             self.assertEqual(personal_data.read_bytes(), user_data_before)
-            self.assertEqual(old_program.read_bytes(), old_program_before)
 
 
 if __name__ == "__main__":

@@ -72,15 +72,17 @@ class StatusDoctorTests(unittest.TestCase):
                 result[relative] = ("file", path.read_bytes())
         return result
 
-    def test_healthy_status_summarizes_version_personal_project_claude_and_legacy(self):
+    def test_healthy_status_summarizes_current_surfaces(self):
         text = self._status()
 
-        self.assertIn("Didimlog 0.0.1", text)
-        self.assertIn("개인 지식: 최신", text)
-        self.assertIn("현재 프로젝트: demo-project", text)
-        self.assertIn("프로젝트 근거: 최신", text)
-        self.assertIn("Claude 연결: 정상", text)
-        self.assertIn("legacy Personal Knowledge: 없음", text)
+        self.assertEqual(
+            text,
+            "Didimlog 0.0.1\n"
+            "개인 지식: 최신\n"
+            "현재 프로젝트: demo-project\n"
+            "프로젝트 근거: 최신\n"
+            "Claude 연결: 정상\n",
+        )
         self.assertNotIn(str(self.home), text)
 
     def test_status_distinguishes_personal_stale_and_unconfigured_project(self):
@@ -95,21 +97,12 @@ class StatusDoctorTests(unittest.TestCase):
         self.assertIn("현재 프로젝트: 없음", text)
         self.assertIn("프로젝트 근거: 설정되지 않음", text)
 
-    def test_status_reports_claude_disconnect_and_legacy_presence(self):
+    def test_status_reports_claude_disconnect(self):
         (self.config / "CLAUDE.md").write_bytes(b"# disconnected\n")
-        legacy = (
-            self.home
-            / ".local"
-            / "share"
-            / "improver"
-            / "personal-knowledge"
-        )
-        legacy.mkdir(parents=True)
 
         text = self._status()
 
         self.assertIn("Claude 연결: 문제 있음", text)
-        self.assertIn("legacy Personal Knowledge: 감지됨", text)
 
     def test_healthy_doctor_has_stable_token_and_zero_exit(self):
         code, text = self._doctor()
@@ -132,21 +125,6 @@ class StatusDoctorTests(unittest.TestCase):
         self.assertEqual(text.count("수정: "), problem_count)
         self.assertNotIn(str(self.home), text)
 
-    def test_legacy_is_a_doctor_problem_with_setup_action(self):
-        legacy = (
-            self.home
-            / ".local"
-            / "share"
-            / "improver"
-            / "personal-knowledge"
-        )
-        legacy.mkdir(parents=True)
-
-        code, text = self._doctor()
-
-        self.assertEqual(code, 3)
-        self.assertIn("무엇: LEGACY_WIRING_PRESENT", text)
-        self.assertIn("수정: didim setup", text)
 
     def test_status_and_doctor_are_read_only(self):
         before = self._snapshot()

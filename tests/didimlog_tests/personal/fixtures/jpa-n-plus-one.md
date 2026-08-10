@@ -1,5 +1,4 @@
 ---
-project: global
 topic: jpa
 title: ManyToOne 기본 EAGER는 항상 LAZY로 명시
 summary: @ManyToOne/@OneToOne 기본 EAGER가 N+1과 예측불가 로딩을 부른다
