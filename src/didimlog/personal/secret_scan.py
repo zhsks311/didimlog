@@ -8,6 +8,8 @@ import re
 import subprocess
 import sys
 
+_GIT_TIMEOUT_SECONDS = 5
+
 
 PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
     # Stripe publishable keys (pk_) are intentionally excluded.
@@ -48,6 +50,7 @@ def git(*args: str) -> subprocess.CompletedProcess[bytes]:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        timeout=_GIT_TIMEOUT_SECONDS,
     )
 
 

@@ -6,6 +6,8 @@ import unittest
 import zipfile
 from pathlib import Path
 
+import yaml
+
 
 REPO = Path(__file__).resolve().parents[2]
 VERSION = "0.0.1"
@@ -69,16 +71,35 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIn("permissions:\n  contents: read", workflow)
 
     def test_release_uses_published_immutable_release_oidc_and_protected_environment(self):
-        workflow = (REPO / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        workflow_text = (REPO / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        workflow = yaml.safe_load(workflow_text)
+        triggers = workflow.get("on", workflow.get(True))
 
-        self.assertIn("release:\n    types: [published]", workflow)
-        self.assertIn("environment:\n      name: pypi", workflow)
-        self.assertIn("id-token: write", workflow)
-        self.assertIn(".immutable", workflow)
-        self.assertIn("gh release download", workflow)
-        self.assertIn("pypa/gh-action-pypi-publish@release/v1", workflow)
-        for forbidden in ("PYPI_API_TOKEN", "password:", "workflow_dispatch:", "push:\n    tags:"):
-            self.assertNotIn(forbidden, workflow)
+        self.assertEqual(triggers, {"release": {"types": ["published"]}})
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        for job in workflow["jobs"].values():
+            self.assertEqual(job.get("permissions", {}).get("contents", "read"), "read")
+            self.assertFalse(self._contains_key(job, "password"))
+
+        publish = workflow["jobs"]["publish"]
+        self.assertEqual(publish["environment"]["name"], "pypi")
+        self.assertEqual(publish["permissions"]["id-token"], "write")
+        self.assertIn(".immutable", workflow_text)
+        self.assertIn("gh release download", workflow_text)
+        self.assertIn("pypa/gh-action-pypi-publish@release/v1", workflow_text)
+        self.assertNotIn("PYPI_API_TOKEN", workflow_text)
+
+    @classmethod
+    def _contains_key(cls, value, expected):
+        if isinstance(value, dict):
+            return expected in value or any(
+                cls._contains_key(child, expected) for child in value.values()
+            )
+        if isinstance(value, list):
+            return any(cls._contains_key(child, expected) for child in value)
+        return False
 
     def test_wheel_and_sdist_follow_the_public_allowlist(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -29,7 +29,12 @@ from didimlog.errors import (
     EXIT_USAGE,
     emit_error,
 )
-from didimlog.indexing import run_index
+from didimlog.indexing import (
+    PERSONAL_INDEX_CURRENT,
+    PROJECT_INDEX_CURRENT,
+    PROJECT_NOT_CONFIGURED,
+    run_index,
+)
 from didimlog.personal.lesson import parse_lesson_text
 from didimlog.personal.lesson_writing import (
     LessonError,
@@ -378,9 +383,9 @@ def _index(args) -> int:
     print(result.project)
     if not args.check:
         return 0
-    personal_current = result.personal.endswith("PERSONAL_INDEX_CURRENT")
-    project_current = result.project.endswith("PROJECT_INDEX_CURRENT")
-    project_unconfigured = "설정되지 않음" in result.project
+    personal_current = result.personal_token == PERSONAL_INDEX_CURRENT
+    project_current = result.project_token == PROJECT_INDEX_CURRENT
+    project_unconfigured = result.project_token == PROJECT_NOT_CONFIGURED
     return 0 if personal_current and (project_current or project_unconfigured) else EXIT_POLICY
 
 

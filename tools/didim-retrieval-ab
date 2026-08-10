@@ -36,6 +36,7 @@ DETAIL_MARKERS = (
     "/knowledge/book/",
 )
 RUN_COUNT = 3
+SESSION_TIMEOUT_SECONDS = 600
 AUTH_FIELDS = ("userID", "oauthAccount", "claudeCodeFirstTokenDate")
 KEYCHAIN_PREFIX = "Claude Code-credentials"
 CLAUDE_ENVIRONMENT_KEYS = ("LANG", "LC_ALL", "LC_CTYPE", "PATH", "TMPDIR")
@@ -329,23 +330,38 @@ def session(
         environment["PATH"] = (
             str(path_prefix) + os.pathsep + environment.get("PATH", os.defpath)
         )
-    completed = subprocess.run(
-        [
-            claude,
-            "-p",
-            prompt,
-            "--no-session-persistence",
-            "--permission-mode",
-            "bypassPermissions",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-        ],
-        cwd=project_dir,
-        env=environment,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        completed = subprocess.run(
+            [
+                claude,
+                "-p",
+                prompt,
+                "--no-session-persistence",
+                "--permission-mode",
+                "bypassPermissions",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+            ],
+            cwd=project_dir,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=SESSION_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as expired:
+        output = expired.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", "replace")
+        elif not isinstance(output, str):
+            output = ""
+        log_path.write_text(output, encoding="utf-8")
+        observed = parse(output)
+        observed["is_error"] = True
+        observed["timed_out"] = True
+        observed["timeout_seconds"] = SESSION_TIMEOUT_SECONDS
+        observed["returncode"] = 124
+        return observed
     log_path.write_text(completed.stdout, encoding="utf-8")
     observed = parse(completed.stdout)
     observed["returncode"] = completed.returncode
@@ -367,14 +383,25 @@ def parse(stream):
             model = event.get("model")
             runtime = event.get("claude_code_version") or event.get("version")
         elif event.get("type") == "assistant":
-            for block in event["message"].get("content", []):
-                if block.get("type") == "tool_use":
-                    reads.append(
-                        (
-                            block["name"],
-                            json.dumps(block["input"], ensure_ascii=False),
-                        )
+            message = event.get("message")
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                name = block.get("name")
+                tool_input = block.get("input")
+                if not isinstance(name, str) or not name or not isinstance(tool_input, dict):
+                    continue
+                reads.append(
+                    (
+                        name,
+                        json.dumps(tool_input, ensure_ascii=False),
                     )
+                )
         elif event.get("type") == "result":
             result = str(event.get("result") or "")
             error = bool(event.get("is_error"))

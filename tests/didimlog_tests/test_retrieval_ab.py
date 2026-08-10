@@ -358,6 +358,45 @@ class EnvironmentTests(unittest.TestCase):
             },
         )
 
+    def test_session_timeout_writes_partial_log_and_returns_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            home = root / "home"
+            config = home / ".claude"
+            log = root / "session.jsonl"
+            for path in (project, config):
+                path.mkdir(parents=True)
+            partial = stream([], result="partial")
+            expired = self.harness.subprocess.TimeoutExpired(
+                cmd=("claude", "-p"),
+                timeout=600,
+                output=partial.encode("utf-8"),
+            )
+
+            with mock.patch.object(
+                self.harness.subprocess,
+                "run",
+                side_effect=expired,
+            ) as run:
+                observed = self.harness.session(
+                    project,
+                    home,
+                    config,
+                    "claude",
+                    "prompt",
+                    log,
+                    oauth_token="oauth-access",
+                )
+            log_text = log.read_text(encoding="utf-8")
+
+        self.assertEqual(run.call_args.kwargs["timeout"], 600)
+        self.assertEqual(log_text, partial)
+        self.assertTrue(observed["is_error"])
+        self.assertTrue(observed["timed_out"])
+        self.assertEqual(observed["timeout_seconds"], 600)
+        self.assertEqual(observed["returncode"], 124)
+
 
     def test_each_trial_case_receives_a_distinct_home_and_config(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -468,6 +507,37 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(observed["tools"], [])
         self.assertTrue(observed["is_error"])
 
+
+    def test_skips_malformed_assistant_events_and_incomplete_tool_uses(self):
+        events = (
+            {"type": "assistant"},
+            {"type": "assistant", "message": None},
+            {"type": "assistant", "message": {"content": None}},
+            {"type": "assistant", "message": {"content": ["invalid"]}},
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "tool_use", "input": {"file_path": "/missing-name"}},
+                        {"type": "tool_use", "name": "Read"},
+                        {
+                            "type": "tool_use",
+                            "name": "Read",
+                            "input": {"file_path": "/valid"},
+                        },
+                    ]
+                },
+            },
+        )
+
+        observed = self.harness.parse(
+            "\n".join(json.dumps(event) for event in events)
+        )
+
+        self.assertEqual(
+            observed["tools"],
+            [("Read", '{"file_path": "/valid"}')],
+        )
 
 class JudgeTests(unittest.TestCase):
     def setUp(self):

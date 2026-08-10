@@ -2,9 +2,11 @@ import base64
 import hashlib
 import tempfile
 import unittest
+from unittest import mock
 from importlib import resources
 from pathlib import Path
 
+from didimlog.personal import render as render_module
 from didimlog.personal.render import render_book
 
 
@@ -127,6 +129,19 @@ graph LR
             self.render()
 
         self.assertFalse(self.output.exists())
+
+    def test_block_raw_html_with_or_without_markdown_attribute_is_rejected(self):
+        for raw_html in (
+            "<div>\nunsafe\n</div>",
+            '<div markdown="1">\n**unsafe**\n</div>',
+        ):
+            with self.subTest(raw_html=raw_html):
+                self.write_source("# unsafe\n\n{}\n".format(raw_html))
+
+                with self.assertRaisesRegex(ValueError, "raw HTML"):
+                    self.render()
+
+                self.assertFalse(self.output.exists())
 
     def test_unsafe_markdown_link_schemes_are_rejected(self):
         for destination in (
@@ -307,6 +322,22 @@ class MermaidResourceTests(unittest.TestCase):
             'THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND',
             license_text,
         )
+
+    def test_mermaid_loader_rejects_runtime_with_wrong_digest(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            package = Path(temporary_directory)
+            (package / "mermaid.min.js").write_text(
+                "console.log('tampered')",
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(
+                render_module.resources,
+                "files",
+                return_value=package,
+            ):
+                with self.assertRaisesRegex(ValueError, "integrity"):
+                    render_module._load_mermaid()
 
 
 if __name__ == "__main__":

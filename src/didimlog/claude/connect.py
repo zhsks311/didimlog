@@ -73,11 +73,14 @@ def _migrate_legacy_claude(original: bytes, config: Path) -> tuple[bytes, bool]:
     if end_begin < begin + len(_LEGACY_START):
         raise ValueError("CLAUDE.md has mismatched legacy Personal Knowledge markers")
     finish = end_begin + len(_LEGACY_END)
-    intended = (
-        original[:begin]
-        + render_managed_block(config)
-        + original[finish:]
-    )
+    without_legacy = original[:begin] + original[finish:]
+    if (
+        config_module._START_PREFIX in without_legacy
+        or config_module._END_PREFIX in without_legacy
+    ):
+        intended = plan_claude_md(without_legacy, config)
+    else:
+        intended = original[:begin] + render_managed_block(config) + original[finish:]
     return intended, True
 
 

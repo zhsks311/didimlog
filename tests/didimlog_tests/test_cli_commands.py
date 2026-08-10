@@ -196,6 +196,8 @@ class CliCommandSurfaceTests(unittest.TestCase):
         stale = SimpleNamespace(
             personal="개인 지식: PERSONAL_INDEX_STALE",
             project="프로젝트 근거: PROJECT_INDEX_CURRENT",
+            personal_token="PERSONAL_INDEX_STALE",
+            project_token="PROJECT_INDEX_CURRENT",
         )
         with mock.patch("didimlog.cli.run_index", return_value=stale) as run:
             code, stdout, stderr = invoke(["index", "--check"])
@@ -205,6 +207,21 @@ class CliCommandSurfaceTests(unittest.TestCase):
         self.assertIn("PERSONAL_INDEX_STALE", stdout)
         self.assertIn("PROJECT_INDEX_CURRENT", stdout)
         run.assert_called_once_with(check=True)
+
+    def test_index_check_uses_tokens_instead_of_display_wording(self):
+        current = SimpleNamespace(
+            personal="개인 지식 표시 문구가 바뀜",
+            project="프로젝트 미설정 표시 문구가 바뀜",
+            personal_token="PERSONAL_INDEX_CURRENT",
+            project_token="PROJECT_NOT_CONFIGURED",
+        )
+        with mock.patch("didimlog.cli.run_index", return_value=current):
+            code, stdout, stderr = invoke(["index", "--check"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn(current.personal, stdout)
+        self.assertIn(current.project, stdout)
 
     def test_hook_session_start_delegates_raw_streams_and_stays_zero(self):
         with mock.patch("didimlog.cli.session_start", return_value=0) as hook:

@@ -42,10 +42,6 @@ _PROJECT_LABELS = {
 }
 
 
-def _token(status: str) -> str:
-    return status.partition(": ")[2]
-
-
 def _safe_label(value: str) -> str:
     return "".join(
         character if ord(character) >= 32 and ord(character) != 127 else "?"
@@ -108,7 +104,7 @@ def status_text(*, home=None, cwd=None, config=None) -> str:
     """Summarize current state without exposing absolute home paths."""
     selected_home = Path.home() if home is None else Path(home)
     selected_home = Path(os.path.abspath(selected_home))
-    personal_token = _token(_personal_check(data_home(selected_home)))
+    personal_token = _personal_check(data_home(selected_home))
     personal_label = _PERSONAL_LABELS.get(personal_token, "확인 필요")
 
     project_root = _discover_git_root(cwd)
@@ -118,7 +114,7 @@ def status_text(*, home=None, cwd=None, config=None) -> str:
     else:
         project_name = _safe_label(project_root.name)
         if _prepared_project(project_root):
-            project_token = _token(_project_check(project_root))
+            project_token = _project_check(project_root)
             project_label = _PROJECT_LABELS.get(project_token, "확인 필요")
         else:
             project_label = "설정되지 않음"

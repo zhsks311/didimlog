@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import html
 from html.parser import HTMLParser
 
@@ -34,6 +35,7 @@ _AUTOMAIL = re.compile(AUTOMAIL_RE, re.DOTALL | re.UNICODE)
 _RAW_HTML = re.compile(HTML_RE, re.DOTALL | re.UNICODE)
 _EXTERNAL_URI = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 _ALLOWED_LINK_SCHEMES = frozenset(("http", "https", "mailto"))
+_MERMAID_SHA256 = "70137e77bb273bb2ef972b86e8b0400cca8be53cb25bfc45911a186dc98665de"
 
 
 _STYLE = r"""
@@ -211,8 +213,14 @@ def _reject_unsafe_links(rendered: str) -> None:
 def _load_mermaid() -> str:
     try:
         package = resources.files("didimlog.resources.personal")
-        return (package / "mermaid.min.js").read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as error:
+        runtime = (package / "mermaid.min.js").read_bytes()
+    except OSError as error:
+        raise ValueError("vendored Mermaid runtime missing") from error
+    if hashlib.sha256(runtime).hexdigest() != _MERMAID_SHA256:
+        raise ValueError("vendored Mermaid runtime failed integrity check")
+    try:
+        return runtime.decode("utf-8")
+    except UnicodeError as error:
         raise ValueError("vendored Mermaid runtime missing") from error
 
 

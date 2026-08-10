@@ -65,18 +65,6 @@ class PackageLifecycleTests(unittest.TestCase):
                 text=True,
             )
 
-            subprocess.run([git, "init", "-q"], cwd=workspace, check=True)
-            subprocess.run(
-                [git, "config", "user.name", "Didimlog Lifecycle"],
-                cwd=workspace,
-                check=True,
-            )
-            subprocess.run(
-                [git, "config", "user.email", "didimlog@example.invalid"],
-                cwd=workspace,
-                check=True,
-            )
-
             environment = os.environ.copy()
             environment.update(
                 {
@@ -89,6 +77,20 @@ class PackageLifecycleTests(unittest.TestCase):
                 }
             )
             environment.pop("PYTHONPATH", None)
+
+            for command in (
+                [git, "init", "-q"],
+                [git, "config", "user.name", "Didimlog Lifecycle"],
+                [git, "config", "user.email", "didimlog@example.invalid"],
+            ):
+                subprocess.run(
+                    command,
+                    cwd=workspace,
+                    env=environment,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
 
             steps = []
 

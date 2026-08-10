@@ -143,6 +143,37 @@ class InstallJournalTests(unittest.TestCase):
 
             self.assertEqual(target.read_bytes(), b"original\n")
 
+    def test_rollback_continues_after_one_target_backup_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            journal = InstallJournal(root / "install-journal.json")
+
+            good_target = root / "CLAUDE.md"
+            good_backup = root / "CLAUDE.md.backup"
+            good_target.write_bytes(b"good original\n")
+            good_backup.write_bytes(b"good original\n")
+            journal.record_original(
+                "good", good_target, b"good original\n", good_backup
+            )
+            good_target.write_bytes(b"good installed\n")
+            journal.record_installed("good", b"good installed\n")
+
+            bad_target = root / "settings.json"
+            bad_backup = root / "settings.json.backup"
+            bad_target.write_bytes(b"bad original\n")
+            bad_backup.write_bytes(b"bad original\n")
+            journal.record_original(
+                "bad", bad_target, b"bad original\n", bad_backup
+            )
+            bad_target.write_bytes(b"bad installed\n")
+            journal.record_installed("bad", b"bad installed\n")
+            bad_backup.unlink()
+
+            journal.rollback()
+
+            self.assertEqual(bad_target.read_bytes(), b"bad installed\n")
+            self.assertEqual(good_target.read_bytes(), b"good original\n")
+
 
 if __name__ == "__main__":
     unittest.main()

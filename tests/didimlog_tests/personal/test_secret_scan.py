@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from didimlog.personal import secret_scan
 
@@ -188,6 +189,22 @@ class SecretScanTests(unittest.TestCase):
         self.assertIn("API secret key", result.stderr)
         self.assertIn("0:notes.md", result.stderr)
         self.assertNotIn(secret, result.stderr)
+
+    def test_git_reads_have_a_bounded_timeout(self):
+        completed = subprocess.CompletedProcess(
+            args=("git", "status"),
+            returncode=0,
+            stdout=b"",
+            stderr=b"",
+        )
+        with mock.patch.object(
+            secret_scan.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            secret_scan.git("status")
+
+        self.assertEqual(run.call_args.kwargs["timeout"], 5)
 
 
 if __name__ == "__main__":

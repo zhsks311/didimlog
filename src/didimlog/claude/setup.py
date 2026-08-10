@@ -12,6 +12,8 @@ import tempfile
 from didimlog import version as didimlog_version
 from didimlog.errors import DidimError, EXIT_POLICY, EXIT_USAGE
 from didimlog.indexing import (
+    PERSONAL_INDEX_CURRENT,
+    PROJECT_INDEX_CURRENT,
     _discover_git_root,
     _personal_check,
     _prepared_project,
@@ -111,7 +113,7 @@ def _plan_personal(home) -> tuple[_PersonalSetupPlan, tuple[str, ...]]:
 
     index_current = (
         not any("디렉터리 생성" in change for change in changes)
-        and _personal_check(root).endswith("PERSONAL_INDEX_CURRENT")
+        and _personal_check(root) == PERSONAL_INDEX_CURRENT
     )
     if not index_current:
         changes.append("개인 지식 index 생성 또는 갱신")
@@ -263,10 +265,11 @@ def _postcheck(plan: SetupPlan) -> None:
         home=plan._personal.home,
         cwd=plan._project_root,
     )
-    if not checked.personal.endswith("PERSONAL_INDEX_CURRENT"):
+    if checked.personal_token != PERSONAL_INDEX_CURRENT:
         raise DidimError("SETUP_POSTCHECK_FAILED", exit_code=EXIT_POLICY)
-    if plan._project_root is not None and not checked.project.endswith(
-        "PROJECT_INDEX_CURRENT"
+    if (
+        plan._project_root is not None
+        and checked.project_token != PROJECT_INDEX_CURRENT
     ):
         raise DidimError("SETUP_POSTCHECK_FAILED", exit_code=EXIT_POLICY)
     if plan._claude is not None and inspect(

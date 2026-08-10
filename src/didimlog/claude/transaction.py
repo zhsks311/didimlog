@@ -71,7 +71,10 @@ class InstallJournal:
 
     def rollback(self) -> None:
         for name in reversed(tuple(self._targets())):
-            self._rollback_target(name)
+            try:
+                self._rollback_target(name)
+            except (OSError, KeyError, ValueError):
+                continue
 
     def _rollback_target(self, name: str) -> bool:
         target = self._targets()[name]

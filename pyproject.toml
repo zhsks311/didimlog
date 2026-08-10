@@ -42,3 +42,8 @@ source-include = [
     "SECURITY.md",
     "uv.lock",
 ]
+
+[dependency-groups]
+dev = [
+    "pyyaml==6.0.3",
+]

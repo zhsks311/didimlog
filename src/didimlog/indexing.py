@@ -18,7 +18,10 @@ from didimlog.project.scaffold import plan_scaffold
 
 
 _GIT_TIMEOUT_SECONDS = 5
-_PROJECT_NOT_CONFIGURED = (
+PERSONAL_INDEX_CURRENT = "PERSONAL_INDEX_CURRENT"
+PROJECT_INDEX_CURRENT = "PROJECT_INDEX_CURRENT"
+PROJECT_NOT_CONFIGURED = "PROJECT_NOT_CONFIGURED"
+_PROJECT_NOT_CONFIGURED_TEXT = (
     "프로젝트 근거: 설정되지 않음 — didim setup을 실행하세요."
 )
 
@@ -27,10 +30,26 @@ _PROJECT_NOT_CONFIGURED = (
 class IndexResult:
     personal: str
     project: str
+    personal_token: str
+    project_token: str
 
 
 def _status(label: str, token: str) -> str:
     return "{}: {}".format(label, token)
+
+
+def _result(personal_token: str, project_token: str) -> IndexResult:
+    project = (
+        _PROJECT_NOT_CONFIGURED_TEXT
+        if project_token == PROJECT_NOT_CONFIGURED
+        else _status("프로젝트 근거", project_token)
+    )
+    return IndexResult(
+        personal=_status("개인 지식", personal_token),
+        project=project,
+        personal_token=personal_token,
+        project_token=project_token,
+    )
 
 
 def _discover_git_root(cwd) -> Path | None:
@@ -91,34 +110,34 @@ def _prepared_project(root: Path) -> bool:
 def _personal_check_locked(root: Path) -> str:
     destination = root / "index"
     if not root.exists():
-        return _status("개인 지식", "PERSONAL_INDEX_MISSING")
+        return "PERSONAL_INDEX_MISSING"
     try:
         outputs = personal_index.build_all(root)
     except (personal_index.KnowledgeIndexError, OSError, UnicodeError):
-        return _status("개인 지식", "PERSONAL_INDEX_INVALID_SOURCE")
+        return "PERSONAL_INDEX_INVALID_SOURCE"
 
     if destination.is_symlink() or (
         destination.exists() and not destination.is_dir()
     ):
-        return _status("개인 지식", "PERSONAL_INDEX_EXTRA")
+        return "PERSONAL_INDEX_EXTRA"
     if not destination.is_dir():
-        return _status("개인 지식", "PERSONAL_INDEX_MISSING")
+        return "PERSONAL_INDEX_MISSING"
     try:
         entries = tuple(destination.iterdir())
     except OSError:
-        return _status("개인 지식", "PERSONAL_INDEX_EXTRA")
+        return "PERSONAL_INDEX_EXTRA"
     expected_names = {project + ".md" for project in outputs}
     actual_names = {entry.name for entry in entries}
     if expected_names - actual_names:
-        return _status("개인 지식", "PERSONAL_INDEX_MISSING")
+        return "PERSONAL_INDEX_MISSING"
     if actual_names - expected_names:
-        return _status("개인 지식", "PERSONAL_INDEX_EXTRA")
+        return "PERSONAL_INDEX_EXTRA"
     for project, text in outputs.items():
         path = destination / (project + ".md")
         try:
             linked = path.lstat()
             if stat.S_ISLNK(linked.st_mode) or not stat.S_ISREG(linked.st_mode):
-                return _status("개인 지식", "PERSONAL_INDEX_EXTRA")
+                return "PERSONAL_INDEX_EXTRA"
             expected = text.encode("utf-8")
             if (
                 read_regular_file_beneath(
@@ -128,20 +147,20 @@ def _personal_check_locked(root: Path) -> str:
                 )
                 != expected
             ):
-                return _status("개인 지식", "PERSONAL_INDEX_STALE")
+                return "PERSONAL_INDEX_STALE"
         except (OSError, UnsafePathError):
-            return _status("개인 지식", "PERSONAL_INDEX_MISSING")
-    return _status("개인 지식", "PERSONAL_INDEX_CURRENT")
+            return "PERSONAL_INDEX_MISSING"
+    return PERSONAL_INDEX_CURRENT
 
 
 def _personal_check(root: Path) -> str:
     if not root.exists():
-        return _status("개인 지식", "PERSONAL_INDEX_MISSING")
+        return "PERSONAL_INDEX_MISSING"
     try:
         with path_lock(root, shared=True):
             return _personal_check_locked(root)
     except OSError:
-        return _status("개인 지식", "PERSONAL_INDEX_INVALID_SOURCE")
+        return "PERSONAL_INDEX_INVALID_SOURCE"
 
 
 def _project_check(root: Path) -> str:
@@ -149,21 +168,21 @@ def _project_check(root: Path) -> str:
     try:
         current = project_index.check_index(root)
     except (OSError, ValueError):
-        return _status("프로젝트 근거", "PROJECT_INDEX_INVALID_SOURCE")
+        return "PROJECT_INDEX_INVALID_SOURCE"
     try:
         entries = tuple(output.parent.iterdir())
     except FileNotFoundError:
-        return _status("프로젝트 근거", "PROJECT_INDEX_MISSING")
+        return "PROJECT_INDEX_MISSING"
     except OSError:
-        return _status("프로젝트 근거", "PROJECT_INDEX_EXTRA")
+        return "PROJECT_INDEX_EXTRA"
     names = {entry.name for entry in entries}
     if "INDEX.md" not in names:
-        return _status("프로젝트 근거", "PROJECT_INDEX_MISSING")
+        return "PROJECT_INDEX_MISSING"
     if names != {"INDEX.md"}:
-        return _status("프로젝트 근거", "PROJECT_INDEX_EXTRA")
+        return "PROJECT_INDEX_EXTRA"
     if current != 0:
-        return _status("프로젝트 근거", "PROJECT_INDEX_STALE")
-    return _status("프로젝트 근거", "PROJECT_INDEX_CURRENT")
+        return "PROJECT_INDEX_STALE"
+    return PROJECT_INDEX_CURRENT
 
 
 def run_index(*, check: bool, home=None, cwd=None) -> IndexResult:
@@ -177,22 +196,22 @@ def run_index(*, check: bool, home=None, cwd=None) -> IndexResult:
     )
 
     if check:
-        personal = _personal_check(personal_root)
-        project = (
-            _PROJECT_NOT_CONFIGURED
+        personal_token = _personal_check(personal_root)
+        project_token = (
+            PROJECT_NOT_CONFIGURED
             if configured_project is None
             else _project_check(configured_project)
         )
-        return IndexResult(personal=personal, project=project)
+        return _result(personal_token, project_token)
 
     personal_index.write_all(
         data_root=personal_root,
         target=personal_root / "index",
     )
-    personal = _status("개인 지식", "PERSONAL_INDEX_WRITTEN")
+    personal_token = "PERSONAL_INDEX_WRITTEN"
     if configured_project is None:
-        project = _PROJECT_NOT_CONFIGURED
+        project_token = PROJECT_NOT_CONFIGURED
     else:
         project_index.write_index(configured_project)
-        project = _status("프로젝트 근거", "PROJECT_INDEX_WRITTEN")
-    return IndexResult(personal=personal, project=project)
+        project_token = "PROJECT_INDEX_WRITTEN"
+    return _result(personal_token, project_token)

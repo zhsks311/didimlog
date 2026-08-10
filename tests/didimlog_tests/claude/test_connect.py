@@ -299,6 +299,28 @@ class ConnectTests(unittest.TestCase):
             self.assertEqual(commands.count(f"{launcher} hook session-start"), 1)
             self.assertEqual(tree_bytes(old_install), old_install_before)
 
+    def test_legacy_and_current_blocks_collapse_to_one_managed_block(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            home = root / "home"
+            config = home / ".claude"
+            config.mkdir(parents=True)
+            launcher = make_launcher(home)
+            legacy = LEGACY_START + b"legacy imports\n" + LEGACY_END
+            current = render_managed_block(config.resolve())
+            original = b"user prefix\n" + legacy + b"between\n" + current + b"user suffix\n"
+            (config / "CLAUDE.md").write_bytes(original)
+
+            plan = plan_connect(config, launcher=launcher, environ={}, home=home)
+            apply_connect(plan, make_journal(root, "mixed-marker-connect"))
+
+            migrated = (config / "CLAUDE.md").read_bytes()
+            self.assertNotIn(LEGACY_START, migrated)
+            self.assertEqual(migrated.count(b"<!-- DIDIMLOG:START"), 1)
+            self.assertIn(b"user prefix\n", migrated)
+            self.assertIn(b"between\n", migrated)
+            self.assertIn(b"user suffix\n", migrated)
+
     def test_explicit_profile_is_the_only_selected_profile(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

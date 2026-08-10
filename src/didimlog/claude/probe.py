@@ -8,6 +8,8 @@ from pathlib import Path
 import stat
 
 from didimlog.indexing import (
+    PERSONAL_INDEX_CURRENT,
+    PROJECT_INDEX_CURRENT,
     _discover_git_root,
     _personal_check,
     _prepared_project,
@@ -73,9 +75,8 @@ def _launcher_from_settings(raw: bytes | None) -> Path | None:
     return launchers[0] if len(launchers) == 1 else None
 
 
-def _index_problem(status: str, *, personal: bool) -> Problem | None:
-    token = status.partition(": ")[2]
-    current = "PERSONAL_INDEX_CURRENT" if personal else "PROJECT_INDEX_CURRENT"
+def _index_problem(token: str, *, personal: bool) -> Problem | None:
+    current = PERSONAL_INDEX_CURRENT if personal else PROJECT_INDEX_CURRENT
     if token == current:
         return None
     if personal:

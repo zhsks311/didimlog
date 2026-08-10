@@ -62,6 +62,8 @@ class IndexServiceTests(unittest.TestCase):
             IndexResult(
                 personal="개인 지식: PERSONAL_INDEX_WRITTEN",
                 project="프로젝트 근거: PROJECT_INDEX_WRITTEN",
+                personal_token="PERSONAL_INDEX_WRITTEN",
+                project_token="PROJECT_INDEX_WRITTEN",
             ),
         )
         self.assertTrue((self.home / "knowledge" / "index" / "_global.md").is_file())
@@ -77,6 +79,8 @@ class IndexServiceTests(unittest.TestCase):
             result.project,
             "프로젝트 근거: 설정되지 않음 — didim setup을 실행하세요.",
         )
+        self.assertEqual(result.personal_token, "PERSONAL_INDEX_WRITTEN")
+        self.assertEqual(result.project_token, "PROJECT_NOT_CONFIGURED")
         self.assertTrue((self.home / "knowledge" / "index" / "_global.md").is_file())
         self.assertFalse((self.cwd / "knowledge").exists())
 
@@ -168,6 +172,8 @@ class IndexServiceTests(unittest.TestCase):
             IndexResult(
                 personal="개인 지식: PERSONAL_INDEX_CURRENT",
                 project="프로젝트 근거: PROJECT_INDEX_CURRENT",
+                personal_token="PERSONAL_INDEX_CURRENT",
+                project_token="PROJECT_INDEX_CURRENT",
             ),
         )
 
