@@ -8,9 +8,24 @@ from didimlog import file_io
 from didimlog.file_io import (
     UnsafePathError,
     open_child_directory,
+    open_directory_path,
     read_regular_file_at,
     replace_regular_file_at_if_unchanged,
 )
+
+
+def stale_revision(info):
+    return mock.Mock(
+        st_dev=info.st_dev,
+        st_ino=info.st_ino,
+        st_mode=info.st_mode,
+        st_uid=info.st_uid,
+        st_gid=info.st_gid,
+        st_nlink=info.st_nlink,
+        st_size=info.st_size,
+        st_mtime_ns=info.st_mtime_ns,
+        st_ctime_ns=info.st_ctime_ns - 1,
+    )
 
 
 class FileIoContractTests(unittest.TestCase):
@@ -32,21 +47,85 @@ class FileIoContractTests(unittest.TestCase):
             root = Path(temporary_directory)
             record = root / "record.md"
             record.write_bytes(b"expected")
+            replacement = root / "replacement.md"
+            replacement.write_bytes(b"external sentinel")
+            linked = stale_revision(replacement.stat())
             root_descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
             real_open = os.open
 
             def replace_before_open(path, flags, *args, **kwargs):
                 if path == "record.md" and kwargs.get("dir_fd") == root_descriptor:
-                    record.unlink()
-                    record.write_bytes(b"external sentinel")
+                    replacement.replace(record)
                 return real_open(path, flags, *args, **kwargs)
 
             try:
-                with mock.patch("didimlog.file_io.os.open", side_effect=replace_before_open):
-                    with self.assertRaises(UnsafePathError):
-                        read_regular_file_at(root_descriptor, "record.md", 64)
+                with (
+                    mock.patch("didimlog.file_io.os.stat", return_value=linked),
+                    mock.patch(
+                        "didimlog.file_io.os.open",
+                        side_effect=replace_before_open,
+                    ),
+                    self.assertRaises(UnsafePathError),
+                ):
+                    read_regular_file_at(root_descriptor, "record.md", 64)
             finally:
                 os.close(root_descriptor)
+
+    def test_directory_reused_inode_with_changed_revision_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            child = root / "child"
+            replacement = root / "replacement"
+            child.mkdir()
+            replacement.mkdir()
+            linked = stale_revision(replacement.stat())
+            root_descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            real_open = os.open
+
+            def replace_before_open(path, flags, *args, **kwargs):
+                if path == "child" and kwargs.get("dir_fd") == root_descriptor:
+                    child.rmdir()
+                    replacement.replace(child)
+                return real_open(path, flags, *args, **kwargs)
+
+            try:
+                with (
+                    mock.patch("didimlog.file_io.os.stat", return_value=linked),
+                    mock.patch(
+                        "didimlog.file_io.os.open",
+                        side_effect=replace_before_open,
+                    ),
+                    self.assertRaises(UnsafePathError),
+                ):
+                    open_child_directory(root_descriptor, "child")
+            finally:
+                os.close(root_descriptor)
+
+    def test_directory_path_reused_inode_with_changed_revision_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "target"
+            replacement = root / "replacement"
+            target.mkdir()
+            replacement.mkdir()
+            linked = stale_revision(replacement.stat())
+            real_open = os.open
+
+            def replace_before_open(path, flags, *args, **kwargs):
+                if path == str(target):
+                    target.rmdir()
+                    replacement.replace(target)
+                return real_open(path, flags, *args, **kwargs)
+
+            with (
+                mock.patch("didimlog.file_io.os.lstat", return_value=linked),
+                mock.patch(
+                    "didimlog.file_io.os.open",
+                    side_effect=replace_before_open,
+                ),
+                self.assertRaises(UnsafePathError),
+            ):
+                open_directory_path(target)
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO is unavailable")
     def test_fifo_is_rejected_without_blocking(self):

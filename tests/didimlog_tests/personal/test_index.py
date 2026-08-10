@@ -1,5 +1,5 @@
 import contextlib
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from concurrent.futures import ThreadPoolExecutor
 import io
 import multiprocessing
 import os

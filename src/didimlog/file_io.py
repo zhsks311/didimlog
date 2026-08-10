@@ -52,8 +52,7 @@ def open_child_directory(parent_descriptor: int, name: str) -> int:
         opened = os.fstat(descriptor)
         if (
             not stat.S_ISDIR(opened.st_mode)
-            or opened.st_dev != linked.st_dev
-            or opened.st_ino != linked.st_ino
+            or _file_revision(opened) != _file_revision(linked)
         ):
             raise UnsafePathError("directory component changed")
         return descriptor
@@ -115,11 +114,9 @@ def read_regular_file_at_with_stat(
         opened = os.fstat(descriptor)
         if (
             not stat.S_ISREG(opened.st_mode)
-            or opened.st_dev != linked.st_dev
-            or opened.st_ino != linked.st_ino
+            or _file_revision(opened) != _file_revision(linked)
         ):
             raise UnsafePathError("file component changed")
-
         limit = maximum_bytes + 1
         chunks = bytearray()
         while len(chunks) < limit:
@@ -434,8 +431,7 @@ def open_directory_path(path: os.PathLike[str] | str) -> int:
         opened = os.fstat(descriptor)
         if (
             not stat.S_ISDIR(opened.st_mode)
-            or opened.st_dev != linked.st_dev
-            or opened.st_ino != linked.st_ino
+            or _file_revision(opened) != _file_revision(linked)
         ):
             raise UnsafePathError("directory path changed")
         return descriptor
