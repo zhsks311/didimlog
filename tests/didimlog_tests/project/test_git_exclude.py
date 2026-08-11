@@ -277,7 +277,7 @@ class GitExcludeContractTests(ErrorContractMixin, unittest.TestCase):
 
         def write_then_track(path, original, intended):
             real_writer(path, original, intended)
-            self.git(self.project, "add", "knowledge/tracked.txt")
+            self.git(self.project, "add", "-f", "knowledge/tracked.txt")
 
         with self.isolated_environment(), mock.patch(
             "didimlog.project.git_exclude.write_regular_file_if_unchanged",

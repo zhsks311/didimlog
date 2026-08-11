@@ -243,6 +243,18 @@ def _validated_project_root(project_root: Path) -> Path:
 
 
 def _git_exclude_path(project_root: Path) -> Path:
+    common_result = _run_git(
+        project_root,
+        (
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ),
+    )
+    common_directory = _strict_path(common_result.stdout)
+    lexical_path = common_directory / "info" / "exclude"
+    _preflight(lexical_path)
+
     result = _run_git(
         project_root,
         (
@@ -252,7 +264,10 @@ def _git_exclude_path(project_root: Path) -> Path:
             "info/exclude",
         ),
     )
-    return _strict_path(result.stdout)
+    path = _strict_path(result.stdout)
+    if path != lexical_path:
+        raise _unsafe()
+    return path
 
 
 def _preflight(path: Path) -> None:
