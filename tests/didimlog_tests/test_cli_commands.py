@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from didimlog import cli
+from didimlog.errors import DidimError, EXIT_GIT
 from didimlog.personal.lesson_writing import LessonSecret
 from didimlog.project.capture import CaptureRequest
 
@@ -44,6 +45,22 @@ def invoke(argv, *, stdin="", tty=False):
     ), contextlib.redirect_stderr(stderr):
         code = cli.main(argv)
     return code, stdout.getvalue(), stderr.getvalue()
+
+
+def setup_plan(
+    *,
+    personal_changes=(),
+    project_changes=(),
+    project_notices=(),
+    claude_changes=(),
+):
+    return SimpleNamespace(
+        version="0.0.1",
+        personal_changes=personal_changes,
+        project_changes=project_changes,
+        project_notices=project_notices,
+        claude_changes=claude_changes,
+    )
 
 
 class CliCommandSurfaceTests(unittest.TestCase):
@@ -104,15 +121,143 @@ class CliCommandSurfaceTests(unittest.TestCase):
                 self.assertEqual(stdout, "")
                 self.assertEqual(stderr, "CLI_USAGE_ERROR\n")
 
+    def test_setup_help_registers_exact_project_knowledge_option(self):
+        code, stdout, stderr = invoke(["setup", "--help"])
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn("--project-knowledge {local,shared}", stdout)
+        self.assertIn(
+            "프로젝트 지식을 이 컴퓨터에만 둘지 Git으로 공유할지 선택",
+            stdout,
+        )
+
+    def test_interactive_setup_defaults_enter_and_one_to_local_before_approval(self):
+        for selected in ("", "1"):
+            with self.subTest(selected=selected), mock.patch(
+                "didimlog.cli.discover_project_for_setup",
+                return_value=Path("/project"),
+            ), mock.patch(
+                "didimlog.cli.plan_setup",
+                return_value=setup_plan(project_changes=("project one",)),
+            ) as planned, mock.patch(
+                "didimlog.cli.apply_setup"
+            ) as applied:
+                code, stdout, stderr = invoke(
+                    ["setup"],
+                    stdin="{}\nn\n".format(selected),
+                    tty=True,
+                )
+
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertLess(
+                stdout.index("프로젝트 지식을 어디에 둘까요?"),
+                stdout.index("Didimlog 0.0.1 변경 계획"),
+            )
+            self.assertLess(
+                stdout.index("Didimlog 0.0.1 변경 계획"),
+                stdout.index("이 변경을 적용할까요? [y/N]: "),
+            )
+            self.assertIn("변경하지 않았습니다.", stdout)
+            self.assertEqual(planned.call_args.kwargs["project_knowledge"], "local")
+            applied.assert_not_called()
+
+    def test_interactive_setup_retries_invalid_storage_choice_and_selects_shared(self):
+        plan = setup_plan()
+        with mock.patch(
+            "didimlog.cli.discover_project_for_setup",
+            return_value=Path("/project"),
+        ), mock.patch("didimlog.cli.plan_setup", return_value=plan) as planned, mock.patch(
+            "didimlog.cli.apply_setup"
+        ):
+            code, stdout, stderr = invoke(
+                ["setup"],
+                stdin="invalid\n2\nn\n",
+                tty=True,
+            )
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(stdout.count("프로젝트 지식을 어디에 둘까요?"), 2)
+        self.assertEqual(stdout.count("1. 이 컴퓨터에서만 사용 — 기본"), 2)
+        self.assertEqual(stdout.count("2. Git에 포함해 공유"), 2)
+        self.assertEqual(stdout.count("선택 [1]: "), 2)
+        self.assertEqual(planned.call_args.kwargs["project_knowledge"], "shared")
+
+    def test_explicit_project_knowledge_skips_storage_question(self):
+        for mode in ("local", "shared"):
+            with self.subTest(mode=mode), mock.patch(
+                "didimlog.cli.discover_project_for_setup"
+            ) as discovered, mock.patch(
+                "didimlog.cli.plan_setup",
+                return_value=setup_plan(),
+            ) as planned, mock.patch(
+                "didimlog.cli.apply_setup"
+            ) as applied:
+                code, stdout, stderr = invoke(
+                    ["setup", "--project-knowledge", mode],
+                    stdin="n\n",
+                    tty=True,
+                )
+
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertNotIn("프로젝트 지식을 어디에 둘까요?", stdout)
+            self.assertIn("이 변경을 적용할까요? [y/N]: ", stdout)
+            self.assertEqual(planned.call_args.kwargs["project_knowledge"], mode)
+            discovered.assert_not_called()
+            applied.assert_not_called()
+
+    def test_unattended_setup_defaults_project_knowledge_to_local_without_probe(self):
+        cases = (
+            ("dry-run", ["setup", "--dry-run"]),
+            ("yes", ["setup", "--yes"]),
+            ("non-tty", ["setup"]),
+        )
+        for name, argv in cases:
+            with self.subTest(name=name), mock.patch(
+                "didimlog.cli.discover_project_for_setup"
+            ) as discovered, mock.patch(
+                "didimlog.cli.plan_setup",
+                return_value=setup_plan(),
+            ) as planned, mock.patch(
+                "didimlog.cli.apply_setup",
+                return_value=(),
+            ):
+                code, stdout, stderr = invoke(argv)
+
+            self.assertEqual(planned.call_args.kwargs["project_knowledge"], "local")
+            self.assertNotIn("프로젝트 지식을 어디에 둘까요?", stdout)
+            discovered.assert_not_called()
+            if name == "non-tty":
+                self.assertEqual((code, stderr), (2, "SETUP_APPROVAL_REQUIRED\n"))
+            else:
+                self.assertEqual((code, stderr), (0, ""))
+
+    def test_interactive_setup_outside_git_defaults_to_local_without_storage_question(self):
+        with mock.patch(
+            "didimlog.cli.discover_project_for_setup",
+            return_value=None,
+        ) as discovered, mock.patch(
+            "didimlog.cli.plan_setup",
+            return_value=setup_plan(),
+        ) as planned, mock.patch(
+            "didimlog.cli.apply_setup"
+        ) as applied:
+            code, stdout, stderr = invoke(["setup"], stdin="n\n", tty=True)
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertNotIn("프로젝트 지식을 어디에 둘까요?", stdout)
+        self.assertEqual(planned.call_args.kwargs["project_knowledge"], "local")
+        discovered.assert_called_once_with(None)
+        applied.assert_not_called()
+
     def test_setup_dry_run_and_yes_use_the_same_plan_summary(self):
-        plan = SimpleNamespace(
-            version="0.0.1",
+        plan = setup_plan(
             personal_changes=("personal one",),
             project_changes=("project one",),
             claude_changes=("claude one",),
         )
         with mock.patch("didimlog.cli.plan_setup", return_value=plan) as planned, mock.patch(
-            "didimlog.cli.apply_setup"
+            "didimlog.cli.apply_setup",
+            return_value=(),
         ) as applied:
             dry_code, dry_stdout, dry_stderr = invoke(
                 ["setup", "--dry-run", "--config-dir", "/safe/config"]
@@ -123,20 +268,127 @@ class CliCommandSurfaceTests(unittest.TestCase):
 
         self.assertEqual((dry_code, dry_stderr), (0, ""))
         self.assertEqual((yes_code, yes_stderr), (0, ""))
-        self.assertIn("personal one", dry_stdout)
-        self.assertIn("project one", dry_stdout)
-        self.assertIn("claude one", dry_stdout)
-        self.assertIn("personal one", yes_stdout)
+        self.assertEqual(dry_stdout, cli._summary(plan))
+        self.assertTrue(yes_stdout.startswith(dry_stdout))
         self.assertEqual(planned.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["project_knowledge"] for call in planned.call_args_list],
+            ["local", "local"],
+        )
         applied.assert_called_once_with(plan, approved=True)
 
-    def test_noninteractive_setup_without_yes_refuses_before_apply(self):
-        plan = SimpleNamespace(
-            version="0.0.1",
-            personal_changes=(),
-            project_changes=(),
-            claude_changes=(),
+    def test_setup_dry_run_summary_shows_git_exclude_change_and_notice(self):
+        plan = setup_plan(
+            project_changes=("Git 로컬 제외 설정에 /knowledge/ 추가",),
+            project_notices=("다른 Git 규칙이 knowledge 폴더를 계속 제외하고 있습니다.",),
         )
+        with mock.patch("didimlog.cli.plan_setup", return_value=plan), mock.patch(
+            "didimlog.cli.apply_setup"
+        ) as applied:
+            code, stdout, stderr = invoke(["setup", "--dry-run"])
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn(
+            "프로젝트 근거\n- Git 로컬 제외 설정에 /knowledge/ 추가",
+            stdout,
+        )
+        self.assertIn(
+            "안내\n- 다른 Git 규칙이 knowledge 폴더를 계속 제외하고 있습니다.",
+            stdout,
+        )
+        applied.assert_not_called()
+
+    def test_setup_prints_shared_final_notice_exactly_once(self):
+        notice = "다른 Git 규칙이 knowledge 폴더를 계속 제외하고 있습니다."
+        plan = setup_plan(project_notices=(notice,))
+        with mock.patch("didimlog.cli.plan_setup", return_value=plan), mock.patch(
+            "didimlog.cli.apply_setup",
+            return_value=(notice,),
+        ) as applied:
+            code, stdout, stderr = invoke(
+                ["setup", "--yes", "--project-knowledge", "shared"]
+            )
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(stdout.count(notice), 1)
+        self.assertTrue(stdout.endswith("Didimlog 준비를 마쳤습니다.\n"))
+        applied.assert_called_once_with(plan, approved=True)
+
+    def test_setup_prints_new_final_notices_after_the_plan_without_duplicates(self):
+        planned_notice = "계획 안내"
+        final_notice = "적용 뒤 안내"
+        plan = setup_plan(project_notices=(planned_notice,))
+        with mock.patch("didimlog.cli.plan_setup", return_value=plan), mock.patch(
+            "didimlog.cli.apply_setup",
+            return_value=(planned_notice, final_notice, final_notice),
+        ):
+            code, stdout, stderr = invoke(["setup", "--yes"])
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(stdout.count(planned_notice), 1)
+        self.assertEqual(stdout.count(final_notice), 1)
+        self.assertLess(
+            stdout.index(final_notice),
+            stdout.index("Didimlog 준비를 마쳤습니다."),
+        )
+
+    def test_setup_rejects_dry_run_and_yes_before_any_git_probe(self):
+        with mock.patch(
+            "didimlog.cli.discover_project_for_setup"
+        ) as discovered, mock.patch("didimlog.cli.plan_setup") as planned:
+            code, stdout, stderr = invoke(["setup", "--dry-run", "--yes"], tty=True)
+
+        self.assertEqual((code, stdout, stderr), (2, "", "CLI_USAGE_ERROR\n"))
+        discovered.assert_not_called()
+        planned.assert_not_called()
+
+    def test_setup_git_errors_preserve_token_and_explain_recovery_on_line_two(self):
+        errors = (
+            (
+                "PROJECT_EXCLUDE_GIT_UNAVAILABLE",
+                "Git 저장소와 로컬 제외 설정을 확인한 뒤 다시 시도하세요.",
+            ),
+            (
+                "PROJECT_EXCLUDE_MARKERS_INVALID",
+                "Didimlog 관리 표시를 직접 고치지 말고 올바른 관리 블록 하나만 남기세요.",
+            ),
+            (
+                "PROJECT_EXCLUDE_CONFLICT",
+                "knowledge 폴더를 다시 포함하는 Git 규칙을 정리한 뒤 다시 시도하세요.",
+            ),
+            (
+                "PROJECT_KNOWLEDGE_TRACKED",
+                "먼저 Git에서 knowledge 폴더의 추적 항목을 직접 정리한 뒤 다시 시도하세요.",
+            ),
+            (
+                "PROJECT_EXCLUDE_CHANGED",
+                "계획 뒤 Git 로컬 제외 설정이 바뀌었습니다. 새 계획을 만든 뒤 다시 시도하세요.",
+            ),
+        )
+        for token, help_text in errors:
+            with self.subTest(token=token), mock.patch(
+                "didimlog.cli.plan_setup",
+                side_effect=DidimError(
+                    token,
+                    exit_code=EXIT_GIT,
+                    help_text=help_text,
+                ),
+            ):
+                code, stdout, stderr = invoke(
+                    [
+                        "--explain-errors",
+                        "setup",
+                        "--dry-run",
+                        "--project-knowledge",
+                        "local",
+                    ]
+                )
+
+            self.assertEqual((code, stdout), (EXIT_GIT, ""))
+            self.assertEqual(stderr, "{}\n도움말: {}\n".format(token, help_text))
+
+    def test_noninteractive_setup_without_yes_refuses_before_apply(self):
+        plan = setup_plan()
         with mock.patch("didimlog.cli.plan_setup", return_value=plan), mock.patch(
             "didimlog.cli.apply_setup"
         ) as applied:

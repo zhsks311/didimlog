@@ -44,6 +44,7 @@ from didimlog.personal.lesson_writing import (
     publish_lesson,
 )
 from didimlog.project.capture import CaptureRequest, capture
+from didimlog.project.git_exclude import discover_project_for_setup
 
 
 _EXPLAIN_ERRORS = "--explain-errors"
@@ -121,6 +122,11 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--dry-run", action="store_true", help="변경 계획만 표시")
     setup.add_argument("--yes", action="store_true", help="변경 계획 승인")
     setup.add_argument("--skip-claude", action="store_true", help="Claude 연결 건너뛰기")
+    setup.add_argument(
+        "--project-knowledge",
+        choices=("local", "shared"),
+        help="프로젝트 지식을 이 컴퓨터에만 둘지 Git으로 공유할지 선택",
+    )
     _add_config(setup)
     setup.set_defaults(_handler=_setup, _help_parser=setup)
 
@@ -205,18 +211,51 @@ def _summary(plan) -> str:
             if changes
             else ("- 변경 없음",)
         )
+    if plan.project_notices:
+        lines.extend(("", "안내"))
+        lines.extend("- {}".format(notice) for notice in plan.project_notices)
     return "\n".join(lines) + "\n"
+
+
+def _project_knowledge_mode(args) -> str:
+    if args.project_knowledge is not None:
+        return args.project_knowledge
+    if args.dry_run or args.yes or not sys.stdin.isatty():
+        return "local"
+    if discover_project_for_setup(None) is None:
+        return "local"
+
+    while True:
+        print("프로젝트 지식을 어디에 둘까요?")
+        print("1. 이 컴퓨터에서만 사용 — 기본")
+        print("2. Git에 포함해 공유")
+        selected = input("선택 [1]: ").strip()
+        if selected in ("", "1"):
+            return "local"
+        if selected == "2":
+            return "shared"
+
+
+def _print_notices(notices) -> None:
+    if not notices:
+        return
+    print()
+    print("안내")
+    for notice in notices:
+        print("- {}".format(notice))
 
 
 def _setup(args) -> int:
     if args.dry_run and args.yes:
         raise DidimError("CLI_USAGE_ERROR", exit_code=EXIT_USAGE)
+    mode = _project_knowledge_mode(args)
     plan = plan_setup(
         home=None,
         cwd=None,
         config=args.config_dir,
         include_project=True,
         skip_claude=args.skip_claude,
+        project_knowledge=mode,
     )
     print(_summary(plan), end="")
     if args.dry_run:
@@ -237,7 +276,15 @@ def _setup(args) -> int:
         if not approved:
             print("변경하지 않았습니다.")
             return 0
-    apply_setup(plan, approved=approved)
+    final_notices = apply_setup(plan, approved=approved)
+    planned_notices = set(plan.project_notices)
+    new_notices = []
+    for notice in final_notices:
+        if notice in planned_notices:
+            continue
+        planned_notices.add(notice)
+        new_notices.append(notice)
+    _print_notices(new_notices)
     print("Didimlog 준비를 마쳤습니다.")
     return 0
 
