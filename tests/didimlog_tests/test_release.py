@@ -141,7 +141,7 @@ class ReleaseContractTests(unittest.TestCase):
                 )
                 checksum_marker.unlink(missing_ok=True)
                 result = subprocess.run(
-                    ["bash", "-e", "-o", "pipefail", "-c", verification_script],
+                    ["bash", "-e", "-c", verification_script],
                     cwd=root,
                     env=environment,
                     capture_output=True,
@@ -181,6 +181,21 @@ class ReleaseContractTests(unittest.TestCase):
             self.assertFalse(
                 checked_extra,
                 "sha256sum --check ran before extra manifest data was rejected",
+            )
+
+            bsd_tagged, checked_bsd_tagged = run_verification(
+                f"{checksum}  {wheel}\n"
+                f"{checksum}  {sdist}\n"
+                f"SHA256 ({wheel}) = {checksum}\n"
+            )
+            self.assertNotEqual(
+                bsd_tagged.returncode,
+                0,
+                "verification accepted a BSD-style tagged duplicate checksum entry",
+            )
+            self.assertFalse(
+                checked_bsd_tagged,
+                "sha256sum --check ran before BSD-style manifest data was rejected",
             )
 
             malformed, checked_malformed = run_verification(

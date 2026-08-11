@@ -35,6 +35,48 @@ from didimlog.project.tree import validate_record_tree
 DATE = "2026-07-14"
 
 
+def _legacy_readme(current):
+    replacements = (
+        (
+            (
+                "- ID 형식은 `PREFIX-YYYYMMDD-NN` (예: `OBS-20260714-01`). "
+                "`didim add`는\n"
+                "  `--date YYYY-MM-DD`와 기존 record를 기준으로 ID의 날짜와 두 자리 "
+                "순번을 자동 할당한다."
+            ),
+            (
+                "- ID 형식은 `PREFIX-YYYYMMDD-NN` (예: `OBS-20260714-01`). "
+                "날짜와 2자리 순번을\n"
+                "  사람이 직접 지정하며 자동 추측하지 않는다."
+            ),
+        ),
+        (
+            (
+                "`didim add experiment`는 JSON stdin의 `contradicts` 필드로 모순 ID를 "
+                "입력한다. 값은\n"
+                '모순이 없으면 `"none"`, 있으면 `"<ID>, <ID>, ..."`인 문자열이다. '
+                "이 필드는 필수이며\n"
+                "기본값도 추론도 없다."
+            ),
+            (
+                "`didim add experiment`는 `--contradicts`가 필수이며 기본값도 "
+                "추론도 없다."
+            ),
+        ),
+    )
+    text = current.decode("utf-8")
+    for current_paragraph, legacy_paragraph in replacements:
+        assert text.count(current_paragraph) == 1
+        text = text.replace(current_paragraph, legacy_paragraph)
+    legacy = text.encode("utf-8")
+    assert len(legacy) == 16_336
+    assert (
+        hashlib.sha256(legacy).hexdigest()
+        == "6347d06afaab04f94c9f409717e0539add7252d000e5b0d51ea68d00036b0961"
+    )
+    return legacy
+
+
 def _observation_request(body, **overrides):
     values = {
         "type": "observation",
@@ -403,6 +445,23 @@ class CaptureTests(unittest.TestCase):
         self.assertIn("didim setup", raised.exception.help_text)
         self.assertFalse((workspace / "knowledge").exists())
         self.assertEqual(sentinel.read_bytes(), b"user data\n")
+
+    def test_capture_migrates_exact_legacy_readme_and_creates_record(self):
+        readme = self.workspace / "knowledge/README.md"
+        current = readme.read_bytes()
+        readme.write_bytes(_legacy_readme(current))
+
+        path = capture(self.workspace, _observation_request("이전 README 마이그레이션"))
+
+        frontmatter, body = _read_record(path)
+        self.assertEqual(
+            path,
+            self._record_path("observation", "OBS-20260714-01"),
+        )
+        self.assertEqual(frontmatter["id"], "OBS-20260714-01")
+        self.assertEqual(body, "## Observation\n\n이전 README 마이그레이션\n")
+        self.assertEqual(readme.read_bytes(), current)
+
 
     def test_atomic_collision_retries_with_the_next_id(self):
         real_link = os.link

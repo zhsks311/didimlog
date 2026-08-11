@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import os
 from pathlib import Path
 import stat
 
+from didimlog.conditional_file import write_regular_file_if_unchanged
 from didimlog.errors import DidimError, EXIT_POLICY
 from didimlog.file_io import (
     UnsafePathError,
@@ -33,6 +35,10 @@ _RESOURCE_TARGETS = (
     ("knowledge/schema/record.schema.json", "record.schema.json"),
     ("knowledge/active/harness.md", "active-harness.md"),
 )
+_LEGACY_README_SIZE = 16_336
+_LEGACY_README_SHA256 = (
+    "6347d06afaab04f94c9f409717e0539add7252d000e5b0d51ea68d00036b0961"
+)
 
 
 @dataclass(frozen=True)
@@ -41,6 +47,7 @@ class ScaffoldPlan:
 
     directories: tuple[Path, ...]
     files: tuple[tuple[Path, bytes], ...]
+    updates: tuple[tuple[Path, bytes, bytes], ...] = ()
 
 
 def _policy_error(token: str, path: Path) -> DidimError:
@@ -99,13 +106,40 @@ def _require_file(path: Path, expected: bytes) -> None:
         raise _policy_error("SCAFFOLD_CONFLICT", path)
 
 
+def _legacy_readme(path: Path, expected: bytes) -> bytes | None:
+    metadata = _lstat(path)
+    if metadata is None:
+        return None
+    if stat.S_ISLNK(metadata.st_mode):
+        raise _policy_error("PATH_ESCAPE", path)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise _policy_error("SCAFFOLD_CONFLICT", path)
+    try:
+        actual = read_regular_file_beneath(
+            path.parent,
+            path.name,
+            max(len(expected), _LEGACY_README_SIZE),
+        )
+    except UnsafePathError as error:
+        raise _policy_error("SCAFFOLD_CONFLICT", path) from error
+    if actual == expected:
+        return None
+    if (
+        len(actual) == _LEGACY_README_SIZE
+        and hashlib.sha256(actual).hexdigest() == _LEGACY_README_SHA256
+    ):
+        return actual
+    raise _policy_error("SCAFFOLD_CONFLICT", path)
+
+
 def _preflight(plan: ScaffoldPlan) -> None:
     workspace = plan.directories[0].parent
     _require_workspace(workspace)
+    originals = {path: original for path, original, _ in plan.updates}
     for path in plan.directories:
         _require_directory(path)
     for path, expected in plan.files:
-        _require_file(path, expected)
+        _require_file(path, originals.get(path, expected))
 
 
 def _validate_plan(plan: ScaffoldPlan) -> Path:
@@ -122,15 +156,44 @@ def _validate_plan(plan: ScaffoldPlan) -> Path:
         raise DidimError("SCAFFOLD_PLAN_INVALID", exit_code=EXIT_POLICY)
     if plan.files != expected.files:
         raise DidimError("SCAFFOLD_PLAN_INVALID", exit_code=EXIT_POLICY)
+    if not isinstance(plan.updates, tuple) or len(plan.updates) > 1:
+        raise DidimError("SCAFFOLD_PLAN_INVALID", exit_code=EXIT_POLICY)
+    if plan.updates:
+        readme_path, current_readme = expected.files[0]
+        update = plan.updates[0]
+        if not isinstance(update, tuple) or len(update) != 3:
+            raise DidimError("SCAFFOLD_PLAN_INVALID", exit_code=EXIT_POLICY)
+        path, original, intended = update
+        if (
+            path != readme_path
+            or not isinstance(original, bytes)
+            or intended != current_readme
+            or len(original) != _LEGACY_README_SIZE
+            or hashlib.sha256(original).hexdigest() != _LEGACY_README_SHA256
+        ):
+            raise DidimError("SCAFFOLD_PLAN_INVALID", exit_code=EXIT_POLICY)
     return workspace
 
 
 def plan_scaffold(workspace: Path) -> ScaffoldPlan:
     """Return a write-free scaffold plan after validating all existing targets."""
     canonical_workspace = _require_workspace(workspace)
-    plan = _expected_plan(canonical_workspace)
-    _preflight(plan)
-    return plan
+    expected = _expected_plan(canonical_workspace)
+    for path in expected.directories:
+        _require_directory(path)
+    updates = []
+    for index, (path, content) in enumerate(expected.files):
+        if index == 0:
+            legacy = _legacy_readme(path, content)
+            if legacy is not None:
+                updates.append((path, legacy, content))
+        else:
+            _require_file(path, content)
+    return ScaffoldPlan(
+        directories=expected.directories,
+        files=expected.files,
+        updates=tuple(updates),
+    )
 
 
 def _directory_flags() -> int:
@@ -301,10 +364,22 @@ def _create_file(
     return identity
 
 
+def _apply_scaffold_updates(plan: ScaffoldPlan) -> None:
+    """Apply only validated conditional updates, without creating missing targets."""
+    _validate_plan(plan)
+    _preflight(plan)
+    for path, original, intended in plan.updates:
+        try:
+            write_regular_file_if_unchanged(path, original, intended)
+        except (OSError, ValueError) as error:
+            raise _policy_error("SCAFFOLD_CONFLICT", path) from error
+
+
 def apply_scaffold(plan: ScaffoldPlan) -> None:
-    """Apply a validated plan create-only, rejecting every incompatible target."""
+    """Create missing targets, then conditionally apply validated updates."""
     workspace = _validate_plan(plan)
     _preflight(plan)
+    update_paths = {path for path, _, _ in plan.updates}
 
     try:
         workspace_descriptor = os.open(workspace, _directory_flags())
@@ -344,6 +419,8 @@ def apply_scaffold(plan: ScaffoldPlan) -> None:
                 )
 
         for path, content in plan.files:
+            if path in update_paths:
+                continue
             _validate_open_directories(
                 workspace,
                 path.parent,
@@ -356,6 +433,8 @@ def apply_scaffold(plan: ScaffoldPlan) -> None:
                 created_files.append(
                     (path.name, identity, os.dup(parent_descriptor))
                 )
+        if plan.updates:
+            _apply_scaffold_updates(plan)
     except BaseException:
         _rollback(created_files, created_directories)
         raise

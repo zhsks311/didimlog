@@ -17,7 +17,8 @@
 - 조회 A/B의 각 case가 독립된 `HOME`과 Claude 설정을 사용하고, Claude 자식 프로세스에는 검증된 OAuth access token과 실행에 필요한 환경만 전달하도록 격리했습니다.
 - 비밀값이 포함된 lesson은 값을 출력하지 않고 `LESSON_SECRET`과 exit `5`로 거부합니다.
 - `disconnect`가 관리 문서를 복원하지 못해도 최상위 Claude 설정 rollback을 계속 수행하도록 수정했습니다.
-- 배포 전에 `SHA256SUMS`가 wheel과 sdist를 정확히 모두 포함하는지 확인하도록 강화했습니다.
+- 배포 전에 `SHA256SUMS`가 wheel과 sdist의 정확한 두 항목만 엄격한 형식으로 포함하는지 확인하도록 강화했습니다.
+- v0.0.1의 기존 프로젝트 안내 파일만 현재 버전으로 안전하게 갱신해 `didim setup`과 `didim add`를 다시 실행할 수 있게 했습니다.
 
 ## [0.0.1] - 2026-08-05
 

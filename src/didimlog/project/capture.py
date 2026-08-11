@@ -37,7 +37,7 @@ from .record import (
     validate_body,
     validate_frontmatter,
 )
-from .scaffold import plan_scaffold
+from .scaffold import ScaffoldPlan, _apply_scaffold_updates, plan_scaffold
 from .tree import resolve_reference, validate_record_tree
 
 
@@ -105,22 +105,27 @@ def _require_git_root(workspace: Path) -> Path:
     return root
 
 
-def _require_scaffold(workspace: Path) -> None:
+def _require_scaffold(workspace: Path) -> ScaffoldPlan:
     try:
         expected = plan_scaffold(workspace)
+        originals = {
+            path: original for path, original, _ in expected.updates
+        }
         for directory in expected.directories:
             entry = directory.lstat()
             if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
                 raise OSError("unsafe scaffold directory")
         for path, content in expected.files:
+            required = originals.get(path, content)
             relative = path.relative_to(workspace)
             actual = read_regular_file_beneath(
                 workspace,
                 relative,
-                len(content),
+                len(required),
             )
-            if actual != content:
+            if actual != required:
                 raise OSError("stale scaffold file")
+        return expected
     except (DidimError, OSError, UnsafePathError, ValueError):
         raise _project_error(
             "PROJECT_SCAFFOLD_MISSING",
@@ -497,7 +502,22 @@ def capture(
         raise SchemaError("INVALID_ID_RETRIES")
 
     root = _require_git_root(Path(workspace))
-    _require_scaffold(root)
+    scaffold = _require_scaffold(root)
+    # The conditional writer locks knowledge itself; migrate before the
+    # snapshot lock so the same process never acquires that flock twice.
+    if scaffold.updates:
+        try:
+            _apply_scaffold_updates(scaffold)
+        except (DidimError, OSError, UnsafePathError, ValueError):
+            raise _project_error(
+                "PROJECT_SCAFFOLD_MISSING",
+                "먼저 didim setup을 실행해 프로젝트 지식 저장소를 준비하세요.",
+            ) from None
     with path_lock(root / "knowledge") as _knowledge_descriptor:
-        _require_scaffold(root)
+        locked_scaffold = _require_scaffold(root)
+        if locked_scaffold.updates:
+            raise _project_error(
+                "PROJECT_SCAFFOLD_MISSING",
+                "먼저 didim setup을 실행해 프로젝트 지식 저장소를 준비하세요.",
+            )
         return _capture_locked(root, request, max_id_retries)

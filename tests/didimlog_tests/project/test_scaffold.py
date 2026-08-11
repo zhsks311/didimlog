@@ -1,4 +1,5 @@
 import dataclasses
+import hashlib
 import json
 import os
 import pathlib
@@ -39,6 +40,48 @@ POINTER = (
     "`review_by`가 조회 기준일보다 이르면 STALE로 취급해 참고만 하고, 부정(refuted/failure) 결과는 지우지 않는다.\n"
     "active/harness.md에 사람이 직접 규칙을 쓰지 않는다(승격 게이트 전용, v1에서는 비어 있음).\n"
 ).encode("utf-8")
+
+
+def _legacy_readme(current):
+    replacements = (
+        (
+            (
+                "- ID 형식은 `PREFIX-YYYYMMDD-NN` (예: `OBS-20260714-01`). "
+                "`didim add`는\n"
+                "  `--date YYYY-MM-DD`와 기존 record를 기준으로 ID의 날짜와 두 자리 "
+                "순번을 자동 할당한다."
+            ),
+            (
+                "- ID 형식은 `PREFIX-YYYYMMDD-NN` (예: `OBS-20260714-01`). "
+                "날짜와 2자리 순번을\n"
+                "  사람이 직접 지정하며 자동 추측하지 않는다."
+            ),
+        ),
+        (
+            (
+                "`didim add experiment`는 JSON stdin의 `contradicts` 필드로 모순 ID를 "
+                "입력한다. 값은\n"
+                '모순이 없으면 `"none"`, 있으면 `"<ID>, <ID>, ..."`인 문자열이다. '
+                "이 필드는 필수이며\n"
+                "기본값도 추론도 없다."
+            ),
+            (
+                "`didim add experiment`는 `--contradicts`가 필수이며 기본값도 "
+                "추론도 없다."
+            ),
+        ),
+    )
+    text = current.decode("utf-8")
+    for current_paragraph, legacy_paragraph in replacements:
+        assert text.count(current_paragraph) == 1
+        text = text.replace(current_paragraph, legacy_paragraph)
+    legacy = text.encode("utf-8")
+    assert len(legacy) == 16_336
+    assert (
+        hashlib.sha256(legacy).hexdigest()
+        == "6347d06afaab04f94c9f409717e0539add7252d000e5b0d51ea68d00036b0961"
+    )
+    return legacy
 
 
 class ScaffoldTests(unittest.TestCase):
@@ -223,6 +266,39 @@ class ScaffoldTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), expected_bytes[relative])
             self.assertEqual(path.stat().st_mtime_ns, expected_timestamps[relative])
 
+    def test_exact_legacy_readme_is_planned_and_applied_as_only_update(self):
+        initial_plan = plan_scaffold(self.workspace)
+        current = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        readme = self.workspace / "knowledge/README.md"
+        legacy = _legacy_readme(current)
+        readme.write_bytes(legacy)
+
+        plan = plan_scaffold(self.workspace)
+
+        self.assertEqual(plan.updates, ((readme, legacy, current),))
+        apply_scaffold(plan)
+        self.assertEqual(readme.read_bytes(), current)
+
+    def test_readme_changed_after_legacy_migration_plan_aborts_without_overwrite(self):
+        initial_plan = plan_scaffold(self.workspace)
+        current = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        readme = self.workspace / "knowledge/README.md"
+        readme.write_bytes(_legacy_readme(current))
+        plan = plan_scaffold(self.workspace)
+        user_bytes = b"user edit after migration plan\n"
+        readme.write_bytes(user_bytes)
+
+        self._assert_policy_error(lambda: apply_scaffold(plan))
+
+        self.assertEqual(readme.read_bytes(), user_bytes)
+
+
     def test_regular_file_where_directory_is_required_blocks_all_writes(self):
         knowledge = self.workspace / "knowledge"
         knowledge.mkdir()
@@ -321,6 +397,43 @@ class ScaffoldTests(unittest.TestCase):
 
         self.assertFalse((self.workspace / "knowledge").exists())
         self.assertFalse((self.root / "escaped.md").exists())
+
+    def test_forged_update_paths_are_rejected_before_any_mutation(self):
+        plan = plan_scaffold(self.workspace)
+        inside = self.workspace / "escaped.md"
+        outside = self.workspace / "knowledge/../../escaped.md"
+        forged = dataclasses.replace(
+            plan,
+            updates=(
+                (inside, b"old", b"new"),
+                (outside, b"old", b"new"),
+            ),
+        )
+
+        self._assert_policy_error(lambda: apply_scaffold(forged))
+
+        self.assertFalse((self.workspace / "knowledge").exists())
+        self.assertFalse(inside.exists())
+        self.assertFalse((self.root / "escaped.md").exists())
+
+    def test_forged_readme_update_bytes_are_rejected_without_rewriting_current_file(
+        self,
+    ):
+        initial_plan = plan_scaffold(self.workspace)
+        current = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        readme = self.workspace / "knowledge/README.md"
+        plan = plan_scaffold(self.workspace)
+        forged = dataclasses.replace(
+            plan,
+            updates=((readme, b"unknown original", b"unknown intended"),),
+        )
+
+        self._assert_policy_error(lambda: apply_scaffold(forged))
+
+        self.assertEqual(readme.read_bytes(), current)
 
     def test_symlinked_workspace_alias_is_rejected_as_path_escape(self):
         alias = self.root / "workspace-alias"
