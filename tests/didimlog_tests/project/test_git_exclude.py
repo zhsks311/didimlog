@@ -480,6 +480,40 @@ class GitExcludeContractTests(ErrorContractMixin, unittest.TestCase):
                 self.assertTrue(plan.notices)
         self.git(self.project, "config", "--unset-all", "core.excludesFile")
 
+    def test_shared_does_not_treat_managed_exclude_as_a_separate_global_rule(self):
+        path = self.exclude_path()
+        path.write_bytes(LF_BLOCK)
+        self.git(self.project, "config", "core.excludesFile", str(path))
+
+        plan = self.call(plan_git_exclude, self.project, "shared")
+
+        self.assertFalse(plan.notices)
+        self.call(apply_git_exclude, plan)
+        self.assertFalse(self.call(project_knowledge_is_ignored, self.project))
+
+    def test_self_referential_exclude_does_not_inherit_default_global_ignore(self):
+        path = self.exclude_path()
+        global_ignore = Path(self.environment["XDG_CONFIG_HOME"]) / "git" / "ignore"
+        global_ignore.parent.mkdir(parents=True)
+        global_ignore.write_bytes(b"/knowledge/\n")
+        self.git(self.project, "config", "core.excludesFile", str(path))
+        path.write_bytes(LF_BLOCK)
+
+        plan = self.call(plan_git_exclude, self.project, "shared")
+
+        self.assertFalse(plan.notices)
+        self.call(apply_git_exclude, plan)
+        self.assertFalse(self.call(project_knowledge_is_ignored, self.project))
+
+    def test_shared_notices_when_gitignore_ignores_only_knowledge_contents(self):
+        (self.project / ".gitignore").write_bytes(b"/knowledge/*\n")
+        self.exclude_path().write_bytes(LF_BLOCK)
+
+        plan = self.call(plan_git_exclude, self.project, "shared")
+
+        self.assertTrue(plan.notices)
+
+
     def test_dry_run_copies_ignore_case_for_case_variant_gitignore_rule(self):
         (self.project / ".gitignore").write_bytes(b"/KNOWLEDGE/\n")
         self.git(self.project, "config", "core.ignoreCase", "true")
@@ -519,6 +553,36 @@ class GitExcludeContractTests(ErrorContractMixin, unittest.TestCase):
 
         self.assertEqual(gitignore.read_bytes(), before_gitignore)
         self.assertEqual(self.git(self.project, "ls-files", "-z").stdout, before_index)
+
+    def test_apply_reports_write_failure_without_change_as_unsafe(self):
+        plan = self.call(plan_git_exclude, self.project, "local")
+
+        with self.isolated_environment(), mock.patch(
+            "didimlog.project.git_exclude.write_regular_file_if_unchanged",
+            side_effect=OSError("write failed at /private/user/path"),
+        ):
+            self.assert_token(
+                "PROJECT_EXCLUDE_UNSAFE",
+                lambda: apply_git_exclude(plan),
+            )
+
+    def test_apply_accepts_postpublication_error_when_intended_bytes_are_present(self):
+        path = self.exclude_path()
+        plan = self.call(plan_git_exclude, self.project, "local")
+        real_writer = conditional_file.write_regular_file_if_unchanged
+
+        def write_then_raise(target, original, intended):
+            real_writer(target, original, intended)
+            raise OSError("cleanup failed at /private/user/path")
+
+        with self.isolated_environment(), mock.patch(
+            "didimlog.project.git_exclude.write_regular_file_if_unchanged",
+            side_effect=write_then_raise,
+        ):
+            apply_git_exclude(plan)
+
+        self.assertEqual(path.read_bytes(), plan.intended)
+        self.assertTrue(self.call(project_knowledge_is_ignored, self.project))
 
     def test_shared_apply_rejects_notice_state_changed_after_revalidation(self):
         path = self.exclude_path()

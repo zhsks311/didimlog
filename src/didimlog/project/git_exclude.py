@@ -426,6 +426,7 @@ def _read_ignore_case(project_root: Path) -> bool:
 
 def _planned_knowledge_is_ignored(
     project_root: Path,
+    exclude_path: Path,
     intended: bytes | None,
 ) -> bool:
     excludes_file = _read_optional_config_path(project_root)
@@ -451,8 +452,20 @@ def _planned_knowledge_is_ignored(
                 "-c",
                 f"core.ignoreCase={'true' if ignore_case else 'false'}",
             ]
-            if excludes_file is not None:
-                arguments.extend(("-c", f"core.excludesFile={excludes_file}"))
+            configured_exclude = (
+                Path(excludes_file)
+                if excludes_file is not None and Path(excludes_file).is_absolute()
+                else project_root / excludes_file
+                if excludes_file is not None
+                else None
+            )
+            if configured_exclude is not None:
+                if _same_file(configured_exclude, exclude_path):
+                    effective_exclude = Path(temporary) / "empty-excludes"
+                    effective_exclude.write_bytes(b"")
+                else:
+                    effective_exclude = Path(excludes_file)
+                arguments.extend(("-c", f"core.excludesFile={effective_exclude}"))
             arguments.extend(
                 ("check-ignore", "--no-index", "-q", "--", "knowledge/")
             )
@@ -486,7 +499,7 @@ def _build_plan(
         raise _unsafe()
     if mode == "local" and _tracked_knowledge_exists(project_root):
         raise _tracked()
-    planned_ignored = _planned_knowledge_is_ignored(project_root, intended)
+    planned_ignored = _planned_knowledge_is_ignored(project_root, path, intended)
     if mode == "local" and not planned_ignored:
         raise _conflict()
     notices: tuple[str, ...] = ()
@@ -560,7 +573,14 @@ def apply_git_exclude(plan: GitExcludePlan) -> None:
     try:
         write_regular_file_if_unchanged(path, plan.original, plan.intended)
     except (OSError, ValueError) as error:
-        raise _changed() from error
+        try:
+            after_failure = _read_exclude(path)
+        except DidimError:
+            raise _unsafe() from error
+        if after_failure != plan.intended:
+            if after_failure == plan.original:
+                raise _unsafe() from error
+            raise _changed() from error
 
     if plan.mode == "local" and _tracked_knowledge_exists(root):
         raise _tracked()

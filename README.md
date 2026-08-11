@@ -52,7 +52,7 @@ didim setup --yes
 프로젝트 지식을 팀과 공유하려면 다음 명령으로 `shared`를 선택합니다.
 
 ```sh
-didim setup --project-knowledge shared
+didim setup --yes --project-knowledge shared
 ```
 
 `shared`는 로컬 제외 설정에서 Didimlog 관리 표시로 둘러싼 블록만 제거하고 사용자 규칙은 바꾸지 않습니다. 같은 파일의 다른 규칙, `.gitignore`, 사용자의 전역 제외 설정 등이 `knowledge/`를 계속 제외하면 안내를 표시하므로, Git에 포함하려면 해당 규칙을 직접 바꿔야 합니다.

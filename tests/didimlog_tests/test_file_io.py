@@ -223,6 +223,55 @@ class FileIoContractTests(unittest.TestCase):
             self.assertEqual(target.stat().st_mode & 0o777, 0o640)
             self.assertEqual([entry.name for entry in root.iterdir()], ["target"])
 
+    def test_first_directory_sync_failure_preserves_same_inode_concurrent_write(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "target"
+            target.write_bytes(b"original")
+            expected_info = target.stat()
+            root_descriptor = os.open(
+                root,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            real_fsync = os.fsync
+            directory_sync_calls = 0
+            write_inodes = []
+
+            def write_target_then_fail_first_directory_sync(descriptor):
+                nonlocal directory_sync_calls
+                if descriptor == root_descriptor:
+                    directory_sync_calls += 1
+                    if directory_sync_calls == 1:
+                        write_inodes.append(target.stat().st_ino)
+                        target.write_bytes(b"latest")
+                        write_inodes.append(target.stat().st_ino)
+                        raise OSError("publication directory sync failed")
+                return real_fsync(descriptor)
+
+            try:
+                with (
+                    mock.patch.object(
+                        file_io.os,
+                        "fsync",
+                        side_effect=write_target_then_fail_first_directory_sync,
+                    ),
+                    self.assertRaises(UnsafePathError),
+                ):
+                    replace_regular_file_at_if_unchanged(
+                        root_descriptor,
+                        target.name,
+                        b"original",
+                        b"managed",
+                        0o600,
+                        expected_info=expected_info,
+                    )
+            finally:
+                os.close(root_descriptor)
+
+            self.assertEqual(write_inodes[0], write_inodes[1])
+            self.assertEqual(target.read_bytes(), b"latest")
+            self.assertEqual([entry.name for entry in root.iterdir()], ["target"])
+
     def test_double_directory_sync_failure_retains_original_backup_for_indeterminate_recovery(
         self,
     ):

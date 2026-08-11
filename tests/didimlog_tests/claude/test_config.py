@@ -1,5 +1,6 @@
 import json
 import tempfile
+import shlex
 import unittest
 from pathlib import Path
 
@@ -145,6 +146,18 @@ class SettingsPlanTests(unittest.TestCase):
             )
             self.assertTrue(intended.endswith(b"\n"))
 
+    def test_launcher_with_spaces_is_one_shell_argument(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            launcher = Path(temporary_directory) / "bin with spaces" / "didim"
+
+            intended = json.loads(plan_settings(b"", launcher))
+            command = intended["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+
+            self.assertEqual(
+                shlex.split(command),
+                [str(launcher), "hook", "session-start"],
+            )
+
     def test_relative_launcher_is_refused(self):
         with self.assertRaises(ValueError):
             plan_settings(b"{}\n", Path("bin/didim"))
@@ -265,6 +278,36 @@ class SettingsPlanTests(unittest.TestCase):
             )
             self.assertEqual(intended_value["hooks"]["Stop"], stop_hooks)
             self.assertEqual(intended_value["theme"], "dark")
+
+    def test_multiline_user_command_is_not_removed_as_a_legacy_managed_hook(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            launcher = Path(temporary_directory) / "current" / "didim"
+            user_hook = {
+                "type": "command",
+                "command": "/old/didim\n hook session-start",
+            }
+            original = (
+                json.dumps(
+                    {
+                        "hooks": {
+                            "SessionStart": [
+                                {
+                                    "hooks": [user_hook],
+                                }
+                            ]
+                        }
+                    }
+                )
+                + "\n"
+            ).encode("utf-8")
+
+            intended_value = json.loads(plan_settings(original, launcher))
+
+            self.assertIn(
+                user_hook,
+                intended_value["hooks"]["SessionStart"][0]["hooks"],
+            )
+
 
     def test_invalid_json_root_and_session_start_shapes_fail_closed(self):
         malformed_values = (

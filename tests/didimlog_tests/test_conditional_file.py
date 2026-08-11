@@ -405,6 +405,34 @@ class ConditionalWriteTests(unittest.TestCase):
                 ["target"],
             )
 
+    def test_parent_path_replaced_after_publish_is_reported(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            parent = root / "parent"
+            parent.mkdir()
+            target = parent / "target"
+            moved_parent = root / "moved-parent"
+            real_link = os.link
+
+            def link_then_replace_parent(*args, **kwargs):
+                result = real_link(*args, **kwargs)
+                parent.rename(moved_parent)
+                parent.mkdir()
+                return result
+
+            with (
+                mock.patch.object(
+                    conditional_file.os,
+                    "link",
+                    side_effect=link_then_replace_parent,
+                ),
+                self.assertRaises(ValueError),
+            ):
+                write_regular_file_if_unchanged(target, None, b"managed\n")
+
+            self.assertFalse(target.exists())
+            self.assertEqual((moved_parent / target.name).read_bytes(), b"managed\n")
+
     def test_intended_none_is_not_a_delete_operation(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             target = Path(temporary_directory) / "target"

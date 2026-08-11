@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import unicodedata
 from pathlib import Path
 
 from didimlog import version as didimlog_version
@@ -36,7 +37,7 @@ _PROJECT_LABELS = {
 
 def _safe_label(value: str) -> str:
     return "".join(
-        character if ord(character) >= 32 and ord(character) != 127 else "?"
+        "?" if unicodedata.category(character).startswith("C") else character
         for character in value
     )
 

@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -6,8 +7,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from didimlog.claude.probe import _launcher_from_settings
 from didimlog.claude.setup import apply_setup, plan_setup
-from didimlog.claude.status import doctor_text, status_text
+from didimlog.claude.status import _safe_label, doctor_text, status_text
 
 
 class StatusDoctorTests(unittest.TestCase):
@@ -29,7 +31,7 @@ class StatusDoctorTests(unittest.TestCase):
             check=True,
             capture_output=True,
         )
-        self.launcher = self.root / "bin" / "didim"
+        self.launcher = self.root / "bin with spaces" / "didim"
         self.launcher.parent.mkdir()
         self.launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         self.launcher.chmod(0o755)
@@ -71,6 +73,32 @@ class StatusDoctorTests(unittest.TestCase):
             else:
                 result[relative] = ("file", path.read_bytes())
         return result
+
+    def test_safe_label_replaces_terminal_controls_and_bidi_overrides(self):
+        self.assertEqual(_safe_label("safe\x1b\u202eevil"), "safe??evil")
+
+    def test_non_command_hook_with_managed_command_text_is_not_a_launcher(self):
+        settings_path = self.config / "settings.json"
+        value = json.loads(settings_path.read_text(encoding="utf-8"))
+        managed_command = value["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        value["hooks"]["SessionStart"].insert(
+            0,
+            {
+                "hooks": [
+                    {
+                        "type": "prompt",
+                        "command": managed_command,
+                    }
+                ]
+            },
+        )
+        settings_path.write_text(json.dumps(value), encoding="utf-8")
+
+        self.assertEqual(
+            _launcher_from_settings(settings_path.read_bytes()),
+            self.launcher,
+        )
+
 
     def test_git_unavailable_in_prepared_project_is_reported_privately(self):
         failures = (

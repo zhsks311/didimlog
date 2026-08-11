@@ -197,6 +197,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _safe_output_text(value: str) -> str:
+    return "".join(
+        "?" if unicodedata.category(character).startswith("C") else character
+        for character in value
+    )
+
+
 def _summary(plan) -> str:
     groups = (
         ("개인 교훈", plan.personal_changes),
@@ -207,13 +214,16 @@ def _summary(plan) -> str:
     for label, changes in groups:
         lines.extend(("", label))
         lines.extend(
-            ("- {}".format(change) for change in changes)
+            ("- {}".format(_safe_output_text(change)) for change in changes)
             if changes
             else ("- 변경 없음",)
         )
     if plan.project_notices:
         lines.extend(("", "안내"))
-        lines.extend("- {}".format(notice) for notice in plan.project_notices)
+        lines.extend(
+            "- {}".format(_safe_output_text(notice))
+            for notice in plan.project_notices
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -242,7 +252,7 @@ def _print_notices(notices) -> None:
     print()
     print("안내")
     for notice in notices:
-        print("- {}".format(notice))
+        print("- {}".format(_safe_output_text(notice)))
 
 
 def _setup(args) -> int:
@@ -310,7 +320,7 @@ def _print_changes(title: str, changes: tuple[str, ...]) -> None:
     print(title)
     if changes:
         for change in changes:
-            print("- {}".format(change))
+            print("- {}".format(_safe_output_text(change)))
     else:
         print("- 변경 없음")
 

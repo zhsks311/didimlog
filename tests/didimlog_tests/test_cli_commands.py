@@ -125,10 +125,11 @@ class CliCommandSurfaceTests(unittest.TestCase):
         code, stdout, stderr = invoke(["setup", "--help"])
 
         self.assertEqual((code, stderr), (0, ""))
-        self.assertIn("--project-knowledge {local,shared}", stdout)
+        normalized = " ".join(stdout.split())
+        self.assertIn("--project-knowledge {local,shared}", normalized)
         self.assertIn(
             "프로젝트 지식을 이 컴퓨터에만 둘지 Git으로 공유할지 선택",
-            stdout,
+            normalized,
         )
 
     def test_interactive_setup_defaults_enter_and_one_to_local_before_approval(self):
@@ -297,6 +298,27 @@ class CliCommandSurfaceTests(unittest.TestCase):
             stdout,
         )
         applied.assert_not_called()
+
+    def test_setup_sanitizes_terminal_controls_in_changes_and_notices(self):
+        planned_notice = "planned\u202enotice"
+        final_notice = "final\x07notice"
+        plan = setup_plan(
+            project_changes=("path\x1b]52;c;SGFja2Vk\x07",),
+            project_notices=(planned_notice,),
+        )
+        with mock.patch("didimlog.cli.plan_setup", return_value=plan), mock.patch(
+            "didimlog.cli.apply_setup",
+            return_value=(planned_notice, final_notice),
+        ):
+            code, stdout, stderr = invoke(["setup", "--yes"])
+
+        self.assertEqual((code, stderr), (0, ""))
+        for character in ("\x1b", "\x07", "\u202e"):
+            self.assertNotIn(character, stdout)
+        self.assertIn("path?]52;c;SGFja2Vk?", stdout)
+        self.assertIn("planned?notice", stdout)
+        self.assertIn("final?notice", stdout)
+
 
     def test_setup_prints_shared_final_notice_exactly_once(self):
         notice = "다른 Git 규칙이 knowledge 폴더를 계속 제외하고 있습니다."

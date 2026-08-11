@@ -223,6 +223,7 @@ def write_regular_file_if_unchanged(
             temporary_name = None
             os.fsync(parent_descriptor)
             publication_sync_pending = False
+            _verify_parent(target, parent_descriptor)
             return
 
         if (
@@ -241,6 +242,7 @@ def write_regular_file_if_unchanged(
         )
         if not replaced:
             raise ValueError("target changed before write")
+        _verify_parent(target, parent_descriptor)
     except ValueError:
         raise
     except OSError:

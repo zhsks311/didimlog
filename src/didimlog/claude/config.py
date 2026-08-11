@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -109,17 +110,40 @@ def _load_settings(original: bytes) -> dict[str, Any]:
     return value
 
 
+def _launcher_from_session_start_command(command: object) -> Path | None:
+    if not isinstance(command, str):
+        return None
+    if (
+        "\n" in command
+        or "\r" in command
+        or not command.endswith(_SESSION_START_SUFFIX)
+    ):
+        return None
+    try:
+        arguments = shlex.split(command)
+    except ValueError:
+        return None
+    if len(arguments) != 3 or arguments[1:] != ["hook", "session-start"]:
+        return None
+    launcher = Path(arguments[0])
+    if not launcher.is_absolute() or launcher.name != "didim":
+        return None
+    return launcher
+
+
 def _is_managed_session_start_hook(hook: dict[str, Any], command: str) -> bool:
     candidate = hook.get("command")
     if hook.get("type") != "command" or not isinstance(candidate, str):
         return False
     if candidate == command:
         return True
+    if _launcher_from_session_start_command(candidate) is not None:
+        return True
+    if "\n" in candidate or "\r" in candidate:
+        return False
     if not candidate.endswith(_SESSION_START_SUFFIX):
         return False
     launcher = candidate[: -len(_SESSION_START_SUFFIX)]
-    if "\n" in launcher or "\r" in launcher:
-        return False
     launcher_path = Path(launcher)
     return launcher_path.is_absolute() and launcher_path.name == "didim"
 
@@ -131,7 +155,7 @@ def plan_settings(original: bytes, launcher: Path) -> bytes:
         raise ValueError("settings.json content must be bytes")
     launcher_bytes = _absolute_path_bytes(launcher, label="launcher")
     launcher_text = launcher_bytes.decode("utf-8")
-    command = launcher_text + _SESSION_START_SUFFIX
+    command = shlex.quote(launcher_text) + _SESSION_START_SUFFIX
 
     value = _load_settings(original)
     hooks_value = value.get("hooks", _MISSING)

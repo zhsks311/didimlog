@@ -73,12 +73,13 @@ def _launcher_from_settings(raw: bytes | None) -> Path | None:
         for hook in matcher_hooks:
             if not isinstance(hook, dict):
                 return None
-            if not config_module._is_managed_session_start_hook(hook, ""):
+            if hook.get("type") != "command":
                 continue
-            command = hook["command"]
-            launchers.append(
-                Path(command[: -len(config_module._SESSION_START_SUFFIX)])
+            launcher = config_module._launcher_from_session_start_command(
+                hook.get("command")
             )
+            if launcher is not None:
+                launchers.append(launcher)
     return launchers[0] if len(launchers) == 1 else None
 
 
