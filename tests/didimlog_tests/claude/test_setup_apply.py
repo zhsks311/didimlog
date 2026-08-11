@@ -95,8 +95,11 @@ class SetupApplyTests(unittest.TestCase):
         ):
             return plan_setup(**options)
 
-    def _apply(self, plan, *, approved=True):
-        with mock.patch.dict(os.environ, self.git_environment, clear=True):
+    def _apply(self, plan, *, approved=True, environment=None):
+        selected_environment = dict(self.git_environment)
+        if environment is not None:
+            selected_environment.update(environment)
+        with mock.patch.dict(os.environ, selected_environment, clear=True):
             return apply_setup(plan, approved=approved)
 
     def _snapshot(self, root):
@@ -152,6 +155,53 @@ class SetupApplyTests(unittest.TestCase):
         checked = run_index(check=True, home=self.home, cwd=self.project)
         self.assertTrue(checked.personal.endswith("PERSONAL_INDEX_CURRENT"))
         self.assertTrue(checked.project.endswith("PROJECT_INDEX_CURRENT"))
+
+    def test_postcheck_ignores_repository_environment_pointing_at_stale_other_repo(self):
+        other = self.root / "other-project"
+        other.mkdir()
+        self._git(other, "init", "-q")
+        setup_module.apply_scaffold(setup_module.plan_scaffold(other))
+        setup_module.write_index(other)
+        (other / "knowledge" / "index" / "INDEX.md").write_bytes(b"stale\n")
+        repository_environment = {
+            "GIT_DIR": str(other / ".git"),
+            "GIT_WORK_TREE": str(other),
+        }
+
+        plan = self._plan()
+
+        self.assertEqual(
+            self._apply(plan, environment=repository_environment),
+            (),
+        )
+
+    def test_postcheck_rejects_stale_planned_repo_when_environment_points_elsewhere(self):
+        other = self.root / "other-project"
+        other.mkdir()
+        self._git(other, "init", "-q")
+        setup_module.apply_scaffold(setup_module.plan_scaffold(other))
+        setup_module.write_index(other)
+        repository_environment = {
+            "GIT_DIR": str(other / ".git"),
+            "GIT_WORK_TREE": str(other),
+        }
+        plan = self._plan()
+        real_apply_git_exclude = setup_module.apply_git_exclude
+
+        def apply_exclude_then_stale(exclude_plan):
+            real_apply_git_exclude(exclude_plan)
+            (self.project / "knowledge" / "index" / "INDEX.md").write_bytes(
+                b"stale\n"
+            )
+
+        with mock.patch(
+            "didimlog.claude.setup.apply_git_exclude",
+            side_effect=apply_exclude_then_stale,
+        ):
+            with self.assertRaises(DidimError) as caught:
+                self._apply(plan, environment=repository_environment)
+
+        self.assertEqual(caught.exception.token, "SETUP_POSTCHECK_FAILED")
 
     def test_apply_runs_each_stage_in_the_approved_order(self):
         plan = self._plan()

@@ -240,12 +240,28 @@ class SetupPlanTests(unittest.TestCase):
                 config=self.config,
                 include_project=False,
                 skip_claude=True,
+                project_knowledge="invalid",
             )
 
         self.assertEqual(plan.project_changes, ())
         self.assertEqual(plan.project_notices, ())
         self.assertIsNone(plan._project_exclude)
         self.assertEqual(plan.claude_changes, ())
+        self.assertEqual(self._snapshot(), before)
+
+
+    def test_invalid_mode_is_rejected_before_discovery_when_project_is_included(self):
+        before = self._snapshot()
+        with mock.patch(
+            "didimlog.claude.setup.discover_project_for_setup",
+            side_effect=AssertionError("discovery must not start"),
+        ):
+            with self.assertRaises(ValueError):
+                self._plan(
+                    skip_claude=True,
+                    project_knowledge="invalid",
+                )
+
         self.assertEqual(self._snapshot(), before)
 
     def test_markerless_directory_remains_non_project_when_git_is_missing(self):

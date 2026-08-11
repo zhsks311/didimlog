@@ -17,7 +17,6 @@ from didimlog.indexing import (
     _personal_check,
     _prepared_project,
     _project_check,
-    run_index,
 )
 from didimlog.personal import index as personal_index
 from didimlog.personal.paths import data_home
@@ -165,6 +164,8 @@ def plan_setup(
 ) -> SetupPlan:
     """Preflight every requested surface and return one deterministic summary."""
     personal_plan, personal_changes = _plan_personal(home)
+    if include_project and project_knowledge not in ("local", "shared"):
+        raise ValueError("mode must be 'local' or 'shared'")
 
     project_plan: ScaffoldPlan | None = None
     project_exclude: GitExcludePlan | None = None
@@ -284,24 +285,24 @@ def _apply_personal(plan: _PersonalSetupPlan) -> None:
 
 
 def _postcheck(plan: SetupPlan) -> tuple[str, ...]:
-    checked = run_index(
-        check=True,
-        home=plan._personal.home,
-        cwd=plan._project_root,
-    )
-    if checked.personal_token != PERSONAL_INDEX_CURRENT:
+    if _personal_check(plan._personal.root) != PERSONAL_INDEX_CURRENT:
         raise DidimError("SETUP_POSTCHECK_FAILED", exit_code=EXIT_POLICY)
     if (
         plan._project_root is not None
-        and checked.project_token != PROJECT_INDEX_CURRENT
+        and _project_check(plan._project_root) != PROJECT_INDEX_CURRENT
     ):
         raise DidimError("SETUP_POSTCHECK_FAILED", exit_code=EXIT_POLICY)
-    if plan._claude is not None and inspect(
-        home=plan._personal.home,
-        cwd=plan._project_root,
-        config=plan._claude.config_dir,
-    ):
-        raise DidimError("SETUP_POSTCHECK_FAILED", exit_code=EXIT_POLICY)
+    if plan._claude is not None:
+        problems = inspect(
+            home=plan._personal.home,
+            cwd=plan._project_root,
+            config=plan._claude.config_dir,
+        )
+        if any(
+            not problem.token.startswith("PROJECT_INDEX_")
+            for problem in problems
+        ):
+            raise DidimError("SETUP_POSTCHECK_FAILED", exit_code=EXIT_POLICY)
 
     if plan._project_exclude is None:
         return ()
