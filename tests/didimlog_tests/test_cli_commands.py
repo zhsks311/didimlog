@@ -338,7 +338,15 @@ class CliCommandSurfaceTests(unittest.TestCase):
         ) as discovered, mock.patch("didimlog.cli.plan_setup") as planned:
             code, stdout, stderr = invoke(["setup", "--dry-run", "--yes"], tty=True)
 
-        self.assertEqual((code, stdout, stderr), (2, "", "CLI_USAGE_ERROR\n"))
+        self.assertEqual(
+            (code, stdout, stderr),
+            (
+                2,
+                "",
+                "CLI_USAGE_ERROR\n"
+                "도움말: 명령과 옵션을 확인하고 didim --help로 사용법을 살펴보세요.\n",
+            ),
+        )
         discovered.assert_not_called()
         planned.assert_not_called()
 
