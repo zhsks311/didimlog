@@ -231,6 +231,8 @@ class ConditionalWriteTests(unittest.TestCase):
             target = Path(temporary_directory) / "target"
             real_temporary_file = conditional_file._temporary_file
             real_unlink = os.unlink
+            real_fsync = os.fsync
+            directory_syncs = 0
             temporary_descriptor = None
             failed = False
 
@@ -253,6 +255,12 @@ class ConditionalWriteTests(unittest.TestCase):
                     raise OSError("unlink failed at /private/user/path")
                 return real_unlink(path, *args, **kwargs)
 
+            def count_directory_fsync(descriptor):
+                nonlocal directory_syncs
+                if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                    directory_syncs += 1
+                return real_fsync(descriptor)
+
             with (
                 mock.patch.object(
                     conditional_file,
@@ -263,6 +271,11 @@ class ConditionalWriteTests(unittest.TestCase):
                     conditional_file.os,
                     "unlink",
                     side_effect=fail_first_temporary_unlink,
+                ),
+                mock.patch.object(
+                    conditional_file.os,
+                    "fsync",
+                    side_effect=count_directory_fsync,
                 ),
                 self.assertRaises(ValueError) as raised,
             ):
@@ -281,18 +294,20 @@ class ConditionalWriteTests(unittest.TestCase):
             self.assertIsNotNone(temporary_descriptor)
             with self.assertRaises(OSError):
                 os.fstat(temporary_descriptor)
+            self.assertEqual(directory_syncs, 1)
 
     def test_parent_fsync_failure_preserves_created_target(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             target = Path(temporary_directory) / "target"
             real_fsync = os.fsync
-            failed = False
+            directory_syncs = 0
 
             def fail_first_directory_fsync(descriptor):
-                nonlocal failed
-                if not failed and stat.S_ISDIR(os.fstat(descriptor).st_mode):
-                    failed = True
-                    raise OSError("fsync failed at /private/user/path")
+                nonlocal directory_syncs
+                if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                    directory_syncs += 1
+                    if directory_syncs == 1:
+                        raise OSError("fsync failed at /private/user/path")
                 return real_fsync(descriptor)
 
             with (
@@ -314,23 +329,25 @@ class ConditionalWriteTests(unittest.TestCase):
                 [entry.name for entry in target.parent.iterdir()],
                 ["target"],
             )
+            self.assertEqual(directory_syncs, 2)
 
-    def test_parent_fsync_failure_preserves_same_inode_concurrent_write(self):
+    def test_always_failing_fsync_preserves_same_inode_concurrent_write(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             target = root / "target"
             concurrent = b"concurrent user bytes\n"
             real_fsync = os.fsync
-            failed = False
+            directory_syncs = 0
             write_inodes = []
 
-            def write_target_before_directory_fsync(descriptor):
-                nonlocal failed
-                if not failed and stat.S_ISDIR(os.fstat(descriptor).st_mode):
-                    failed = True
-                    write_inodes.append(target.stat().st_ino)
-                    target.write_bytes(concurrent)
-                    write_inodes.append(target.stat().st_ino)
+            def write_target_while_directory_fsync_always_fails(descriptor):
+                nonlocal directory_syncs
+                if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                    directory_syncs += 1
+                    if directory_syncs == 1:
+                        write_inodes.append(target.stat().st_ino)
+                        target.write_bytes(concurrent)
+                        write_inodes.append(target.stat().st_ino)
                     raise OSError("fsync failed at /private/user/path")
                 return real_fsync(descriptor)
 
@@ -338,7 +355,7 @@ class ConditionalWriteTests(unittest.TestCase):
                 mock.patch.object(
                     conditional_file.os,
                     "fsync",
-                    side_effect=write_target_before_directory_fsync,
+                    side_effect=write_target_while_directory_fsync_always_fails,
                 ),
                 self.assertRaises(ValueError) as raised,
             ):
@@ -350,6 +367,7 @@ class ConditionalWriteTests(unittest.TestCase):
             )
             self.assertEqual(target.read_bytes(), concurrent)
             self.assertEqual(write_inodes[0], write_inodes[1])
+            self.assertEqual(directory_syncs, 2)
             self.assertEqual(
                 [entry.name for entry in root.iterdir()],
                 ["target"],

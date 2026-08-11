@@ -180,6 +180,7 @@ def write_regular_file_if_unchanged(
     parent_descriptor = _open_parent(target)
     lock_descriptor: int | None = None
     temporary_name: str | None = None
+    publication_sync_pending = False
     try:
         lock_descriptor = acquire_directory_lock(parent_descriptor)
         maximum_bytes = 0 if original is None else len(original)
@@ -217,9 +218,11 @@ def write_regular_file_if_unchanged(
                 dst_dir_fd=parent_descriptor,
                 follow_symlinks=False,
             )
+            publication_sync_pending = True
             os.unlink(temporary_name, dir_fd=parent_descriptor)
             temporary_name = None
             os.fsync(parent_descriptor)
+            publication_sync_pending = False
             return
 
         if (
@@ -246,6 +249,11 @@ def write_regular_file_if_unchanged(
         if temporary_name is not None:
             try:
                 os.unlink(temporary_name, dir_fd=parent_descriptor)
+            except OSError:
+                pass
+        if publication_sync_pending:
+            try:
+                os.fsync(parent_descriptor)
             except OSError:
                 pass
         if lock_descriptor is not None:
