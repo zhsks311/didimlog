@@ -267,12 +267,77 @@ class GitExcludeContractTests(ErrorContractMixin, unittest.TestCase):
         )
         self.assertNotIn(START, self.exclude_path().read_bytes())
 
+    def test_ignore_case_tracks_case_variant_in_plan_apply_and_postcheck(self):
+        self.git(self.project, "config", "core.ignoreCase", "true")
+        knowledge = self.project / "Knowledge"
+        knowledge.mkdir()
+        tracked = knowledge / "tracked.txt"
+        tracked.write_text("tracked\n", encoding="utf-8")
+        self.git(self.project, "add", "Knowledge/tracked.txt")
+
+        self.assert_token(
+            "PROJECT_KNOWLEDGE_TRACKED",
+            lambda: self.call(plan_git_exclude, self.project, "local"),
+        )
+        self.git(
+            self.project,
+            "rm",
+            "--cached",
+            "-q",
+            "--",
+            "Knowledge/tracked.txt",
+        )
+
+        plan = self.call(plan_git_exclude, self.project, "local")
+        self.git(self.project, "add", "Knowledge/tracked.txt")
+        self.assert_token(
+            "PROJECT_KNOWLEDGE_TRACKED",
+            lambda: self.call(apply_git_exclude, plan),
+        )
+        self.git(
+            self.project,
+            "rm",
+            "--cached",
+            "-q",
+            "--",
+            "Knowledge/tracked.txt",
+        )
+
+        original = plan.path.read_bytes()
+        real_writer = conditional_file.write_regular_file_if_unchanged
+
+        def write_then_track_case_variant(path, original, intended):
+            real_writer(path, original, intended)
+            self.git(self.project, "add", "-f", "Knowledge/tracked.txt")
+
+        with self.isolated_environment(), mock.patch(
+            "didimlog.project.git_exclude.write_regular_file_if_unchanged",
+            side_effect=write_then_track_case_variant,
+        ):
+            self.assert_token(
+                "PROJECT_KNOWLEDGE_TRACKED",
+                lambda: apply_git_exclude(plan),
+            )
+        self.assertEqual(plan.path.read_bytes(), original)
+
+    def test_ignore_case_false_keeps_tracked_pathspec_literal(self):
+        self.git(self.project, "config", "core.ignoreCase", "false")
+        knowledge = self.project / "Knowledge"
+        knowledge.mkdir()
+        (knowledge / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+        self.git(self.project, "add", "Knowledge/tracked.txt")
+
+        plan = self.call(plan_git_exclude, self.project, "local")
+
+        self.assertIsInstance(plan, GitExcludePlan)
+
     def test_local_rechecks_tracked_state_after_the_write(self):
         knowledge = self.project / "knowledge"
         knowledge.mkdir()
         tracked = knowledge / "tracked.txt"
         tracked.write_text("tracked\n", encoding="utf-8")
         plan = self.call(plan_git_exclude, self.project, "local")
+        original = plan.path.read_bytes()
         real_writer = conditional_file.write_regular_file_if_unchanged
 
         def write_then_track(path, original, intended):
@@ -287,6 +352,7 @@ class GitExcludeContractTests(ErrorContractMixin, unittest.TestCase):
                 "PROJECT_KNOWLEDGE_TRACKED",
                 lambda: apply_git_exclude(plan),
             )
+        self.assertEqual(plan.path.read_bytes(), original)
 
     def test_local_planned_state_refuses_a_later_negate_rule_before_writing(self):
         path = self.exclude_path()
@@ -403,6 +469,56 @@ class GitExcludeContractTests(ErrorContractMixin, unittest.TestCase):
                 "PROJECT_EXCLUDE_CHANGED",
                 lambda: apply_git_exclude(plan),
             )
+        self.assertEqual(path.read_bytes(), LF_BLOCK)
+
+    def test_failed_postcheck_removes_new_exclude_only_if_still_intended(self):
+        path = self.exclude_path()
+        path.unlink()
+        knowledge = self.project / "knowledge"
+        knowledge.mkdir()
+        (knowledge / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+        plan = self.call(plan_git_exclude, self.project, "local")
+        real_writer = conditional_file.write_regular_file_if_unchanged
+
+        def write_then_track(path, original, intended):
+            real_writer(path, original, intended)
+            self.git(self.project, "add", "-f", "knowledge/tracked.txt")
+
+        with self.isolated_environment(), mock.patch(
+            "didimlog.project.git_exclude.write_regular_file_if_unchanged",
+            side_effect=write_then_track,
+        ):
+            self.assert_token(
+                "PROJECT_KNOWLEDGE_TRACKED",
+                lambda: apply_git_exclude(plan),
+            )
+        self.assertFalse(path.exists())
+
+    def test_failed_postcheck_preserves_concurrent_exclude_replacement(self):
+        path = self.exclude_path()
+        original = path.read_bytes()
+        knowledge = self.project / "knowledge"
+        knowledge.mkdir()
+        (knowledge / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+        plan = self.call(plan_git_exclude, self.project, "local")
+        real_writer = conditional_file.write_regular_file_if_unchanged
+        concurrent = b"concurrent replacement\n"
+
+        def write_replace_then_track(target, planned, intended):
+            real_writer(target, planned, intended)
+            target.write_bytes(concurrent)
+            self.git(self.project, "add", "-f", "knowledge/tracked.txt")
+
+        with self.isolated_environment(), mock.patch(
+            "didimlog.project.git_exclude.write_regular_file_if_unchanged",
+            side_effect=write_replace_then_track,
+        ):
+            self.assert_token(
+                "PROJECT_KNOWLEDGE_TRACKED",
+                lambda: apply_git_exclude(plan),
+            )
+        self.assertNotEqual(path.read_bytes(), original)
+        self.assertEqual(path.read_bytes(), concurrent)
 
     def test_concurrent_create_change_and_delete_are_rejected_without_overwrite(self):
         path = self.exclude_path()

@@ -14,6 +14,8 @@ from didimlog.conditional_file import (
     write_regular_file_if_unchanged,
 )
 from didimlog.errors import DidimError, EXIT_GIT
+from didimlog.file_io import open_directory_path, read_regular_file_at_with_stat
+from didimlog.locking import acquire_directory_lock
 
 
 _GIT_TIMEOUT_SECONDS = 5
@@ -376,7 +378,12 @@ def _transform(original: bytes | None, mode: str) -> tuple[bytes | None, tuple[s
 
 
 def _tracked_knowledge_exists(project_root: Path) -> bool:
-    result = _run_git(project_root, ("ls-files", "-z", "--", "knowledge/"))
+    pathspec = (
+        ":(icase)knowledge/"
+        if _read_ignore_case(project_root)
+        else "knowledge/"
+    )
+    result = _run_git(project_root, ("ls-files", "-z", "--", pathspec))
     return bool(result.stdout)
 
 
@@ -526,6 +533,79 @@ def _plan_has_valid_shape(plan: object) -> bool:
     )
 
 
+def _rollback_revision(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_uid,
+        info.st_gid,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _delete_created_exclude_if_unchanged(path: Path, intended: bytes) -> None:
+    parent_descriptor: int | None = None
+    lock_descriptor: int | None = None
+    verification_descriptor: int | None = None
+    try:
+        parent_descriptor = open_directory_path(path.parent)
+        lock_descriptor = acquire_directory_lock(parent_descriptor)
+        data, opened = read_regular_file_at_with_stat(
+            parent_descriptor,
+            path.name,
+            len(intended),
+        )
+        if data != intended:
+            return
+
+        verification_descriptor = open_directory_path(path.parent)
+        original_parent = os.fstat(parent_descriptor)
+        current_parent = os.fstat(verification_descriptor)
+        if (
+            original_parent.st_dev != current_parent.st_dev
+            or original_parent.st_ino != current_parent.st_ino
+        ):
+            return
+        current = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if _rollback_revision(current) != _rollback_revision(opened):
+            return
+        os.unlink(path.name, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+    except (OSError, RuntimeError, ValueError):
+        return
+    finally:
+        if verification_descriptor is not None:
+            os.close(verification_descriptor)
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+
+
+def _restore_exclude_after_failed_postcheck(plan: GitExcludePlan) -> None:
+    if plan.intended is None:
+        return
+    if plan.original is None:
+        _delete_created_exclude_if_unchanged(plan.path, plan.intended)
+        return
+    try:
+        write_regular_file_if_unchanged(
+            plan.path,
+            plan.intended,
+            plan.original,
+        )
+    except (OSError, ValueError):
+        return
+
+
 def apply_git_exclude(plan: GitExcludePlan) -> None:
     """Apply a still-current canonical plan and verify the resulting policy."""
     if not _plan_has_valid_shape(plan):
@@ -555,13 +635,17 @@ def apply_git_exclude(plan: GitExcludePlan) -> None:
     except (OSError, ValueError) as error:
         raise _changed() from error
 
-    if plan.mode == "local" and _tracked_knowledge_exists(root):
-        raise _tracked()
-    ignored = _actual_knowledge_is_ignored(root)
-    if plan.mode == "local" and not ignored:
-        raise _conflict()
-    if plan.mode == "shared" and ignored != bool(plan.notices):
-        raise _changed()
+    try:
+        if plan.mode == "local" and _tracked_knowledge_exists(root):
+            raise _tracked()
+        ignored = _actual_knowledge_is_ignored(root)
+        if plan.mode == "local" and not ignored:
+            raise _conflict()
+        if plan.mode == "shared" and ignored != bool(plan.notices):
+            raise _changed()
+    except DidimError:
+        _restore_exclude_after_failed_postcheck(plan)
+        raise
 
 
 def project_knowledge_is_ignored(project_root: Path) -> bool:
