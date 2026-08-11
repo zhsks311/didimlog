@@ -156,6 +156,65 @@ class SetupApplyTests(unittest.TestCase):
         self.assertTrue(checked.personal.endswith("PERSONAL_INDEX_CURRENT"))
         self.assertTrue(checked.project.endswith("PROJECT_INDEX_CURRENT"))
 
+    def test_postcheck_rejects_project_index_that_turns_stale_during_inspect(self):
+        plan = self._plan()
+        real_inspect = setup_module.inspect
+        observed_tokens = []
+
+        def inspect_after_index_turns_stale(**arguments):
+            (self.project / "knowledge" / "index" / "INDEX.md").write_bytes(
+                b"stale\n"
+            )
+            problems = real_inspect(**arguments)
+            observed_tokens.extend(problem.token for problem in problems)
+            return problems
+
+        with mock.patch(
+            "didimlog.claude.setup.inspect",
+            side_effect=inspect_after_index_turns_stale,
+        ):
+            with self.assertRaises(DidimError) as caught:
+                self._apply(plan)
+
+        self.assertEqual(caught.exception.token, "SETUP_POSTCHECK_FAILED")
+        self.assertIn("PROJECT_INDEX_STALE", observed_tokens)
+        self.assertFalse((self.config / "CLAUDE.md").exists())
+        self.assertFalse((self.config / "settings.json").exists())
+
+    def test_postcheck_rechecks_planned_repo_after_empty_inspect_result(self):
+        other = self.root / "other-project"
+        other.mkdir()
+        self._git(other, "init", "-q")
+        setup_module.apply_scaffold(setup_module.plan_scaffold(other))
+        setup_module.write_index(other)
+        repository_environment = {
+            "GIT_DIR": str(other / ".git"),
+            "GIT_WORK_TREE": str(other),
+        }
+        plan = self._plan()
+        real_inspect = setup_module.inspect
+        observed_problems = []
+
+        def inspect_after_planned_index_turns_stale(**arguments):
+            (self.project / "knowledge" / "index" / "INDEX.md").write_bytes(
+                b"stale\n"
+            )
+            problems = real_inspect(**arguments)
+            observed_problems.append(problems)
+            return problems
+
+        with mock.patch(
+            "didimlog.claude.setup.inspect",
+            side_effect=inspect_after_planned_index_turns_stale,
+        ):
+            with self.assertRaises(DidimError) as caught:
+                self._apply(plan, environment=repository_environment)
+
+        self.assertEqual(observed_problems, [()])
+        self.assertEqual(caught.exception.token, "SETUP_POSTCHECK_FAILED")
+        self.assertFalse((self.config / "CLAUDE.md").exists())
+        self.assertFalse((self.config / "settings.json").exists())
+
     def test_postcheck_ignores_repository_environment_pointing_at_stale_other_repo(self):
         other = self.root / "other-project"
         other.mkdir()

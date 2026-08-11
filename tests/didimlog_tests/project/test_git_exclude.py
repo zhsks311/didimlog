@@ -25,6 +25,11 @@ RULE = b"/knowledge/"
 END = b"# DIDIMLOG:END project-knowledge"
 LF_BLOCK = START + b"\n" + RULE + b"\n" + END + b"\n"
 CRLF_BLOCK = START + b"\r\n" + RULE + b"\r\n" + END + b"\r\n"
+MAXIMUM_EXCLUDE_BYTES = 1024 * 1024
+
+def content_ending_with_newline(size, newline):
+    prefix = b"#" if newline == b"\r\n" and size % 2 else b""
+    return prefix + newline * ((size - len(prefix)) // len(newline))
 
 
 class ErrorContractMixin:
@@ -184,6 +189,73 @@ class GitExcludeContractTests(ErrorContractMixin, unittest.TestCase):
                 self.assertEqual(shared.intended, original)
                 self.call(apply_git_exclude, shared)
                 self.assertEqual(path.read_bytes(), original)
+
+    def test_local_rejects_exact_limit_without_final_newline_without_mutation(self):
+        path = self.exclude_path()
+        original = b"x" * MAXIMUM_EXCLUDE_BYTES
+        path.write_bytes(original)
+        before = path.stat()
+
+        self.assert_token(
+            "PROJECT_EXCLUDE_UNSAFE",
+            lambda: self.call(plan_git_exclude, self.project, "local"),
+        )
+
+        after = path.stat()
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual((after.st_dev, after.st_ino), (before.st_dev, before.st_ino))
+        self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
+
+    def test_local_allows_exact_limit_and_rejects_one_byte_over_after_transform(self):
+        path = self.exclude_path()
+        cases = (
+            (b"\n", LF_BLOCK),
+            (b"\r\n", CRLF_BLOCK),
+        )
+        for newline, managed_block in cases:
+            with self.subTest(newline=newline, intended_size=MAXIMUM_EXCLUDE_BYTES):
+                original = content_ending_with_newline(
+                    MAXIMUM_EXCLUDE_BYTES - len(managed_block),
+                    newline,
+                )
+                path.write_bytes(original)
+
+                plan = self.call(plan_git_exclude, self.project, "local")
+
+                self.assertEqual(len(plan.intended), MAXIMUM_EXCLUDE_BYTES)
+                self.assertEqual(plan.intended, original + managed_block)
+
+            with self.subTest(newline=newline, intended_size=MAXIMUM_EXCLUDE_BYTES + 1):
+                original = content_ending_with_newline(
+                    MAXIMUM_EXCLUDE_BYTES + 1 - len(managed_block),
+                    newline,
+                )
+                path.write_bytes(original)
+                before = path.stat()
+
+                self.assert_token(
+                    "PROJECT_EXCLUDE_UNSAFE",
+                    lambda: self.call(plan_git_exclude, self.project, "local"),
+                )
+
+                after = path.stat()
+                self.assertEqual(path.read_bytes(), original)
+                self.assertEqual(
+                    (after.st_dev, after.st_ino),
+                    (before.st_dev, before.st_ino),
+                )
+                self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
+
+    def test_shared_removal_from_limit_sized_file_remains_allowed(self):
+        path = self.exclude_path()
+        remainder = b"\n" * (MAXIMUM_EXCLUDE_BYTES - len(LF_BLOCK))
+        original = LF_BLOCK + remainder
+        path.write_bytes(original)
+
+        plan = self.call(plan_git_exclude, self.project, "shared")
+
+        self.assertEqual(plan.original, original)
+        self.assertEqual(plan.intended, remainder)
 
     def test_shared_recognizes_one_exact_block_at_front_middle_or_end(self):
         path = self.exclude_path()

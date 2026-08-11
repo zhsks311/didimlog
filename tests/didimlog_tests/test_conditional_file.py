@@ -120,6 +120,38 @@ class ConditionalWriteTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"managed bytes\n")
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
 
+    def test_existing_replacement_ignores_cleanup_directory_sync_failure(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            target = Path(temporary_directory) / "target"
+            original = b"user bytes\n"
+            intended = b"managed bytes\n"
+            target.write_bytes(original)
+            real_fsync = os.fsync
+            directory_sync_calls = 0
+
+            def fail_cleanup_directory_sync(descriptor):
+                nonlocal directory_sync_calls
+                if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                    directory_sync_calls += 1
+                    if directory_sync_calls == 2:
+                        raise OSError("cleanup directory sync failed")
+                return real_fsync(descriptor)
+
+            with mock.patch.object(
+                conditional_file.os,
+                "fsync",
+                side_effect=fail_cleanup_directory_sync,
+            ):
+                result = write_regular_file_if_unchanged(target, original, intended)
+
+            self.assertIsNone(result)
+            self.assertEqual(directory_sync_calls, 2)
+            self.assertEqual(target.read_bytes(), intended)
+            self.assertEqual(
+                [entry.name for entry in target.parent.iterdir()],
+                ["target"],
+            )
+
     def test_existing_no_op_preserves_bytes_inode_and_mtime(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             target = Path(temporary_directory) / "target"

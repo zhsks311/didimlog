@@ -26,6 +26,8 @@ from .connect import (
 )
 from .paths import config_dir, config_target
 
+_PROJECT_ROOT_UNSET = object()
+
 
 @dataclass(frozen=True)
 class Problem:
@@ -91,7 +93,13 @@ def _index_problem(token: str, *, personal: bool) -> Problem | None:
     return _problem(token, impact, "didim index")
 
 
-def inspect(*, home=None, cwd=None, config=None) -> tuple[Problem, ...]:
+def inspect(
+    *,
+    home=None,
+    cwd=None,
+    config=None,
+    _project_root=_PROJECT_ROOT_UNSET,
+) -> tuple[Problem, ...]:
     """Inspect wiring and derived indexes without reading source bodies into output."""
     selected_home = Path.home() if home is None else Path(home)
     selected_home = Path(os.path.abspath(selected_home))
@@ -181,7 +189,11 @@ def inspect(*, home=None, cwd=None, config=None) -> tuple[Problem, ...]:
     if personal_problem is not None:
         problems.append(personal_problem)
 
-    project_root = _discover_git_root(cwd)
+    project_root = (
+        _discover_git_root(cwd)
+        if _project_root is _PROJECT_ROOT_UNSET
+        else _project_root
+    )
     if project_root is not None and _prepared_project(project_root):
         project_problem = _index_problem(
             _project_check(project_root),

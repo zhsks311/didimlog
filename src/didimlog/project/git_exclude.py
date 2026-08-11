@@ -482,6 +482,8 @@ def _build_plan(
     original: bytes | None,
 ) -> GitExcludePlan:
     intended, changes = _transform(original, mode)
+    if intended is not None and len(intended) > _MAXIMUM_EXCLUDE_BYTES:
+        raise _unsafe()
     if mode == "local" and _tracked_knowledge_exists(project_root):
         raise _tracked()
     planned_ignored = _planned_knowledge_is_ignored(project_root, intended)

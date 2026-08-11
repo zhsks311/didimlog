@@ -307,6 +307,16 @@ def _postcheck(plan: SetupPlan) -> tuple[str, ...]:
             for problem in problems
         ):
             raise DidimError("SETUP_POSTCHECK_FAILED", exit_code=EXIT_POLICY)
+        if plan._project_root is not None:
+            try:
+                project_current = _prepared_project(
+                    plan._project_root
+                ) and _project_check(plan._project_root) == PROJECT_INDEX_CURRENT
+            except (DidimError, OSError, ValueError):
+                project_current = False
+            if not project_current:
+                raise DidimError("SETUP_POSTCHECK_FAILED", exit_code=EXIT_POLICY)
+
 
     if plan._project_exclude is None:
         return ()

@@ -301,6 +301,7 @@ def replace_regular_file_at_if_unchanged(
     backup_name: str | None = None
     backup_moved = False
     published_identity: tuple[int, int] | None = None
+    publication_committed = False
     try:
         temporary_name, temporary_descriptor = _create_temporary_file_at(
             parent_descriptor,
@@ -378,45 +379,53 @@ def replace_regular_file_at_if_unchanged(
         ):
             return False
 
-        os.unlink(backup_name, dir_fd=parent_descriptor)
-        backup_name = None
-        backup_moved = False
-        os.unlink(temporary_name, dir_fd=parent_descriptor)
-        temporary_name = None
+        # This parent sync is the commit point; the original backup still exists.
         os.fsync(parent_descriptor)
+        publication_committed = True
+        backup_moved = False
         return True
     except UnsafePathError:
         raise
     except OSError as error:
         raise UnsafePathError("unable to replace regular file safely") from error
     finally:
+        cleanup_names = True
         if (
-            backup_moved
+            not publication_committed
+            and backup_moved
             and backup_name is not None
             and published_identity is not None
-            and not _rollback_published_file_at(
+        ):
+            rollback_succeeded = _rollback_published_file_at(
                 parent_descriptor,
                 name,
                 backup_name,
                 published_identity,
             )
-        ):
-            backup_name = None
-        if backup_name is not None:
-            try:
-                os.unlink(backup_name, dir_fd=parent_descriptor)
-            except FileNotFoundError:
-                pass
-        if temporary_name is not None:
-            try:
-                os.unlink(temporary_name, dir_fd=parent_descriptor)
-            except FileNotFoundError:
-                pass
-        if backup_moved:
-            try:
-                os.fsync(parent_descriptor)
-            except OSError:
-                pass
+            if not rollback_succeeded:
+                backup_name = None
+            else:
+                try:
+                    os.fsync(parent_descriptor)
+                except OSError:
+                    cleanup_names = False
+
+        if cleanup_names:
+            if backup_name is not None:
+                try:
+                    os.unlink(backup_name, dir_fd=parent_descriptor)
+                except OSError:
+                    pass
+            if temporary_name is not None:
+                try:
+                    os.unlink(temporary_name, dir_fd=parent_descriptor)
+                except OSError:
+                    pass
+            if backup_moved or publication_committed:
+                try:
+                    os.fsync(parent_descriptor)
+                except OSError:
+                    pass
 
 
 def open_directory_path(path: os.PathLike[str] | str) -> int:

@@ -163,6 +163,225 @@ class FileIoContractTests(unittest.TestCase):
             finally:
                 os.close(root_descriptor)
 
+    def test_first_directory_sync_failure_restores_original_and_syncs_rollback(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "target"
+            target.write_bytes(b"original")
+            target.chmod(0o640)
+            expected_info = target.stat()
+            root_descriptor = os.open(
+                root,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            real_fsync = os.fsync
+            directory_sync_calls = 0
+            rollback_sync_observed = False
+
+            def fail_first_directory_sync(descriptor):
+                nonlocal directory_sync_calls, rollback_sync_observed
+                if descriptor == root_descriptor:
+                    directory_sync_calls += 1
+                    if directory_sync_calls == 1:
+                        raise OSError("publication directory sync failed")
+                    if directory_sync_calls == 2:
+                        backups = [
+                            entry
+                            for entry in root.iterdir()
+                            if entry.name.startswith(".didim-backup-")
+                        ]
+                        rollback_sync_observed = (
+                            target.read_bytes() == b"original"
+                            and len(backups) == 1
+                            and backups[0].read_bytes() == b"original"
+                        )
+                return real_fsync(descriptor)
+
+            try:
+                with (
+                    mock.patch.object(
+                        file_io.os,
+                        "fsync",
+                        side_effect=fail_first_directory_sync,
+                    ),
+                    self.assertRaises(UnsafePathError),
+                ):
+                    replace_regular_file_at_if_unchanged(
+                        root_descriptor,
+                        target.name,
+                        b"original",
+                        b"managed",
+                        0o640,
+                        expected_info=expected_info,
+                    )
+            finally:
+                os.close(root_descriptor)
+
+            self.assertEqual(directory_sync_calls, 3)
+            self.assertTrue(rollback_sync_observed)
+            self.assertEqual(target.read_bytes(), b"original")
+            self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+            self.assertEqual([entry.name for entry in root.iterdir()], ["target"])
+
+    def test_double_directory_sync_failure_retains_original_backup_for_indeterminate_recovery(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "target"
+            target.write_bytes(b"original")
+            expected_info = target.stat()
+            root_descriptor = os.open(
+                root,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            real_fsync = os.fsync
+            directory_sync_calls = 0
+
+            def fail_publication_and_rollback_sync(descriptor):
+                nonlocal directory_sync_calls
+                if descriptor == root_descriptor:
+                    directory_sync_calls += 1
+                    if directory_sync_calls <= 2:
+                        raise OSError("directory sync failed")
+                return real_fsync(descriptor)
+
+            try:
+                with (
+                    mock.patch.object(
+                        file_io.os,
+                        "fsync",
+                        side_effect=fail_publication_and_rollback_sync,
+                    ),
+                    self.assertRaises(UnsafePathError),
+                ):
+                    replace_regular_file_at_if_unchanged(
+                        root_descriptor,
+                        target.name,
+                        b"original",
+                        b"managed",
+                        0o600,
+                        expected_info=expected_info,
+                    )
+            finally:
+                os.close(root_descriptor)
+
+            backups = [
+                entry
+                for entry in root.iterdir()
+                if entry.name.startswith(".didim-backup-")
+            ]
+            replacements = [
+                entry
+                for entry in root.iterdir()
+                if entry.name.startswith(".didim-replacement-")
+            ]
+            original_is_preserved = (
+                target.exists() and target.read_bytes() == b"original"
+            ) or any(backup.read_bytes() == b"original" for backup in backups)
+
+            self.assertEqual(directory_sync_calls, 2)
+            self.assertTrue(original_is_preserved)
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), b"original")
+            self.assertEqual(len(replacements), 1)
+            self.assertEqual(replacements[0].read_bytes(), b"managed")
+
+    def test_first_publication_sync_observes_original_backup(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "target"
+            target.write_bytes(b"original")
+            expected_info = target.stat()
+            root_descriptor = os.open(
+                root,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            real_fsync = os.fsync
+            directory_sync_calls = 0
+            backup_observed = False
+
+            def observe_first_directory_sync(descriptor):
+                nonlocal directory_sync_calls, backup_observed
+                if descriptor == root_descriptor:
+                    directory_sync_calls += 1
+                    if directory_sync_calls == 1:
+                        backups = [
+                            entry
+                            for entry in root.iterdir()
+                            if entry.name.startswith(".didim-backup-")
+                        ]
+                        backup_observed = (
+                            len(backups) == 1
+                            and backups[0].read_bytes() == b"original"
+                        )
+                return real_fsync(descriptor)
+
+            try:
+                with mock.patch.object(
+                    file_io.os,
+                    "fsync",
+                    side_effect=observe_first_directory_sync,
+                ):
+                    replaced = replace_regular_file_at_if_unchanged(
+                        root_descriptor,
+                        target.name,
+                        b"original",
+                        b"managed",
+                        0o600,
+                        expected_info=expected_info,
+                    )
+            finally:
+                os.close(root_descriptor)
+
+            self.assertTrue(replaced)
+            self.assertTrue(backup_observed)
+            self.assertEqual(target.read_bytes(), b"managed")
+            self.assertEqual([entry.name for entry in root.iterdir()], ["target"])
+
+    def test_cleanup_directory_sync_failure_keeps_committed_success(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "target"
+            target.write_bytes(b"original")
+            expected_info = target.stat()
+            root_descriptor = os.open(
+                root,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            real_fsync = os.fsync
+            directory_sync_calls = 0
+
+            def fail_cleanup_directory_sync(descriptor):
+                nonlocal directory_sync_calls
+                if descriptor == root_descriptor:
+                    directory_sync_calls += 1
+                    if directory_sync_calls == 2:
+                        raise OSError("cleanup directory sync failed")
+                return real_fsync(descriptor)
+
+            try:
+                with mock.patch.object(
+                    file_io.os,
+                    "fsync",
+                    side_effect=fail_cleanup_directory_sync,
+                ):
+                    replaced = replace_regular_file_at_if_unchanged(
+                        root_descriptor,
+                        target.name,
+                        b"original",
+                        b"managed",
+                        0o600,
+                        expected_info=expected_info,
+                    )
+            finally:
+                os.close(root_descriptor)
+
+            self.assertTrue(replaced)
+            self.assertEqual(directory_sync_calls, 2)
+            self.assertEqual(target.read_bytes(), b"managed")
+            self.assertEqual([entry.name for entry in root.iterdir()], ["target"])
+
     def test_rollback_preserves_a_concurrent_replace_after_publish(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
