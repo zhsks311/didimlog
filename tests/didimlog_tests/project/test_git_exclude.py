@@ -303,7 +303,6 @@ class GitExcludeContractTests(ErrorContractMixin, unittest.TestCase):
             "Knowledge/tracked.txt",
         )
 
-        original = plan.path.read_bytes()
         real_writer = conditional_file.write_regular_file_if_unchanged
 
         def write_then_track_case_variant(path, original, intended):
@@ -318,7 +317,7 @@ class GitExcludeContractTests(ErrorContractMixin, unittest.TestCase):
                 "PROJECT_KNOWLEDGE_TRACKED",
                 lambda: apply_git_exclude(plan),
             )
-        self.assertEqual(plan.path.read_bytes(), original)
+        self.assertEqual(plan.path.read_bytes(), plan.intended)
 
     def test_ignore_case_false_keeps_tracked_pathspec_literal(self):
         self.git(self.project, "config", "core.ignoreCase", "false")
@@ -337,7 +336,6 @@ class GitExcludeContractTests(ErrorContractMixin, unittest.TestCase):
         tracked = knowledge / "tracked.txt"
         tracked.write_text("tracked\n", encoding="utf-8")
         plan = self.call(plan_git_exclude, self.project, "local")
-        original = plan.path.read_bytes()
         real_writer = conditional_file.write_regular_file_if_unchanged
 
         def write_then_track(path, original, intended):
@@ -352,7 +350,7 @@ class GitExcludeContractTests(ErrorContractMixin, unittest.TestCase):
                 "PROJECT_KNOWLEDGE_TRACKED",
                 lambda: apply_git_exclude(plan),
             )
-        self.assertEqual(plan.path.read_bytes(), original)
+        self.assertEqual(plan.path.read_bytes(), plan.intended)
 
     def test_local_planned_state_refuses_a_later_negate_rule_before_writing(self):
         path = self.exclude_path()
@@ -469,9 +467,9 @@ class GitExcludeContractTests(ErrorContractMixin, unittest.TestCase):
                 "PROJECT_EXCLUDE_CHANGED",
                 lambda: apply_git_exclude(plan),
             )
-        self.assertEqual(path.read_bytes(), LF_BLOCK)
+        self.assertEqual(path.read_bytes(), plan.intended)
 
-    def test_failed_postcheck_removes_new_exclude_only_if_still_intended(self):
+    def test_failed_postcheck_keeps_new_exclude_in_applied_state(self):
         path = self.exclude_path()
         path.unlink()
         knowledge = self.project / "knowledge"
@@ -492,52 +490,7 @@ class GitExcludeContractTests(ErrorContractMixin, unittest.TestCase):
                 "PROJECT_KNOWLEDGE_TRACKED",
                 lambda: apply_git_exclude(plan),
             )
-        self.assertFalse(path.exists())
-
-    def test_created_exclude_rollback_preserves_replace_before_quarantine(self):
-        path = self.exclude_path()
-        path.unlink()
-        concurrent_source = path.with_name("concurrent-user-exclude")
-        concurrent = b"concurrent user exclude\n"
-        concurrent_source.write_bytes(concurrent)
-        knowledge = self.project / "knowledge"
-        knowledge.mkdir()
-        (knowledge / "tracked.txt").write_text("tracked\n", encoding="utf-8")
-        plan = self.call(plan_git_exclude, self.project, "local")
-        real_writer = conditional_file.write_regular_file_if_unchanged
-        real_rename = os.rename
-
-        def write_then_track(path, original, intended):
-            real_writer(path, original, intended)
-            self.git(self.project, "add", "-f", "knowledge/tracked.txt")
-
-        def replace_before_quarantine(
-            source,
-            destination,
-            *,
-            src_dir_fd=None,
-            dst_dir_fd=None,
-        ):
-            os.replace(concurrent_source, path)
-            return real_rename(
-                source,
-                destination,
-                src_dir_fd=src_dir_fd,
-                dst_dir_fd=dst_dir_fd,
-            )
-
-        with self.isolated_environment(), mock.patch(
-            "didimlog.project.git_exclude.write_regular_file_if_unchanged",
-            side_effect=write_then_track,
-        ), mock.patch(
-            "didimlog.project.git_exclude.os.rename",
-            side_effect=replace_before_quarantine,
-        ):
-            self.assert_token(
-                "PROJECT_KNOWLEDGE_TRACKED",
-                lambda: apply_git_exclude(plan),
-            )
-        self.assertEqual(path.read_bytes(), concurrent)
+        self.assertEqual(path.read_bytes(), plan.intended)
 
     def test_failed_postcheck_preserves_concurrent_exclude_replacement(self):
         path = self.exclude_path()
