@@ -12,15 +12,27 @@ import secrets
 import stat
 from collections.abc import Mapping
 
+from didimlog.conditional_file import (
+    read_optional_regular_file,
+    write_regular_file_if_unchanged,
+)
+from didimlog.file_io import (
+    UnsafePathError,
+    open_directory_path,
+    read_regular_file_at_with_stat,
+)
+from didimlog.locking import acquire_directory_lock
+
 from . import config as config_module
 from . import resources as resource_module
-from .config import plan_claude_md, plan_settings, write_if_unchanged
+from .config import plan_claude_md, plan_settings
 from .paths import config_dir, config_target
 from .transaction import InstallJournal
 
 
 _RESOURCE_NAMES = ("KNOWLEDGE_USAGE.md", "LESSON_WRITING_RULES.md")
 _RESOURCE_PACKAGE = "didimlog.resources.personal"
+_MANAGED_FILE_MAXIMUM_BYTES = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -36,21 +48,6 @@ class ClaudeChangePlan:
     config_dir: Path
     changes: tuple[str, ...]
     _files: tuple[_FileChange, ...] = field(repr=False, compare=False)
-
-
-def _read_optional(path: Path) -> bytes | None:
-    try:
-        parent = path.parent.lstat()
-    except FileNotFoundError:
-        return None
-    if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
-        raise ValueError("managed target parent must be a regular directory")
-    parent_descriptor = config_module._open_parent(path)
-    try:
-        current = config_module._read_target(parent_descriptor, path.name)
-        return None if current is None else current[0]
-    finally:
-        os.close(parent_descriptor)
 
 
 def _packaged_resources() -> tuple[tuple[str, bytes], ...]:
@@ -83,6 +80,15 @@ def _selected_config(explicit, *, environ, home) -> tuple[Path, Path]:
 def _target(config: Path, name: str, home: Path) -> Path:
     return config_target(config, name, home=home)
 
+def _resource_directory_exists(config: Path) -> bool:
+    try:
+        (config / "didimlog").lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise ValueError("managed resource directory could not be inspected") from error
+    return True
+
 
 def plan_connect(
     explicit=None,
@@ -101,9 +107,17 @@ def plan_connect(
     changes: list[str] = []
     file_changes: list[_FileChange] = []
 
+    resource_directory_exists = _resource_directory_exists(selected)
     for name, intended in _packaged_resources():
         path = _target(selected, "didimlog/" + name, selected_home)
-        original = _read_optional(path)
+        original = (
+            read_optional_regular_file(
+                path,
+                _MANAGED_FILE_MAXIMUM_BYTES,
+            )
+            if resource_directory_exists
+            else None
+        )
         if original != intended:
             file_changes.append(
                 _FileChange("resource:" + name, path, original, intended)
@@ -111,7 +125,10 @@ def plan_connect(
             changes.append("관리 지침 설치: {}".format(path))
 
     claude_path = _target(selected, "CLAUDE.md", selected_home)
-    claude_original = _read_optional(claude_path)
+    claude_original = read_optional_regular_file(
+        claude_path,
+        _MANAGED_FILE_MAXIMUM_BYTES,
+    )
     claude_input = b"" if claude_original is None else claude_original
     claude_intended = plan_claude_md(claude_input, selected)
     if claude_original != claude_intended:
@@ -126,7 +143,10 @@ def plan_connect(
         changes.append("Claude 지침 연결: {}".format(claude_path))
 
     settings_path = _target(selected, "settings.json", selected_home)
-    settings_original = _read_optional(settings_path)
+    settings_original = read_optional_regular_file(
+        settings_path,
+        _MANAGED_FILE_MAXIMUM_BYTES,
+    )
     settings_input = b"" if settings_original is None else settings_original
     settings_intended = plan_settings(settings_input, launcher_path)
     if settings_original != settings_intended:
@@ -209,7 +229,11 @@ def _apply_writes(plan: ClaudeChangePlan, journal: InstallJournal) -> None:
             change.original,
             backup,
         )
-        write_if_unchanged(change.path, change.original, change.intended)
+        write_regular_file_if_unchanged(
+            change.path,
+            change.original,
+            change.intended,
+        )
         journal.record_installed(change.name, change.intended)
 
 
@@ -309,7 +333,10 @@ def plan_disconnect(
     file_changes: list[_FileChange] = []
 
     claude_path = _target(selected, "CLAUDE.md", selected_home)
-    claude_original = _read_optional(claude_path)
+    claude_original = read_optional_regular_file(
+        claude_path,
+        _MANAGED_FILE_MAXIMUM_BYTES,
+    )
     if claude_original is not None:
         intended = _remove_managed_block(claude_original)
         if intended != claude_original:
@@ -319,7 +346,10 @@ def plan_disconnect(
             changes.append("Claude 지침 연결 해제: {}".format(claude_path))
 
     settings_path = _target(selected, "settings.json", selected_home)
-    settings_original = _read_optional(settings_path)
+    settings_original = read_optional_regular_file(
+        settings_path,
+        _MANAGED_FILE_MAXIMUM_BYTES,
+    )
     if settings_original is not None:
         intended = _remove_managed_hooks(settings_original)
         if intended != settings_original:
@@ -328,9 +358,17 @@ def plan_disconnect(
             )
             changes.append("SessionStart hook 연결 해제: {}".format(settings_path))
 
+    resource_directory_exists = _resource_directory_exists(selected)
     for name, packaged in _packaged_resources():
         path = _target(selected, "didimlog/" + name, selected_home)
-        original = _read_optional(path)
+        original = (
+            read_optional_regular_file(
+                path,
+                _MANAGED_FILE_MAXIMUM_BYTES,
+            )
+            if resource_directory_exists
+            else None
+        )
         if original == packaged:
             file_changes.append(
                 _FileChange("disconnect:resource:" + name, path, original, None)
@@ -341,17 +379,46 @@ def plan_disconnect(
 
 
 def _delete_unchanged(change: _FileChange) -> None:
-    current = _read_optional(change.path)
-    if current != change.original:
-        raise ValueError("managed resource changed after planning")
-    parent_descriptor = config_module._open_parent(change.path)
+    if change.original is None:
+        raise ValueError("managed resource did not exist during planning")
     try:
-        rechecked = config_module._read_target(parent_descriptor, change.path.name)
-        if rechecked is None or rechecked[0] != change.original:
+        parent_descriptor = open_directory_path(change.path.parent)
+    except UnsafePathError as error:
+        raise ValueError("managed resource parent is unsafe") from error
+    lock_descriptor: int | None = None
+    try:
+        lock_descriptor = acquire_directory_lock(parent_descriptor)
+        current, current_info = read_regular_file_at_with_stat(
+            parent_descriptor,
+            change.path.name,
+            len(change.original),
+        )
+        if current != change.original:
+            raise ValueError("managed resource changed after planning")
+        rechecked, rechecked_info = read_regular_file_at_with_stat(
+            parent_descriptor,
+            change.path.name,
+            len(change.original),
+        )
+        if (
+            rechecked != change.original
+            or (rechecked_info.st_dev, rechecked_info.st_ino)
+            != (current_info.st_dev, current_info.st_ino)
+            or rechecked_info.st_mode != current_info.st_mode
+            or rechecked_info.st_size != current_info.st_size
+            or rechecked_info.st_mtime_ns != current_info.st_mtime_ns
+            or rechecked_info.st_ctime_ns != current_info.st_ctime_ns
+        ):
             raise ValueError("managed resource changed before removal")
         os.unlink(change.path.name, dir_fd=parent_descriptor)
         os.fsync(parent_descriptor)
+    except ValueError:
+        raise
+    except OSError as error:
+        raise ValueError("managed resource could not be removed safely") from error
     finally:
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
         os.close(parent_descriptor)
 
 
@@ -375,7 +442,18 @@ def apply_disconnect(plan: ClaudeChangePlan, journal: InstallJournal) -> None:
             pass
     except BaseException:
         for change in reversed(deleted):
-            if _read_optional(change.path) is None and change.original is not None:
-                write_if_unchanged(change.path, None, change.original)
+            if (
+                read_optional_regular_file(
+                    change.path,
+                    _MANAGED_FILE_MAXIMUM_BYTES,
+                )
+                is None
+                and change.original is not None
+            ):
+                write_regular_file_if_unchanged(
+                    change.path,
+                    None,
+                    change.original,
+                )
         journal.rollback()
         raise

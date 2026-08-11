@@ -14,15 +14,20 @@ from didimlog.errors import DidimError, EXIT_POLICY, EXIT_USAGE
 from didimlog.indexing import (
     PERSONAL_INDEX_CURRENT,
     PROJECT_INDEX_CURRENT,
-    _discover_git_root,
     _personal_check,
     _prepared_project,
     _project_check,
-    run_index,
 )
 from didimlog.personal import index as personal_index
 from didimlog.personal.paths import data_home
 from didimlog.personal.rules_document import create_user_rules
+from didimlog.project.git_exclude import (
+    GitExcludePlan,
+    apply_git_exclude,
+    discover_project_for_setup,
+    plan_git_exclude,
+    project_knowledge_is_ignored,
+)
 from didimlog.project.index import write_index
 from didimlog.project.scaffold import (
     ScaffoldPlan,
@@ -48,9 +53,11 @@ class SetupPlan:
     version: str
     personal_changes: tuple[str, ...]
     project_changes: tuple[str, ...]
+    project_notices: tuple[str, ...]
     claude_changes: tuple[str, ...]
     _personal: _PersonalSetupPlan = field(repr=False, compare=False)
     _project: ScaffoldPlan | None = field(repr=False, compare=False)
+    _project_exclude: GitExcludePlan | None = field(repr=False, compare=False)
     _project_root: Path | None = field(repr=False, compare=False)
     _claude: ClaudeChangePlan | None = field(repr=False, compare=False)
 
@@ -153,14 +160,19 @@ def plan_setup(
     config=None,
     include_project: bool,
     skip_claude: bool,
+    project_knowledge: str = "local",
 ) -> SetupPlan:
     """Preflight every requested surface and return one deterministic summary."""
     personal_plan, personal_changes = _plan_personal(home)
+    if include_project and project_knowledge not in ("local", "shared"):
+        raise ValueError("mode must be 'local' or 'shared'")
 
     project_plan: ScaffoldPlan | None = None
+    project_exclude: GitExcludePlan | None = None
     project_root: Path | None = None
+    project_notices: tuple[str, ...] = ()
     if include_project:
-        project_root = _discover_git_root(cwd)
+        project_root = discover_project_for_setup(cwd)
         if project_root is None:
             project_changes = (
                 "프로젝트 근거: 설정되지 않음 — didim setup을 Git 프로젝트에서 실행하세요.",
@@ -168,6 +180,17 @@ def plan_setup(
         else:
             project_plan = plan_scaffold(project_root)
             project_changes = _project_changes(project_root, project_plan)
+            project_exclude = plan_git_exclude(project_root, project_knowledge)
+            if project_exclude.changes:
+                if project_exclude.mode == "local":
+                    project_changes += (
+                        "프로젝트 지식을 이 컴퓨터에서만 사용: {}".format(
+                            project_exclude.path
+                        ),
+                    )
+                else:
+                    project_changes += project_exclude.changes
+            project_notices = project_exclude.notices
     else:
         project_changes = ()
 
@@ -189,9 +212,11 @@ def plan_setup(
         version=didimlog_version(),
         personal_changes=personal_changes,
         project_changes=project_changes,
+        project_notices=project_notices,
         claude_changes=claude_changes,
         _personal=personal_plan,
         _project=project_plan,
+        _project_exclude=project_exclude,
         _project_root=project_root,
         _claude=claude_plan,
     )
@@ -259,28 +284,70 @@ def _apply_personal(plan: _PersonalSetupPlan) -> None:
             os.close(descriptor)
 
 
-def _postcheck(plan: SetupPlan) -> None:
-    checked = run_index(
-        check=True,
-        home=plan._personal.home,
-        cwd=plan._project_root,
-    )
-    if checked.personal_token != PERSONAL_INDEX_CURRENT:
+def _postcheck(plan: SetupPlan) -> tuple[str, ...]:
+    if _personal_check(plan._personal.root) != PERSONAL_INDEX_CURRENT:
         raise DidimError("SETUP_POSTCHECK_FAILED", exit_code=EXIT_POLICY)
+    if plan._project_root is not None:
+        try:
+            project_current = _prepared_project(
+                plan._project_root
+            ) and _project_check(plan._project_root) == PROJECT_INDEX_CURRENT
+        except (DidimError, OSError, ValueError):
+            project_current = False
+        if not project_current:
+            raise DidimError("SETUP_POSTCHECK_FAILED", exit_code=EXIT_POLICY)
+    if plan._claude is not None:
+        problems = inspect(
+            home=plan._personal.home,
+            cwd=plan._project_root,
+            config=plan._claude.config_dir,
+        )
+        if any(
+            not problem.token.startswith("PROJECT_INDEX_")
+            for problem in problems
+        ):
+            raise DidimError("SETUP_POSTCHECK_FAILED", exit_code=EXIT_POLICY)
+        if plan._project_root is not None:
+            try:
+                project_current = _prepared_project(
+                    plan._project_root
+                ) and _project_check(plan._project_root) == PROJECT_INDEX_CURRENT
+            except (DidimError, OSError, ValueError):
+                project_current = False
+            if not project_current:
+                raise DidimError("SETUP_POSTCHECK_FAILED", exit_code=EXIT_POLICY)
+
+
+    if plan._project_exclude is None:
+        return ()
+    try:
+        final_exclude = plan_git_exclude(
+            plan._project_exclude.project_root,
+            plan._project_exclude.mode,
+        )
+        ignored = project_knowledge_is_ignored(
+            plan._project_exclude.project_root
+        )
+    except (DidimError, ValueError):
+        raise DidimError(
+            "SETUP_POSTCHECK_FAILED",
+            exit_code=EXIT_POLICY,
+        ) from None
     if (
-        plan._project_root is not None
-        and checked.project_token != PROJECT_INDEX_CURRENT
+        final_exclude.project_root != plan._project_exclude.project_root
+        or final_exclude.path != plan._project_exclude.path
+        or final_exclude.changes
+        or (final_exclude.mode == "local" and not ignored)
+        or (
+            final_exclude.mode == "shared"
+            and ignored != bool(final_exclude.notices)
+        )
     ):
         raise DidimError("SETUP_POSTCHECK_FAILED", exit_code=EXIT_POLICY)
-    if plan._claude is not None and inspect(
-        home=plan._personal.home,
-        cwd=plan._project_root,
-        config=plan._claude.config_dir,
-    ):
-        raise DidimError("SETUP_POSTCHECK_FAILED", exit_code=EXIT_POLICY)
+    return final_exclude.notices
 
 
-def apply_setup(plan: SetupPlan, *, approved: bool) -> None:
+def apply_setup(plan: SetupPlan, *, approved: bool) -> tuple[str, ...]:
     """Apply an approved preflight in dependency order and verify every surface."""
     if not approved:
         raise DidimError(
@@ -292,31 +359,35 @@ def apply_setup(plan: SetupPlan, *, approved: bool) -> None:
         raise DidimError("SETUP_PLAN_INVALID", exit_code=EXIT_POLICY)
 
     _apply_personal(plan._personal)
+    if _personal_check(plan._personal.root) != PERSONAL_INDEX_CURRENT:
+        personal_index.write_all(
+            data_root=plan._personal.root,
+            target=plan._personal.root / "index",
+        )
     if plan._project is not None:
         apply_scaffold(plan._project)
-
-    personal_index.write_all(
-        data_root=plan._personal.root,
-        target=plan._personal.root / "index",
-    )
-    if plan._project_root is not None:
+    if (
+        plan._project_root is not None
+        and _project_check(plan._project_root) != PROJECT_INDEX_CURRENT
+    ):
         write_index(plan._project_root)
+    if plan._project_exclude is not None:
+        apply_git_exclude(plan._project_exclude)
 
-    journal: InstallJournal | None = None
-    if plan._claude is not None:
-        with tempfile.TemporaryDirectory(
-            prefix=".didimlog-setup-",
-            dir=plan._personal.root,
-        ) as transaction_directory:
-            journal = InstallJournal(
-                Path(transaction_directory) / "journal.json",
-                reset=True,
-            )
+    if plan._claude is None or not plan._claude.changes:
+        return _postcheck(plan)
+
+    with tempfile.TemporaryDirectory(
+        prefix=".didimlog-setup-",
+        dir=plan._personal.root,
+    ) as transaction_directory:
+        journal = InstallJournal(
+            Path(transaction_directory) / "journal.json",
+            reset=True,
+        )
+        try:
             apply_connect(plan._claude, journal)
-            try:
-                _postcheck(plan)
-            except BaseException:
-                journal.rollback()
-                raise
-        return
-    _postcheck(plan)
+            return _postcheck(plan)
+        except BaseException:
+            journal.rollback()
+            raise

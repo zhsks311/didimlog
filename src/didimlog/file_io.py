@@ -193,7 +193,8 @@ def _rollback_published_file_at(
     parent_descriptor: int,
     name: str,
     backup_name: str,
-    published_identity: tuple[int, int],
+    replacement: bytes,
+    published_revision: tuple[int, ...],
 ) -> bool:
     """Preserve a concurrent public entry while restoring after failed publish."""
     recovery_name: str | None = None
@@ -235,42 +236,32 @@ def _rollback_published_file_at(
         except OSError:
             return False
 
+        published_unchanged = False
         try:
-            quarantined = os.stat(
+            quarantined_data, quarantined = read_regular_file_at_with_stat(
+                parent_descriptor,
                 recovery_name,
-                dir_fd=parent_descriptor,
-                follow_symlinks=False,
+                len(replacement),
             )
-        except OSError:
-            keep_recovery = True
-            return False
+            published_unchanged = (
+                quarantined_data == replacement
+                and _conditional_replace_revision(quarantined) == published_revision
+            )
+        except UnsafePathError:
+            pass
 
-        if (quarantined.st_dev, quarantined.st_ino) == published_identity:
-            try:
-                os.link(
-                    backup_name,
-                    name,
-                    src_dir_fd=parent_descriptor,
-                    dst_dir_fd=parent_descriptor,
-                    follow_symlinks=False,
-                )
-            except FileExistsError:
-                pass
-            except OSError:
-                keep_recovery = True
-                return False
-            return True
-
+        source_name = backup_name if published_unchanged else recovery_name
         try:
             os.link(
-                recovery_name,
+                source_name,
                 name,
                 src_dir_fd=parent_descriptor,
                 dst_dir_fd=parent_descriptor,
                 follow_symlinks=False,
             )
         except FileExistsError:
-            keep_recovery = True
+            if not published_unchanged:
+                keep_recovery = True
         except OSError:
             keep_recovery = True
             return False
@@ -300,7 +291,8 @@ def replace_regular_file_at_if_unchanged(
     temporary_name: str | None = None
     backup_name: str | None = None
     backup_moved = False
-    published_identity: tuple[int, int] | None = None
+    published_revision: tuple[int, ...] | None = None
+    publication_committed = False
     try:
         temporary_name, temporary_descriptor = _create_temporary_file_at(
             parent_descriptor,
@@ -310,7 +302,7 @@ def replace_regular_file_at_if_unchanged(
         try:
             _write_all_and_sync(temporary_descriptor, replacement)
             temporary_info = os.fstat(temporary_descriptor)
-            published_identity = (temporary_info.st_dev, temporary_info.st_ino)
+            published_revision = _conditional_replace_revision(temporary_info)
         finally:
             os.close(temporary_descriptor)
 
@@ -357,10 +349,10 @@ def replace_regular_file_at_if_unchanged(
         except FileExistsError:
             return False
 
-        published = os.stat(
+        published_data, published = read_regular_file_at_with_stat(
+            parent_descriptor,
             name,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
+            len(replacement),
         )
         moved_after, moved_after_info = read_regular_file_at_with_stat(
             parent_descriptor,
@@ -368,7 +360,8 @@ def replace_regular_file_at_if_unchanged(
             len(expected),
         )
         if (
-            (published.st_dev, published.st_ino) != published_identity
+            published_data != replacement
+            or _conditional_replace_revision(published) != published_revision
             or moved_after != expected
             or (
                 expected_info is not None
@@ -378,45 +371,54 @@ def replace_regular_file_at_if_unchanged(
         ):
             return False
 
-        os.unlink(backup_name, dir_fd=parent_descriptor)
-        backup_name = None
-        backup_moved = False
-        os.unlink(temporary_name, dir_fd=parent_descriptor)
-        temporary_name = None
+        # This parent sync is the commit point; the original backup still exists.
         os.fsync(parent_descriptor)
+        publication_committed = True
+        backup_moved = False
         return True
     except UnsafePathError:
         raise
     except OSError as error:
         raise UnsafePathError("unable to replace regular file safely") from error
     finally:
+        cleanup_names = True
         if (
-            backup_moved
+            not publication_committed
+            and backup_moved
             and backup_name is not None
-            and published_identity is not None
-            and not _rollback_published_file_at(
+            and published_revision is not None
+        ):
+            rollback_succeeded = _rollback_published_file_at(
                 parent_descriptor,
                 name,
                 backup_name,
-                published_identity,
+                replacement,
+                published_revision,
             )
-        ):
-            backup_name = None
-        if backup_name is not None:
-            try:
-                os.unlink(backup_name, dir_fd=parent_descriptor)
-            except FileNotFoundError:
-                pass
-        if temporary_name is not None:
-            try:
-                os.unlink(temporary_name, dir_fd=parent_descriptor)
-            except FileNotFoundError:
-                pass
-        if backup_moved:
-            try:
-                os.fsync(parent_descriptor)
-            except OSError:
-                pass
+            if not rollback_succeeded:
+                backup_name = None
+            else:
+                try:
+                    os.fsync(parent_descriptor)
+                except OSError:
+                    cleanup_names = False
+
+        if cleanup_names:
+            if backup_name is not None:
+                try:
+                    os.unlink(backup_name, dir_fd=parent_descriptor)
+                except OSError:
+                    pass
+            if temporary_name is not None:
+                try:
+                    os.unlink(temporary_name, dir_fd=parent_descriptor)
+                except OSError:
+                    pass
+            if backup_moved or publication_committed:
+                try:
+                    os.fsync(parent_descriptor)
+                except OSError:
+                    pass
 
 
 def open_directory_path(path: os.PathLike[str] | str) -> int:

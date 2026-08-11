@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import stat
 
+from didimlog.conditional_file import read_optional_regular_file
 from didimlog.indexing import (
     PERSONAL_INDEX_CURRENT,
     PROJECT_INDEX_CURRENT,
@@ -18,8 +19,14 @@ from didimlog.indexing import (
 from didimlog.personal.paths import data_home
 
 from . import config as config_module
-from .connect import _packaged_resources, _read_optional
+from .connect import (
+    _MANAGED_FILE_MAXIMUM_BYTES,
+    _packaged_resources,
+    _resource_directory_exists,
+)
 from .paths import config_dir, config_target
+
+_PROJECT_ROOT_UNSET = object()
 
 
 @dataclass(frozen=True)
@@ -66,12 +73,13 @@ def _launcher_from_settings(raw: bytes | None) -> Path | None:
         for hook in matcher_hooks:
             if not isinstance(hook, dict):
                 return None
-            if not config_module._is_managed_session_start_hook(hook, ""):
+            if hook.get("type") != "command":
                 continue
-            command = hook["command"]
-            launchers.append(
-                Path(command[: -len(config_module._SESSION_START_SUFFIX)])
+            launcher = config_module._launcher_from_session_start_command(
+                hook.get("command")
             )
+            if launcher is not None:
+                launchers.append(launcher)
     return launchers[0] if len(launchers) == 1 else None
 
 
@@ -86,7 +94,13 @@ def _index_problem(token: str, *, personal: bool) -> Problem | None:
     return _problem(token, impact, "didim index")
 
 
-def inspect(*, home=None, cwd=None, config=None) -> tuple[Problem, ...]:
+def inspect(
+    *,
+    home=None,
+    cwd=None,
+    config=None,
+    _project_root=_PROJECT_ROOT_UNSET,
+) -> tuple[Problem, ...]:
     """Inspect wiring and derived indexes without reading source bodies into output."""
     selected_home = Path.home() if home is None else Path(home)
     selected_home = Path(os.path.abspath(selected_home))
@@ -98,7 +112,10 @@ def inspect(*, home=None, cwd=None, config=None) -> tuple[Problem, ...]:
         "CLAUDE.md",
         home=selected_home,
     )
-    claude_raw = _read_optional(claude_path)
+    claude_raw = read_optional_regular_file(
+        claude_path,
+        _MANAGED_FILE_MAXIMUM_BYTES,
+    )
     expected_block = config_module.render_managed_block(selected_config)
     if claude_raw is None or claude_raw.count(expected_block) != 1:
         problems.append(
@@ -109,15 +126,19 @@ def inspect(*, home=None, cwd=None, config=None) -> tuple[Problem, ...]:
             )
         )
 
-    resource_invalid = False
-    for name, expected in _packaged_resources():
-        path = config_target(
-            selected_config,
-            "didimlog/" + name,
-            home=selected_home,
-        )
-        if _read_optional(path) != expected:
-            resource_invalid = True
+    resource_invalid = not _resource_directory_exists(selected_config)
+    if not resource_invalid:
+        for name, expected in _packaged_resources():
+            path = config_target(
+                selected_config,
+                "didimlog/" + name,
+                home=selected_home,
+            )
+            if (
+                read_optional_regular_file(path, _MANAGED_FILE_MAXIMUM_BYTES)
+                != expected
+            ):
+                resource_invalid = True
     if resource_invalid:
         problems.append(
             _problem(
@@ -132,7 +153,12 @@ def inspect(*, home=None, cwd=None, config=None) -> tuple[Problem, ...]:
         "settings.json",
         home=selected_home,
     )
-    launcher = _launcher_from_settings(_read_optional(settings_path))
+    launcher = _launcher_from_settings(
+        read_optional_regular_file(
+            settings_path,
+            _MANAGED_FILE_MAXIMUM_BYTES,
+        )
+    )
     if (
         launcher is None
         or not launcher.is_absolute()
@@ -164,7 +190,11 @@ def inspect(*, home=None, cwd=None, config=None) -> tuple[Problem, ...]:
     if personal_problem is not None:
         problems.append(personal_problem)
 
-    project_root = _discover_git_root(cwd)
+    project_root = (
+        _discover_git_root(cwd)
+        if _project_root is _PROJECT_ROOT_UNSET
+        else _project_root
+    )
     if project_root is not None and _prepared_project(project_root):
         project_problem = _index_problem(
             _project_check(project_root),
