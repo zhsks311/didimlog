@@ -492,6 +492,33 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(body, "## Observation\n\n이전 README 마이그레이션\n")
         self.assertEqual(readme.read_bytes(), current)
 
+    def test_capture_accepts_current_readme_when_legacy_plan_turns_stale(self):
+        readme = self.workspace / "knowledge/README.md"
+        current = readme.read_bytes()
+        readme.write_bytes(_legacy_readme(current))
+
+        def migrate_before_return(workspace):
+            stale_plan = plan_scaffold(workspace)
+            apply_scaffold(stale_plan)
+            return stale_plan
+
+        with mock.patch.object(
+            capture_module,
+            "plan_scaffold",
+            side_effect=migrate_before_return,
+        ):
+            path = capture(
+                self.workspace,
+                _observation_request("계획 직후 README 마이그레이션"),
+            )
+
+        self.assertEqual(path.name, "OBS-20260714-01.md")
+        self.assertIn(
+            "계획 직후 README 마이그레이션",
+            path.read_text(encoding="utf-8"),
+        )
+        self.assertEqual(readme.read_bytes(), current)
+
 
     def test_atomic_collision_retries_with_the_next_id(self):
         real_link = os.link

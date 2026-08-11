@@ -98,11 +98,19 @@ def _prepared_project(root: Path) -> bool:
             linked = directory.lstat()
             if stat.S_ISLNK(linked.st_mode) or not stat.S_ISDIR(linked.st_mode):
                 return False
-        originals = {path: original for path, original, _ in plan.updates}
+        updates = {
+            path: (original, intended)
+            for path, original, intended in plan.updates
+        }
         for path, expected in plan.files:
             relative = path.relative_to(root)
-            accepted = originals.get(path, expected)
-            if read_regular_file_beneath(root, relative, len(accepted)) != accepted:
+            accepted = updates.get(path, (expected,))
+            actual = read_regular_file_beneath(
+                root,
+                relative,
+                max(len(value) for value in accepted),
+            )
+            if actual not in accepted:
                 return False
     except (OSError, UnsafePathError, ValueError):
         return False

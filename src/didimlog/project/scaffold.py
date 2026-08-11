@@ -489,6 +489,14 @@ def _apply_scaffold_updates(
 def apply_scaffold(plan: ScaffoldPlan) -> None:
     """Create missing targets, then conditionally apply validated updates."""
     workspace = _validate_plan(plan)
+    initial_metadata = _lstat(workspace)
+    if (
+        initial_metadata is None
+        or stat.S_ISLNK(initial_metadata.st_mode)
+        or not stat.S_ISDIR(initial_metadata.st_mode)
+    ):
+        raise _policy_error("PATH_ESCAPE", workspace)
+    initial_identity = (initial_metadata.st_dev, initial_metadata.st_ino)
     _preflight(plan)
     update_paths = {path for path, _, _ in plan.updates}
 
@@ -497,6 +505,12 @@ def apply_scaffold(plan: ScaffoldPlan) -> None:
     except OSError as error:
         raise _policy_error("PATH_ESCAPE", workspace) from error
     workspace_metadata = os.fstat(workspace_descriptor)
+    if (
+        workspace_metadata.st_dev,
+        workspace_metadata.st_ino,
+    ) != initial_identity:
+        os.close(workspace_descriptor)
+        raise _policy_error("PATH_ESCAPE", workspace)
     descriptors = {workspace: workspace_descriptor}
     identities = {
         workspace: (workspace_metadata.st_dev, workspace_metadata.st_ino)

@@ -108,22 +108,23 @@ def _require_git_root(workspace: Path) -> Path:
 def _require_scaffold(workspace: Path) -> ScaffoldPlan:
     try:
         expected = plan_scaffold(workspace)
-        originals = {
-            path: original for path, original, _ in expected.updates
+        updates = {
+            path: (original, intended)
+            for path, original, intended in expected.updates
         }
         for directory in expected.directories:
             entry = directory.lstat()
             if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
                 raise OSError("unsafe scaffold directory")
         for path, content in expected.files:
-            required = originals.get(path, content)
+            accepted = updates.get(path, (content,))
             relative = path.relative_to(workspace)
             actual = read_regular_file_beneath(
                 workspace,
                 relative,
-                len(required),
+                max(len(value) for value in accepted),
             )
-            if actual != required:
+            if actual not in accepted:
                 raise OSError("stale scaffold file")
         return expected
     except (DidimError, OSError, UnsafePathError, ValueError):

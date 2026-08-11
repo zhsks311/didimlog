@@ -384,6 +384,60 @@ class ScaffoldTests(unittest.TestCase):
         finally:
             restore_workspace()
 
+    def test_workspace_replaced_by_directory_after_preflight_cannot_redirect_update(
+        self,
+    ):
+        initial_plan = plan_scaffold(self.workspace)
+        current = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        legacy = _legacy_readme(current)
+        readme = self.workspace / "knowledge/README.md"
+        readme.write_bytes(legacy)
+        plan = plan_scaffold(self.workspace)
+
+        replacement = self.root / "replacement"
+        replacement.mkdir()
+        self._make_empty_git_repository(replacement)
+        apply_scaffold(plan_scaffold(replacement))
+        replacement_readme = replacement / "knowledge/README.md"
+        replacement_readme.write_bytes(legacy)
+        backup = self.root / "workspace-backup"
+        original_preflight = scaffold_module._preflight
+
+        def preflight_then_replace(candidate):
+            original_preflight(candidate)
+            self.workspace.rename(backup)
+            replacement.rename(self.workspace)
+
+        try:
+            raised = None
+            with mock.patch.object(
+                scaffold_module,
+                "_preflight",
+                side_effect=preflight_then_replace,
+            ):
+                try:
+                    apply_scaffold(plan)
+                except DidimError as error:
+                    raised = error
+
+            with self.subTest("apply rejects the directory replacement"):
+                self.assertIsNotNone(raised)
+                if raised is not None:
+                    self.assertEqual(raised.exit_code, EXIT_POLICY)
+            with self.subTest("replacement scaffold remains untouched"):
+                self.assertEqual(
+                    (self.workspace / "knowledge/README.md").read_bytes(),
+                    legacy,
+                )
+        finally:
+            if self.workspace.exists():
+                self.workspace.rename(replacement)
+            if backup.exists():
+                backup.rename(self.workspace)
+
     def test_user_edit_of_new_pointer_survives_rollback_when_readme_update_fails(
         self,
     ):
