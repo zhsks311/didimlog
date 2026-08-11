@@ -203,6 +203,27 @@ class SetupApplyTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.token, "SETUP_POSTCHECK_FAILED")
 
+    def test_postcheck_rejects_concurrent_project_scaffold_change(self):
+        plan = self._plan()
+        real_apply_git_exclude = setup_module.apply_git_exclude
+
+        def apply_exclude_then_change_scaffold(exclude_plan):
+            real_apply_git_exclude(exclude_plan)
+            (self.project / "knowledge" / "README.md").write_bytes(
+                b"changed concurrently\n"
+            )
+
+        with mock.patch(
+            "didimlog.claude.setup.apply_git_exclude",
+            side_effect=apply_exclude_then_change_scaffold,
+        ):
+            with self.assertRaises(DidimError) as caught:
+                self._apply(plan)
+
+        self.assertEqual(caught.exception.token, "SETUP_POSTCHECK_FAILED")
+        self.assertFalse((self.config / "CLAUDE.md").exists())
+        self.assertFalse((self.config / "settings.json").exists())
+
     def test_apply_runs_each_stage_in_the_approved_order(self):
         plan = self._plan()
         calls = mock.Mock()

@@ -287,9 +287,9 @@ def _apply_personal(plan: _PersonalSetupPlan) -> None:
 def _postcheck(plan: SetupPlan) -> tuple[str, ...]:
     if _personal_check(plan._personal.root) != PERSONAL_INDEX_CURRENT:
         raise DidimError("SETUP_POSTCHECK_FAILED", exit_code=EXIT_POLICY)
-    if (
-        plan._project_root is not None
-        and _project_check(plan._project_root) != PROJECT_INDEX_CURRENT
+    if plan._project_root is not None and (
+        not _prepared_project(plan._project_root)
+        or _project_check(plan._project_root) != PROJECT_INDEX_CURRENT
     ):
         raise DidimError("SETUP_POSTCHECK_FAILED", exit_code=EXIT_POLICY)
     if plan._claude is not None:
