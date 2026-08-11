@@ -144,74 +144,6 @@ def _write_all_and_sync(descriptor: int, content: bytes) -> None:
     os.fsync(descriptor)
 
 
-def _rollback_created_file_at(
-    parent_descriptor: int,
-    name: str,
-    published_identity: tuple[int, int],
-) -> None:
-    recovery_name: str | None = None
-    keep_recovery = False
-    try:
-        try:
-            recovery_name, recovery_descriptor = _temporary_file(
-                parent_descriptor,
-                0o600,
-            )
-        except (OSError, ValueError):
-            return
-        try:
-            os.close(recovery_descriptor)
-        except OSError:
-            return
-
-        try:
-            os.rename(
-                name,
-                recovery_name,
-                src_dir_fd=parent_descriptor,
-                dst_dir_fd=parent_descriptor,
-            )
-        except FileNotFoundError:
-            return
-        except OSError:
-            return
-
-        try:
-            quarantined = os.stat(
-                recovery_name,
-                dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-        except OSError:
-            keep_recovery = True
-            return
-        if (quarantined.st_dev, quarantined.st_ino) == published_identity:
-            return
-
-        try:
-            os.link(
-                recovery_name,
-                name,
-                src_dir_fd=parent_descriptor,
-                dst_dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-        except FileExistsError:
-            keep_recovery = True
-        except OSError:
-            keep_recovery = True
-    finally:
-        if recovery_name is not None and not keep_recovery:
-            try:
-                os.unlink(recovery_name, dir_fd=parent_descriptor)
-            except OSError:
-                pass
-        try:
-            os.fsync(parent_descriptor)
-        except OSError:
-            pass
-
-
 def read_optional_regular_file(
     path: Path,
     maximum_bytes: int,
@@ -248,8 +180,6 @@ def write_regular_file_if_unchanged(
     parent_descriptor = _open_parent(target)
     lock_descriptor: int | None = None
     temporary_name: str | None = None
-    published_identity: tuple[int, int] | None = None
-    created_published = False
     try:
         lock_descriptor = acquire_directory_lock(parent_descriptor)
         maximum_bytes = 0 if original is None else len(original)
@@ -278,11 +208,6 @@ def write_regular_file_if_unchanged(
             )
             try:
                 _write_all_and_sync(temporary_descriptor, intended)
-                temporary_info = os.fstat(temporary_descriptor)
-                published_identity = (
-                    temporary_info.st_dev,
-                    temporary_info.st_ino,
-                )
             finally:
                 os.close(temporary_descriptor)
             os.link(
@@ -292,7 +217,6 @@ def write_regular_file_if_unchanged(
                 dst_dir_fd=parent_descriptor,
                 follow_symlinks=False,
             )
-            created_published = True
             os.unlink(temporary_name, dir_fd=parent_descriptor)
             temporary_name = None
             os.fsync(parent_descriptor)
@@ -317,12 +241,6 @@ def write_regular_file_if_unchanged(
     except ValueError:
         raise
     except OSError:
-        if created_published and published_identity is not None:
-            _rollback_created_file_at(
-                parent_descriptor,
-                target.name,
-                published_identity,
-            )
         raise ValueError("target could not be written atomically") from None
     finally:
         if temporary_name is not None:

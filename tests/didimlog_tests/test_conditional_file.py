@@ -226,7 +226,7 @@ class ConditionalWriteTests(unittest.TestCase):
                 ["target"],
             )
 
-    def test_temporary_unlink_failure_rolls_back_created_target_and_closes_fd(self):
+    def test_temporary_unlink_failure_preserves_created_target_and_closes_fd(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             target = Path(temporary_directory) / "target"
             real_temporary_file = conditional_file._temporary_file
@@ -273,13 +273,16 @@ class ConditionalWriteTests(unittest.TestCase):
                 str(raised.exception),
                 "target could not be written atomically",
             )
-            self.assertFalse(target.exists())
-            self.assertEqual(list(target.parent.iterdir()), [])
+            self.assertEqual(target.read_bytes(), b"managed\n")
+            self.assertEqual(
+                [entry.name for entry in target.parent.iterdir()],
+                ["target"],
+            )
             self.assertIsNotNone(temporary_descriptor)
             with self.assertRaises(OSError):
                 os.fstat(temporary_descriptor)
 
-    def test_parent_fsync_failure_rolls_back_created_target(self):
+    def test_parent_fsync_failure_preserves_created_target(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             target = Path(temporary_directory) / "target"
             real_fsync = os.fsync
@@ -306,24 +309,28 @@ class ConditionalWriteTests(unittest.TestCase):
                 str(raised.exception),
                 "target could not be written atomically",
             )
-            self.assertFalse(target.exists())
-            self.assertEqual(list(target.parent.iterdir()), [])
+            self.assertEqual(target.read_bytes(), b"managed\n")
+            self.assertEqual(
+                [entry.name for entry in target.parent.iterdir()],
+                ["target"],
+            )
 
-    def test_failed_create_rollback_preserves_concurrent_replacement(self):
+    def test_parent_fsync_failure_preserves_same_inode_concurrent_write(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             target = root / "target"
             concurrent = b"concurrent user bytes\n"
             real_fsync = os.fsync
             failed = False
+            write_inodes = []
 
-            def replace_target_before_directory_fsync(descriptor):
+            def write_target_before_directory_fsync(descriptor):
                 nonlocal failed
                 if not failed and stat.S_ISDIR(os.fstat(descriptor).st_mode):
                     failed = True
-                    replacement = root / "concurrent"
-                    replacement.write_bytes(concurrent)
-                    os.replace(replacement, target)
+                    write_inodes.append(target.stat().st_ino)
+                    target.write_bytes(concurrent)
+                    write_inodes.append(target.stat().st_ino)
                     raise OSError("fsync failed at /private/user/path")
                 return real_fsync(descriptor)
 
@@ -331,7 +338,7 @@ class ConditionalWriteTests(unittest.TestCase):
                 mock.patch.object(
                     conditional_file.os,
                     "fsync",
-                    side_effect=replace_target_before_directory_fsync,
+                    side_effect=write_target_before_directory_fsync,
                 ),
                 self.assertRaises(ValueError) as raised,
             ):
@@ -342,6 +349,7 @@ class ConditionalWriteTests(unittest.TestCase):
                 "target could not be written atomically",
             )
             self.assertEqual(target.read_bytes(), concurrent)
+            self.assertEqual(write_inodes[0], write_inodes[1])
             self.assertEqual(
                 [entry.name for entry in root.iterdir()],
                 ["target"],
