@@ -1,15 +1,12 @@
 import json
 import tempfile
 import unittest
-from unittest import mock
 from pathlib import Path
 
-from didimlog.claude import config
 from didimlog.claude.config import (
     plan_claude_md,
     plan_settings,
     render_managed_block,
-    write_if_unchanged,
 )
 
 
@@ -293,108 +290,6 @@ class SettingsPlanTests(unittest.TestCase):
                 with self.subTest(original=original):
                     with self.assertRaises(ValueError):
                         plan_settings(original, launcher)
-
-
-class ConditionalWriteTests(unittest.TestCase):
-    def test_absent_target_is_created_only_when_still_absent(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            target = Path(temporary_directory) / "CLAUDE.md"
-
-            write_if_unchanged(target, None, b"managed\n")
-
-            self.assertEqual(target.read_bytes(), b"managed\n")
-
-    def test_existing_target_is_replaced_only_when_original_bytes_match(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            target = Path(temporary_directory) / "settings.json"
-            original = b'{"user": true}\n'
-            target.write_bytes(original)
-
-            write_if_unchanged(target, original, b'{"user": true, "new": true}\n')
-
-            self.assertEqual(
-                target.read_bytes(),
-                b'{"user": true, "new": true}\n',
-            )
-
-    def test_concurrent_change_is_refused_without_overwriting_user_bytes(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            target = Path(temporary_directory) / "CLAUDE.md"
-            planned_original = b"# before planning\n"
-            concurrent_bytes = b"# user changed this after planning\n"
-            target.write_bytes(concurrent_bytes)
-
-            with self.assertRaises(ValueError):
-                write_if_unchanged(target, planned_original, b"managed result\n")
-
-            self.assertEqual(target.read_bytes(), concurrent_bytes)
-
-    def test_change_after_final_recheck_is_preserved(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            target = Path(temporary_directory) / "CLAUDE.md"
-            original = b"# before planning\n"
-            concurrent_bytes = b"# user saved during publish\n"
-            target.write_bytes(original)
-            real_read_target = config._read_target
-            calls = 0
-
-            def change_after_recheck(parent_descriptor, name):
-                nonlocal calls
-                result = real_read_target(parent_descriptor, name)
-                calls += 1
-                if calls == 2:
-                    target.write_bytes(concurrent_bytes)
-                return result
-
-            with (
-                mock.patch.object(
-                    config,
-                    "_read_target",
-                    side_effect=change_after_recheck,
-                ),
-                self.assertRaises(ValueError),
-            ):
-                write_if_unchanged(target, original, b"managed result\n")
-
-            self.assertEqual(target.read_bytes(), concurrent_bytes)
-
-    def test_file_created_during_absent_plan_is_not_overwritten(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            target = Path(temporary_directory) / "settings.json"
-            concurrent_bytes = b'{"created": "by user"}\n'
-            target.write_bytes(concurrent_bytes)
-
-            with self.assertRaises(ValueError):
-                write_if_unchanged(target, None, b'{"managed": true}\n')
-
-            self.assertEqual(target.read_bytes(), concurrent_bytes)
-
-    def test_file_removed_after_existing_plan_is_not_recreated(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            target = Path(temporary_directory) / "CLAUDE.md"
-
-            with self.assertRaises(ValueError):
-                write_if_unchanged(target, b"previous bytes\n", b"managed result\n")
-
-            self.assertFalse(target.exists())
-
-    def test_symlink_target_is_refused_without_changing_link_or_destination(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
-            destination = root / "user-owned.md"
-            destination.write_bytes(b"user-owned bytes\n")
-            target = root / "CLAUDE.md"
-            target.symlink_to(destination)
-
-            with self.assertRaises(ValueError):
-                write_if_unchanged(
-                    target,
-                    destination.read_bytes(),
-                    b"managed result\n",
-                )
-
-            self.assertTrue(target.is_symlink())
-            self.assertEqual(destination.read_bytes(), b"user-owned bytes\n")
 
 
 if __name__ == "__main__":

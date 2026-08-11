@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import stat
 
+from didimlog.conditional_file import read_optional_regular_file
 from didimlog.indexing import (
     PERSONAL_INDEX_CURRENT,
     PROJECT_INDEX_CURRENT,
@@ -18,7 +19,11 @@ from didimlog.indexing import (
 from didimlog.personal.paths import data_home
 
 from . import config as config_module
-from .connect import _packaged_resources, _read_optional
+from .connect import (
+    _MANAGED_FILE_MAXIMUM_BYTES,
+    _packaged_resources,
+    _resource_directory_exists,
+)
 from .paths import config_dir, config_target
 
 
@@ -98,7 +103,10 @@ def inspect(*, home=None, cwd=None, config=None) -> tuple[Problem, ...]:
         "CLAUDE.md",
         home=selected_home,
     )
-    claude_raw = _read_optional(claude_path)
+    claude_raw = read_optional_regular_file(
+        claude_path,
+        _MANAGED_FILE_MAXIMUM_BYTES,
+    )
     expected_block = config_module.render_managed_block(selected_config)
     if claude_raw is None or claude_raw.count(expected_block) != 1:
         problems.append(
@@ -109,15 +117,19 @@ def inspect(*, home=None, cwd=None, config=None) -> tuple[Problem, ...]:
             )
         )
 
-    resource_invalid = False
-    for name, expected in _packaged_resources():
-        path = config_target(
-            selected_config,
-            "didimlog/" + name,
-            home=selected_home,
-        )
-        if _read_optional(path) != expected:
-            resource_invalid = True
+    resource_invalid = not _resource_directory_exists(selected_config)
+    if not resource_invalid:
+        for name, expected in _packaged_resources():
+            path = config_target(
+                selected_config,
+                "didimlog/" + name,
+                home=selected_home,
+            )
+            if (
+                read_optional_regular_file(path, _MANAGED_FILE_MAXIMUM_BYTES)
+                != expected
+            ):
+                resource_invalid = True
     if resource_invalid:
         problems.append(
             _problem(
@@ -132,7 +144,12 @@ def inspect(*, home=None, cwd=None, config=None) -> tuple[Problem, ...]:
         "settings.json",
         home=selected_home,
     )
-    launcher = _launcher_from_settings(_read_optional(settings_path))
+    launcher = _launcher_from_settings(
+        read_optional_regular_file(
+            settings_path,
+            _MANAGED_FILE_MAXIMUM_BYTES,
+        )
+    )
     if (
         launcher is None
         or not launcher.is_absolute()
