@@ -8,6 +8,7 @@
 
 - 프로젝트 evidence 경로를 `knowledge/raw/` 아래로 제한하고 scaffold 문서를 현재 CLI 기준으로 정리했습니다.
 - 프로젝트 record와 개인 lesson·index를 같은 source snapshot 잠금 안에서 처리합니다.
+- `setup`은 프로젝트 `knowledge/`를 기본적으로 로컬 Git 저장소의 `info/exclude`로 추적에서 제외하고, 팀 공유가 필요하면 `didim setup --project-knowledge shared`로 선택하게 바꿨습니다.
 
 ### 수정
 

@@ -3,7 +3,7 @@
 Didimlog는 AI와 함께 일하며 확인한 사실, 실험 결과, 재사용할 교훈을 로컬 파일로 남기고 필요한 순간에만 다시 찾게 하는 CLI입니다.
 
 - 개인 지식은 `~/knowledge`에 프로젝트별로 나눠 보존합니다.
-- 프로젝트 지식은 Git 저장소의 `knowledge/records`에 observation, experiment, evidence로 보존합니다.
+- 프로젝트 지식은 프로젝트 디렉터리의 `knowledge/records`에 observation, experiment, evidence로 보존하며 기본적으로 Git 추적에서 제외합니다.
 - Claude Code에는 전체 본문 대신 짧은 조회 지침만 연결합니다.
 - 기존 원문은 덮어쓰거나 삭제하지 않습니다.
 
@@ -41,11 +41,21 @@ didim setup --yes
 `setup`은 다음 작업을 순서대로 수행합니다.
 
 1. `~/knowledge`에 개인 지식 디렉터리와 검색용 index를 준비합니다.
-2. 현재 위치가 Git 저장소라면 프로젝트 `knowledge/` scaffold와 index를 준비합니다.
+2. 현재 위치가 Git 저장소라면 프로젝트 `knowledge/` 폴더와 index를 준비합니다.
 3. Claude Code 설정에 Didimlog가 관리하는 조회 지침과 SessionStart hook을 연결합니다.
 4. 실제 파일과 연결 상태를 다시 검사합니다.
 
 사용자가 직접 작성한 `~/knowledge`, 프로젝트 `knowledge/`, Claude 설정의 사용자 소유 본문은 덮어쓰지 않습니다. 기존 파일과 충돌하거나 symlink·path escape가 발견되면 쓰기 전에 중단합니다.
+
+프로젝트 `knowledge/`의 기본값은 로컬 전용입니다. `.gitignore`를 바꾸지 않고 현재 로컬 Git 저장소가 사용하는 `info/exclude` 파일(일반 저장소의 `.git/info/exclude`)에 `/knowledge/` 규칙을 추가합니다. 같은 로컬 저장소에 연결된 작업 트리(linked worktree)는 이 파일을 공유하므로 한 작업 트리의 설정이 다른 연결된 작업 트리에도 적용됩니다.
+
+프로젝트 지식을 팀과 공유하려면 다음 명령으로 `shared`를 선택합니다.
+
+```sh
+didim setup --project-knowledge shared
+```
+
+`shared`는 로컬 제외 설정에서 Didimlog 관리 표시로 둘러싼 블록만 제거하고 사용자 규칙은 바꾸지 않습니다. 같은 파일의 다른 규칙, `.gitignore`, 사용자의 전역 제외 설정 등이 `knowledge/`를 계속 제외하면 안내를 표시하므로, Git에 포함하려면 해당 규칙을 직접 바꿔야 합니다.
 
 Claude Code를 연결하지 않고 저장 공간만 준비하려면 다음 명령을 사용합니다.
 
