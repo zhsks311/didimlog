@@ -226,6 +226,127 @@ class ConditionalWriteTests(unittest.TestCase):
                 ["target"],
             )
 
+    def test_temporary_unlink_failure_rolls_back_created_target_and_closes_fd(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            target = Path(temporary_directory) / "target"
+            real_temporary_file = conditional_file._temporary_file
+            real_unlink = os.unlink
+            temporary_descriptor = None
+            failed = False
+
+            def capture_temporary_descriptor(*args, **kwargs):
+                nonlocal temporary_descriptor
+                result = real_temporary_file(*args, **kwargs)
+                if temporary_descriptor is None:
+                    temporary_descriptor = result[1]
+                return result
+
+            def fail_first_temporary_unlink(path, *args, **kwargs):
+                nonlocal failed
+                if (
+                    not failed
+                    and isinstance(path, str)
+                    and path.startswith(".didimlog-")
+                    and path.endswith(".tmp")
+                ):
+                    failed = True
+                    raise OSError("unlink failed at /private/user/path")
+                return real_unlink(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    conditional_file,
+                    "_temporary_file",
+                    side_effect=capture_temporary_descriptor,
+                ),
+                mock.patch.object(
+                    conditional_file.os,
+                    "unlink",
+                    side_effect=fail_first_temporary_unlink,
+                ),
+                self.assertRaises(ValueError) as raised,
+            ):
+                write_regular_file_if_unchanged(target, None, b"managed\n")
+
+            self.assertIsNone(raised.exception.__cause__)
+            self.assertEqual(
+                str(raised.exception),
+                "target could not be written atomically",
+            )
+            self.assertFalse(target.exists())
+            self.assertEqual(list(target.parent.iterdir()), [])
+            self.assertIsNotNone(temporary_descriptor)
+            with self.assertRaises(OSError):
+                os.fstat(temporary_descriptor)
+
+    def test_parent_fsync_failure_rolls_back_created_target(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            target = Path(temporary_directory) / "target"
+            real_fsync = os.fsync
+            failed = False
+
+            def fail_first_directory_fsync(descriptor):
+                nonlocal failed
+                if not failed and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                    failed = True
+                    raise OSError("fsync failed at /private/user/path")
+                return real_fsync(descriptor)
+
+            with (
+                mock.patch.object(
+                    conditional_file.os,
+                    "fsync",
+                    side_effect=fail_first_directory_fsync,
+                ),
+                self.assertRaises(ValueError) as raised,
+            ):
+                write_regular_file_if_unchanged(target, None, b"managed\n")
+
+            self.assertEqual(
+                str(raised.exception),
+                "target could not be written atomically",
+            )
+            self.assertFalse(target.exists())
+            self.assertEqual(list(target.parent.iterdir()), [])
+
+    def test_failed_create_rollback_preserves_concurrent_replacement(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "target"
+            concurrent = b"concurrent user bytes\n"
+            real_fsync = os.fsync
+            failed = False
+
+            def replace_target_before_directory_fsync(descriptor):
+                nonlocal failed
+                if not failed and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                    failed = True
+                    replacement = root / "concurrent"
+                    replacement.write_bytes(concurrent)
+                    os.replace(replacement, target)
+                    raise OSError("fsync failed at /private/user/path")
+                return real_fsync(descriptor)
+
+            with (
+                mock.patch.object(
+                    conditional_file.os,
+                    "fsync",
+                    side_effect=replace_target_before_directory_fsync,
+                ),
+                self.assertRaises(ValueError) as raised,
+            ):
+                write_regular_file_if_unchanged(target, None, b"managed\n")
+
+            self.assertEqual(
+                str(raised.exception),
+                "target could not be written atomically",
+            )
+            self.assertEqual(target.read_bytes(), concurrent)
+            self.assertEqual(
+                [entry.name for entry in root.iterdir()],
+                ["target"],
+            )
+
     def test_intended_none_is_not_a_delete_operation(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             target = Path(temporary_directory) / "target"
