@@ -425,33 +425,40 @@ def _planned_knowledge_is_ignored(
 ) -> bool:
     excludes_file = _read_optional_config_path(project_root)
     ignore_case = _read_ignore_case(project_root)
-    with tempfile.TemporaryDirectory(prefix="didimlog-git-exclude-") as temporary:
-        git_directory = Path(temporary) / "git"
-        (git_directory / "info").mkdir(parents=True)
-        (git_directory / "objects").mkdir()
-        (git_directory / "refs" / "heads").mkdir(parents=True)
-        (git_directory / "HEAD").write_bytes(b"ref: refs/heads/main\n")
-        (git_directory / "config").write_bytes(
-            b"[core]\n\trepositoryformatversion = 0\n\tbare = false\n"
-        )
-        if intended is not None:
-            (git_directory / "info" / "exclude").write_bytes(intended)
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="didimlog-git-exclude-"
+        ) as temporary:
+            git_directory = Path(temporary) / "git"
+            (git_directory / "info").mkdir(parents=True)
+            (git_directory / "objects").mkdir()
+            (git_directory / "refs" / "heads").mkdir(parents=True)
+            (git_directory / "HEAD").write_bytes(b"ref: refs/heads/main\n")
+            (git_directory / "config").write_bytes(
+                b"[core]\n\trepositoryformatversion = 0\n\tbare = false\n"
+            )
+            if intended is not None:
+                (git_directory / "info" / "exclude").write_bytes(intended)
 
-        arguments = [
-            f"--git-dir={git_directory}",
-            f"--work-tree={project_root}",
-            "-c",
-            f"core.ignoreCase={'true' if ignore_case else 'false'}",
-        ]
-        if excludes_file is not None:
-            arguments.extend(("-c", f"core.excludesFile={excludes_file}"))
-        arguments.extend(("check-ignore", "--no-index", "-q", "--", "knowledge/"))
-        result = _run_git(
-            project_root,
-            tuple(arguments),
-            allowed_returncodes=(0, 1),
-        )
-        return result.returncode == 0
+            arguments = [
+                f"--git-dir={git_directory}",
+                f"--work-tree={project_root}",
+                "-c",
+                f"core.ignoreCase={'true' if ignore_case else 'false'}",
+            ]
+            if excludes_file is not None:
+                arguments.extend(("-c", f"core.excludesFile={excludes_file}"))
+            arguments.extend(
+                ("check-ignore", "--no-index", "-q", "--", "knowledge/")
+            )
+            result = _run_git(
+                project_root,
+                tuple(arguments),
+                allowed_returncodes=(0, 1),
+            )
+            return result.returncode == 0
+    except OSError as error:
+        raise _git_unavailable() from error
 
 
 def _actual_knowledge_is_ignored(project_root: Path) -> bool:
@@ -553,6 +560,8 @@ def apply_git_exclude(plan: GitExcludePlan) -> None:
     ignored = _actual_knowledge_is_ignored(root)
     if plan.mode == "local" and not ignored:
         raise _conflict()
+    if plan.mode == "shared" and ignored != bool(plan.notices):
+        raise _changed()
 
 
 def project_knowledge_is_ignored(project_root: Path) -> bool:

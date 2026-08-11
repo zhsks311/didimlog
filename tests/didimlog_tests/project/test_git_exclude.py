@@ -353,6 +353,21 @@ class GitExcludeContractTests(ErrorContractMixin, unittest.TestCase):
 
         self.assertTrue(plan.notices)
 
+    def test_dry_run_temp_metadata_oserror_is_path_free_git_unavailable(self):
+        leaked_temporary_path = self.root / "private-temp-metadata"
+        failure = OSError(f"cannot create {leaked_temporary_path}")
+
+        with self.isolated_environment(), mock.patch(
+            "didimlog.project.git_exclude.tempfile.TemporaryDirectory",
+            side_effect=failure,
+        ):
+            error = self.assert_token(
+                "PROJECT_EXCLUDE_GIT_UNAVAILABLE",
+                lambda: plan_git_exclude(self.project, "shared"),
+            )
+        self.assertNotIn(str(leaked_temporary_path), str(error))
+        self.assertNotIn(str(leaked_temporary_path), error.help_text)
+
     def test_apply_sets_and_removes_effective_ignore_without_changing_gitignore_or_index(self):
         gitignore = self.project / ".gitignore"
         gitignore.write_bytes(b"user rule\n")
@@ -368,6 +383,26 @@ class GitExcludeContractTests(ErrorContractMixin, unittest.TestCase):
 
         self.assertEqual(gitignore.read_bytes(), before_gitignore)
         self.assertEqual(self.git(self.project, "ls-files", "-z").stdout, before_index)
+
+    def test_shared_apply_rejects_notice_state_changed_after_revalidation(self):
+        path = self.exclude_path()
+        path.write_bytes(LF_BLOCK)
+        plan = self.call(plan_git_exclude, self.project, "shared")
+        self.assertFalse(plan.notices)
+        real_writer = conditional_file.write_regular_file_if_unchanged
+
+        def write_then_add_other_ignore(path, original, intended):
+            real_writer(path, original, intended)
+            (self.project / ".gitignore").write_bytes(b"/knowledge/\n")
+
+        with self.isolated_environment(), mock.patch(
+            "didimlog.project.git_exclude.write_regular_file_if_unchanged",
+            side_effect=write_then_add_other_ignore,
+        ):
+            self.assert_token(
+                "PROJECT_EXCLUDE_CHANGED",
+                lambda: apply_git_exclude(plan),
+            )
 
     def test_concurrent_create_change_and_delete_are_rejected_without_overwrite(self):
         path = self.exclude_path()
