@@ -9,12 +9,15 @@
 - 프로젝트 evidence 경로를 `knowledge/raw/` 아래로 제한하고 scaffold 문서를 현재 CLI 기준으로 정리했습니다.
 - 프로젝트 record와 개인 lesson·index를 같은 source snapshot 잠금 안에서 처리합니다.
 - `setup`은 프로젝트 `knowledge/`를 기본적으로 로컬 Git 저장소의 `info/exclude`로 추적에서 제외하고, 팀 공유가 필요하면 `didim setup --project-knowledge shared`로 선택하게 바꿨습니다.
+- 설치되는 프로젝트 안내를 실제 `didim add` 동작에 맞춰 ID 자동 할당과 experiment의 `contradicts` 입력 방식을 명확히 했습니다.
 
 ### 수정
 
 - 경로를 검사한 뒤 파일이 교체되는 경쟁과 부분 record가 최종 파일명으로 노출될 수 있는 문제를 막았습니다.
 - 조회 A/B의 각 case가 독립된 `HOME`과 Claude 설정을 사용하고, Claude 자식 프로세스에는 검증된 OAuth access token과 실행에 필요한 환경만 전달하도록 격리했습니다.
 - 비밀값이 포함된 lesson은 값을 출력하지 않고 `LESSON_SECRET`과 exit `5`로 거부합니다.
+- `disconnect`가 관리 문서를 복원하지 못해도 최상위 Claude 설정 rollback을 계속 수행하도록 수정했습니다.
+- 배포 전에 `SHA256SUMS`가 wheel과 sdist를 정확히 모두 포함하는지 확인하도록 강화했습니다.
 
 ## [0.0.1] - 2026-08-05
 

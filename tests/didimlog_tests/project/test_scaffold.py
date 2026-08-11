@@ -102,6 +102,7 @@ class ScaffoldTests(unittest.TestCase):
             plan.directories = ()
 
         planned = self._planned_bytes(plan)
+        readme = planned[pathlib.Path("knowledge/README.md")].decode("utf-8")
         self.assertTrue(planned[pathlib.Path("knowledge/README.md")].startswith(
             b"# Knowledge Harness (v1)"
         ))
@@ -109,6 +110,17 @@ class ScaffoldTests(unittest.TestCase):
             b"knowledge-harness-tutorial.html",
             planned[pathlib.Path("knowledge/README.md")],
         )
+        self.assertIn(
+            "`didim add`는\n"
+            "  `--date YYYY-MM-DD`와 기존 record를 기준으로 ID의 날짜와 두 자리 순번을 자동 할당한다.",
+            readme,
+        )
+        self.assertIn(
+            "`didim add experiment`는 JSON stdin의 `contradicts` 필드로 모순 ID를 입력한다.",
+            readme,
+        )
+        self.assertNotIn("사람이 직접 지정하며", readme)
+        self.assertNotIn("--contradicts", readme)
         self.assertEqual(planned[pathlib.Path("knowledge/POINTER.md")], POINTER)
         schema = json.loads(
             planned[pathlib.Path("knowledge/schema/record.schema.json")].decode("utf-8")

@@ -3,7 +3,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from didimlog.claude import connect as connect_module
 from didimlog.claude.connect import (
     ClaudeChangePlan,
     apply_connect,
@@ -322,6 +324,73 @@ class DisconnectTests(unittest.TestCase):
             self.assertFalse(usage.exists())
             self.assertEqual(rules.read_bytes(), custom_rules)
             self.assertEqual(user_resource.read_bytes(), b"user resource must remain\n")
+
+    def test_resource_restore_failure_still_rolls_back_top_level_files_and_reraises_original_disconnect_failure(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            home = root / "home"
+            config = home / ".claude"
+            config.mkdir(parents=True)
+            launcher = make_launcher(home)
+            claude_md = config / "CLAUDE.md"
+            settings = config / "settings.json"
+            claude_md.write_bytes(b"# user rules\n")
+            settings.write_bytes(b'{"theme":"dark"}\n')
+            apply_connect(
+                plan_connect(
+                    config,
+                    launcher=launcher,
+                    environ={},
+                    home=home,
+                ),
+                make_journal(root, "before-failed-disconnect"),
+            )
+            connected_claude = claude_md.read_bytes()
+            connected_settings = settings.read_bytes()
+            disconnect_plan = plan_disconnect(config, environ={}, home=home)
+            removals = tuple(
+                change
+                for change in disconnect_plan._files
+                if change.intended is None
+            )
+            self.assertEqual(len(removals), len(RESOURCE_NAMES))
+            removal_to_restore, removal_to_fail = removals
+            removal_to_fail.path.write_bytes(
+                b"user changed resource after disconnect planning\n"
+            )
+            original_write = connect_module.write_regular_file_if_unchanged
+            restoration_failure = OSError("forced managed resource restoration failure")
+            restoration_attempts = 0
+
+            def fail_deleted_resource_restoration(
+                path: Path,
+                expected: bytes | None,
+                intended: bytes | None,
+            ) -> None:
+                nonlocal restoration_attempts
+                if path == removal_to_restore.path and expected is None:
+                    restoration_attempts += 1
+                    raise restoration_failure
+                original_write(path, expected, intended)
+
+            with mock.patch.object(
+                connect_module,
+                "write_regular_file_if_unchanged",
+                side_effect=fail_deleted_resource_restoration,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^managed resource changed after planning$",
+                ):
+                    apply_disconnect(
+                        disconnect_plan,
+                        make_journal(root, "failed-disconnect"),
+                    )
+
+            self.assertEqual(restoration_attempts, 1)
+            self.assertEqual(claude_md.read_bytes(), connected_claude)
+            self.assertEqual(settings.read_bytes(), connected_settings)
+
 
     def test_disconnect_of_an_unconnected_profile_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

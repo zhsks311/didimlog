@@ -41,11 +41,16 @@ jobs:
           TAG: ${{ github.event.release.tag_name }}
         run: |
           version="${TAG#v}"
-          test -f "packages/didimlog-${version}-py3-none-any.whl"
-          test -f "packages/didimlog-${version}.tar.gz"
+          wheel_filename="didimlog-${version}-py3-none-any.whl"
+          sdist_filename="didimlog-${version}.tar.gz"
+          test -f "packages/${wheel_filename}"
+          test -f "packages/${sdist_filename}"
           test "$(find packages -type f | wc -l)" -eq 2
+          expected_filenames="$(printf '%s\n' "${wheel_filename}" "${sdist_filename}" | sort)"
+          manifest_filenames="$(awk 'length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ && NF == 2 && (substr($0, 65, 2) == "  " || substr($0, 65, 2) == " *") { print substr($0, 67); next } { exit 1 }' verify/SHA256SUMS | sort)"
+          test "${manifest_filenames}" = "${expected_filenames}"
           cd packages
-          sha256sum --check ../verify/SHA256SUMS
+          sha256sum --strict --check ../verify/SHA256SUMS
       - name: Publish with PyPI Trusted Publishing
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
