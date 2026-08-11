@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import stat
 import subprocess
 import tempfile
@@ -547,6 +548,90 @@ def _rollback_revision(info: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _quarantine_created_exclude_at(
+    parent_descriptor: int,
+    name: str,
+    published_identity: tuple[int, int],
+) -> None:
+    recovery_name: str | None = None
+    keep_recovery = False
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        for _ in range(32):
+            candidate = (
+                ".didimlog-exclude-"
+                + secrets.token_hex(12)
+                + ".rollback"
+            )
+            try:
+                recovery_descriptor = os.open(
+                    candidate,
+                    flags,
+                    0o600,
+                    dir_fd=parent_descriptor,
+                )
+            except FileExistsError:
+                continue
+            except OSError:
+                return
+            recovery_name = candidate
+            try:
+                os.close(recovery_descriptor)
+            except OSError:
+                return
+            break
+        if recovery_name is None:
+            return
+
+        try:
+            os.rename(
+                name,
+                recovery_name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+        except OSError:
+            return
+        try:
+            quarantined = os.stat(
+                recovery_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError:
+            keep_recovery = True
+            return
+        if (quarantined.st_dev, quarantined.st_ino) == published_identity:
+            return
+
+        try:
+            os.link(
+                recovery_name,
+                name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except (FileExistsError, OSError):
+            keep_recovery = True
+    finally:
+        if recovery_name is not None and not keep_recovery:
+            try:
+                os.unlink(recovery_name, dir_fd=parent_descriptor)
+            except OSError:
+                pass
+        try:
+            os.fsync(parent_descriptor)
+        except OSError:
+            pass
+
+
 def _delete_created_exclude_if_unchanged(path: Path, intended: bytes) -> None:
     parent_descriptor: int | None = None
     lock_descriptor: int | None = None
@@ -577,8 +662,11 @@ def _delete_created_exclude_if_unchanged(path: Path, intended: bytes) -> None:
         )
         if _rollback_revision(current) != _rollback_revision(opened):
             return
-        os.unlink(path.name, dir_fd=parent_descriptor)
-        os.fsync(parent_descriptor)
+        _quarantine_created_exclude_at(
+            parent_descriptor,
+            path.name,
+            (opened.st_dev, opened.st_ino),
+        )
     except (OSError, RuntimeError, ValueError):
         return
     finally:
