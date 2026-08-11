@@ -1,3 +1,4 @@
+import hashlib
 import shutil
 import subprocess
 import tempfile
@@ -18,6 +19,48 @@ date: 2026-08-05
 ## 교훈
 index는 원본 전체와 일치해야 한다.
 """
+
+
+def _legacy_readme(current):
+    replacements = (
+        (
+            (
+                "- ID 형식은 `PREFIX-YYYYMMDD-NN` (예: `OBS-20260714-01`). "
+                "`didim add`는\n"
+                "  `--date YYYY-MM-DD`와 기존 record를 기준으로 ID의 날짜와 두 자리 "
+                "순번을 자동 할당한다."
+            ),
+            (
+                "- ID 형식은 `PREFIX-YYYYMMDD-NN` (예: `OBS-20260714-01`). "
+                "날짜와 2자리 순번을\n"
+                "  사람이 직접 지정하며 자동 추측하지 않는다."
+            ),
+        ),
+        (
+            (
+                "`didim add experiment`는 JSON stdin의 `contradicts` 필드로 모순 ID를 "
+                "입력한다. 값은\n"
+                '모순이 없으면 `"none"`, 있으면 `"<ID>, <ID>, ..."`인 문자열이다. '
+                "이 필드는 필수이며\n"
+                "기본값도 추론도 없다."
+            ),
+            (
+                "`didim add experiment`는 `--contradicts`가 필수이며 기본값도 "
+                "추론도 없다."
+            ),
+        ),
+    )
+    text = current.decode("utf-8")
+    for current_paragraph, legacy_paragraph in replacements:
+        assert text.count(current_paragraph) == 1
+        text = text.replace(current_paragraph, legacy_paragraph)
+    legacy = text.encode("utf-8")
+    assert len(legacy) == 16_336
+    assert (
+        hashlib.sha256(legacy).hexdigest()
+        == "6347d06afaab04f94c9f409717e0539add7252d000e5b0d51ea68d00036b0961"
+    )
+    return legacy
 
 
 class IndexServiceTests(unittest.TestCase):
@@ -116,6 +159,33 @@ class IndexServiceTests(unittest.TestCase):
         self.assertEqual(result.project, "프로젝트 근거: PROJECT_INDEX_MISSING")
         self.assertFalse(personal_index.exists())
         self.assertFalse(project_index.exists())
+
+    def test_exact_legacy_readme_remains_prepared_for_index_check_and_write(self):
+        project = self._git_project()
+        readme = project / "knowledge" / "README.md"
+        legacy = _legacy_readme(readme.read_bytes())
+        readme.write_bytes(legacy)
+        project_index = project / "knowledge" / "index" / "INDEX.md"
+
+        check_result = run_index(check=True, home=self.home, cwd=project)
+
+        self.assertEqual(check_result.project_token, "PROJECT_INDEX_MISSING")
+        self.assertEqual(
+            check_result.project,
+            "프로젝트 근거: PROJECT_INDEX_MISSING",
+        )
+        self.assertFalse(project_index.exists())
+        self.assertEqual(readme.read_bytes(), legacy)
+
+        write_result = run_index(check=False, home=self.home, cwd=project)
+
+        self.assertEqual(write_result.project_token, "PROJECT_INDEX_WRITTEN")
+        self.assertEqual(
+            write_result.project,
+            "프로젝트 근거: PROJECT_INDEX_WRITTEN",
+        )
+        self.assertTrue(project_index.is_file())
+        self.assertEqual(readme.read_bytes(), legacy)
 
     def test_check_distinguishes_stale_and_never_rewrites_current_bytes(self):
         project = self._git_project()

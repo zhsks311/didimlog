@@ -101,13 +101,43 @@ def _read_record(path):
     return frontmatter, body
 
 
-def _capture_in_process(workspace, body, ready, start, results):
-    ready.put(True)
-    if not start.wait(10):
-        results.put(("error", "start timeout"))
-        return
+def _capture_in_process(
+    workspace,
+    body,
+    ready,
+    start,
+    results,
+    pause_after_scaffold_plan=False,
+):
+    if pause_after_scaffold_plan:
+        real_require_scaffold = capture_module._require_scaffold
+        paused = False
+
+        def require_scaffold_then_pause(scaffold_workspace):
+            nonlocal paused
+            plan = real_require_scaffold(scaffold_workspace)
+            if not paused:
+                paused = True
+                ready.put(plan.updates)
+                if not start.wait(10):
+                    raise RuntimeError("start timeout")
+            return plan
+
+        capture_context = mock.patch.object(
+            capture_module,
+            "_require_scaffold",
+            side_effect=require_scaffold_then_pause,
+        )
+    else:
+        ready.put(True)
+        if not start.wait(10):
+            results.put(("error", "start timeout"))
+            return
+        capture_context = contextlib.nullcontext()
+
     try:
-        path = capture(pathlib.Path(workspace), _observation_request(body))
+        with capture_context:
+            path = capture(pathlib.Path(workspace), _observation_request(body))
     except BaseException as error:
         results.put(("error", type(error).__name__, str(error)))
     else:
@@ -756,6 +786,68 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(len(documents), 2)
         for body in bodies:
             self.assertEqual(sum(body in document for document in documents), 1)
+
+    def test_two_processes_migrate_same_legacy_readme_and_preserve_both_captures(
+        self,
+    ):
+        readme = self.workspace / "knowledge/README.md"
+        current_readme = readme.read_bytes()
+        readme.write_bytes(_legacy_readme(current_readme))
+        context = multiprocessing.get_context("spawn")
+        plan_ready = context.Queue()
+        migrate = context.Event()
+        results = context.Queue()
+        bodies = ("첫 legacy migration 원문", "둘째 legacy migration 원문")
+        processes = [
+            context.Process(
+                target=_capture_in_process,
+                args=(
+                    str(self.workspace),
+                    body,
+                    plan_ready,
+                    migrate,
+                    results,
+                    True,
+                ),
+            )
+            for body in bodies
+        ]
+        for process in processes:
+            process.start()
+        plans = [plan_ready.get(timeout=10) for _ in processes]
+        migrate.set()
+        self.assertEqual(plans[0], plans[1])
+        self.assertEqual(len(plans[0]), 1)
+        for process in processes:
+            process.join(15)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+            self.assertEqual(process.exitcode, 0)
+
+        outcomes = [results.get(timeout=5) for _ in processes]
+        self.assertEqual(
+            {outcome[0] for outcome in outcomes},
+            {"ok"},
+            outcomes,
+        )
+        self.assertEqual(
+            {outcome[1] for outcome in outcomes},
+            {"OBS-20260714-01.md", "OBS-20260714-02.md"},
+        )
+        documents = [
+            path.read_text(encoding="utf-8")
+            for path in sorted(
+                (self.workspace / "knowledge" / "records" / "observation").glob(
+                    "OBS-*.md"
+                )
+            )
+        ]
+        self.assertEqual(len(documents), 2)
+        for body in bodies:
+            self.assertEqual(sum(body in document for document in documents), 1)
+        self.assertEqual(readme.read_bytes(), current_readme)
 
     def test_index_callback_failure_preserves_record_and_reports_stable_recovery_line(self):
         try:

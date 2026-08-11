@@ -282,6 +282,23 @@ class ScaffoldTests(unittest.TestCase):
         apply_scaffold(plan)
         self.assertEqual(readme.read_bytes(), current)
 
+    def test_stale_legacy_update_plan_is_idempotent_after_another_apply(self):
+        initial_plan = plan_scaffold(self.workspace)
+        current = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        readme = self.workspace / "knowledge/README.md"
+        readme.write_bytes(_legacy_readme(current))
+        stale_plan = plan_scaffold(self.workspace)
+
+        apply_scaffold(stale_plan)
+        migrated_timestamp = readme.stat().st_mtime_ns
+        apply_scaffold(stale_plan)
+
+        self.assertEqual(readme.read_bytes(), current)
+        self.assertEqual(readme.stat().st_mtime_ns, migrated_timestamp)
+
     def test_readme_changed_after_legacy_migration_plan_aborts_without_overwrite(self):
         initial_plan = plan_scaffold(self.workspace)
         current = self._planned_bytes(initial_plan)[
@@ -297,6 +314,107 @@ class ScaffoldTests(unittest.TestCase):
         self._assert_policy_error(lambda: apply_scaffold(plan))
 
         self.assertEqual(readme.read_bytes(), user_bytes)
+
+    def test_workspace_replaced_by_symlink_after_preflight_cannot_redirect_legacy_update(
+        self,
+    ):
+        initial_plan = plan_scaffold(self.workspace)
+        current = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        legacy = _legacy_readme(current)
+        readme = self.workspace / "knowledge/README.md"
+        readme.write_bytes(legacy)
+        plan = plan_scaffold(self.workspace)
+
+        outside = self.root / "outside"
+        outside.mkdir()
+        self._make_empty_git_repository(outside)
+        apply_scaffold(plan_scaffold(outside))
+        outside_readme = outside / "knowledge/README.md"
+        outside_readme.write_bytes(legacy)
+
+        backup = self.root / "workspace-backup"
+
+        def restore_workspace():
+            if self.workspace.is_symlink():
+                self.workspace.unlink()
+            if backup.exists() and not self.workspace.exists():
+                backup.rename(self.workspace)
+
+        original_write = scaffold_module._update_scaffold_file_at
+        replaced = False
+
+        def replace_workspace_before_update(
+            parent_descriptor,
+            path,
+            original,
+            intended,
+        ):
+            nonlocal replaced
+            if not replaced:
+                self.workspace.rename(backup)
+                self._symlink(
+                    self.workspace,
+                    outside,
+                    target_is_directory=True,
+                )
+                replaced = True
+            return original_write(parent_descriptor, path, original, intended)
+
+        try:
+            raised = None
+            with mock.patch.object(
+                scaffold_module,
+                "_update_scaffold_file_at",
+                side_effect=replace_workspace_before_update,
+            ):
+                try:
+                    apply_scaffold(plan)
+                except DidimError as error:
+                    raised = error
+
+            with self.subTest("apply rejects the path replacement"):
+                self.assertIsNotNone(raised)
+                if raised is not None:
+                    self.assertEqual(raised.exit_code, EXIT_POLICY)
+            with self.subTest("external scaffold remains untouched"):
+                self.assertEqual(outside_readme.read_bytes(), legacy)
+        finally:
+            restore_workspace()
+
+    def test_user_edit_of_new_pointer_survives_rollback_when_readme_update_fails(
+        self,
+    ):
+        initial_plan = plan_scaffold(self.workspace)
+        current = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        readme = self.workspace / "knowledge/README.md"
+        readme.write_bytes(_legacy_readme(current))
+        pointer = self.workspace / "knowledge/POINTER.md"
+        pointer.unlink()
+        plan = plan_scaffold(self.workspace)
+        user_bytes = b"user edit after pointer creation\n"
+
+        def edit_pointer_then_fail(*_args):
+            created_identity = pointer.stat().st_ino
+            pointer.write_bytes(user_bytes)
+            self.assertEqual(pointer.stat().st_ino, created_identity)
+            raise OSError("injected README update failure")
+
+        with mock.patch.object(
+            scaffold_module,
+            "_update_scaffold_file_at",
+            side_effect=edit_pointer_then_fail,
+        ):
+            self._assert_policy_error(lambda: apply_scaffold(plan))
+
+        self.assertTrue(pointer.exists())
+        self.assertEqual(pointer.read_bytes(), user_bytes)
+
 
 
     def test_regular_file_where_directory_is_required_blocks_all_writes(self):

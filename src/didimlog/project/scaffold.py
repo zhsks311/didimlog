@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
 import stat
 
-from didimlog.conditional_file import write_regular_file_if_unchanged
 from didimlog.errors import DidimError, EXIT_POLICY
 from didimlog.file_io import (
     UnsafePathError,
     read_regular_file_at,
+    read_regular_file_at_with_stat,
     read_regular_file_beneath,
+    replace_regular_file_at_if_unchanged,
 )
+from didimlog.locking import acquire_directory_lock, path_lock
 from didimlog.project.resources import read_project_resource
 
 
@@ -90,7 +93,11 @@ def _require_directory(path: Path) -> None:
         raise _policy_error("SCAFFOLD_CONFLICT", path)
 
 
-def _require_file(path: Path, expected: bytes) -> None:
+def _require_file(
+    path: Path,
+    expected: bytes,
+    alternate: bytes | None = None,
+) -> None:
     metadata = _lstat(path)
     if metadata is None:
         return
@@ -98,11 +105,18 @@ def _require_file(path: Path, expected: bytes) -> None:
         raise _policy_error("PATH_ESCAPE", path)
     if not stat.S_ISREG(metadata.st_mode):
         raise _policy_error("SCAFFOLD_CONFLICT", path)
+    maximum_bytes = len(expected)
+    if alternate is not None:
+        maximum_bytes = max(maximum_bytes, len(alternate))
     try:
-        actual = read_regular_file_beneath(path.parent, path.name, len(expected))
+        actual = read_regular_file_beneath(
+            path.parent,
+            path.name,
+            maximum_bytes,
+        )
     except UnsafePathError as error:
         raise _policy_error("SCAFFOLD_CONFLICT", path) from error
-    if actual != expected:
+    if actual != expected and actual != alternate:
         raise _policy_error("SCAFFOLD_CONFLICT", path)
 
 
@@ -135,11 +149,18 @@ def _legacy_readme(path: Path, expected: bytes) -> bytes | None:
 def _preflight(plan: ScaffoldPlan) -> None:
     workspace = plan.directories[0].parent
     _require_workspace(workspace)
-    originals = {path: original for path, original, _ in plan.updates}
+    updates = {
+        path: (original, intended)
+        for path, original, intended in plan.updates
+    }
     for path in plan.directories:
         _require_directory(path)
     for path, expected in plan.files:
-        _require_file(path, originals.get(path, expected))
+        update = updates.get(path)
+        if update is None:
+            _require_file(path, expected)
+        else:
+            _require_file(path, update[0], update[1])
 
 
 def _validate_plan(plan: ScaffoldPlan) -> Path:
@@ -270,13 +291,45 @@ def _entry_identity(
         os.close(descriptor)
 
 
+def _file_revision(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _entry_revision(
+    parent_descriptor: int,
+    name: str,
+) -> tuple[int, ...] | None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    except OSError:
+        return None
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            return None
+        return _file_revision(metadata)
+    finally:
+        os.close(descriptor)
+
+
 def _rollback(
-    created_files: list[tuple[str, tuple[int, int], int]],
+    created_files: list[tuple[str, tuple[int, ...], int]],
     created_directories: list[tuple[str, tuple[int, int], int]],
 ) -> None:
-    for name, identity, parent_descriptor in reversed(created_files):
+    for name, revision, parent_descriptor in reversed(created_files):
         try:
-            if _entry_identity(parent_descriptor, name, directory=False) == identity:
+            if _entry_revision(parent_descriptor, name) == revision:
                 os.unlink(name, dir_fd=parent_descriptor)
         except OSError:
             pass
@@ -313,7 +366,7 @@ def _create_file(
     path: Path,
     content: bytes,
     parent_descriptor: int,
-) -> tuple[int, int] | None:
+) -> tuple[int, ...] | None:
     parent_metadata = _lstat(path.parent)
     opened_parent = os.fstat(parent_descriptor)
     if (
@@ -340,6 +393,7 @@ def _create_file(
         raise _policy_error("SCAFFOLD_CREATE_FAILED", path) from error
 
     identity: tuple[int, int]
+    revision: tuple[int, ...]
     try:
         metadata = os.fstat(descriptor)
         identity = (metadata.st_dev, metadata.st_ino)
@@ -348,6 +402,7 @@ def _create_file(
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
+            revision = _file_revision(os.fstat(stream.fileno()))
     except OSError as error:
         if descriptor >= 0:
             os.close(descriptor)
@@ -361,18 +416,74 @@ def _create_file(
         except (OSError, UnboundLocalError):
             pass
         raise _policy_error("SCAFFOLD_CREATE_FAILED", path) from error
-    return identity
+    return revision
 
 
-def _apply_scaffold_updates(plan: ScaffoldPlan) -> None:
-    """Apply only validated conditional updates, without creating missing targets."""
-    _validate_plan(plan)
-    _preflight(plan)
-    for path, original, intended in plan.updates:
-        try:
-            write_regular_file_if_unchanged(path, original, intended)
-        except (OSError, ValueError) as error:
-            raise _policy_error("SCAFFOLD_CONFLICT", path) from error
+def _update_scaffold_file_at(
+    parent_descriptor: int,
+    path: Path,
+    original: bytes,
+    intended: bytes,
+) -> None:
+    """Conditionally update one regular file through a pinned directory."""
+    lock_descriptor = acquire_directory_lock(parent_descriptor)
+    try:
+        maximum_bytes = max(len(original), len(intended))
+        current, current_info = read_regular_file_at_with_stat(
+            parent_descriptor,
+            path.name,
+            maximum_bytes,
+        )
+        if current == intended:
+            return
+        if current != original:
+            raise ValueError("scaffold target changed after planning")
+        replaced = replace_regular_file_at_if_unchanged(
+            parent_descriptor,
+            path.name,
+            original,
+            intended,
+            stat.S_IMODE(current_info.st_mode),
+            expected_info=current_info,
+        )
+        if replaced:
+            return
+        current, _ = read_regular_file_at_with_stat(
+            parent_descriptor,
+            path.name,
+            maximum_bytes,
+        )
+        if current != intended:
+            raise ValueError("scaffold target changed before write")
+    finally:
+        os.close(lock_descriptor)
+
+
+def _apply_scaffold_updates(
+    plan: ScaffoldPlan,
+    knowledge_descriptor: int | None = None,
+) -> None:
+    """Apply validated updates through a pinned, locked knowledge directory."""
+    if knowledge_descriptor is None:
+        workspace = _validate_plan(plan)
+    else:
+        workspace = plan.directories[0].parent
+    lock_context = (
+        path_lock(workspace / "knowledge")
+        if knowledge_descriptor is None
+        else nullcontext(knowledge_descriptor)
+    )
+    with lock_context as pinned_knowledge:
+        for path, original, intended in plan.updates:
+            try:
+                _update_scaffold_file_at(
+                    pinned_knowledge,
+                    path,
+                    original,
+                    intended,
+                )
+            except (OSError, UnsafePathError, ValueError) as error:
+                raise _policy_error("SCAFFOLD_CONFLICT", path) from error
 
 
 def apply_scaffold(plan: ScaffoldPlan) -> None:
@@ -391,7 +502,7 @@ def apply_scaffold(plan: ScaffoldPlan) -> None:
         workspace: (workspace_metadata.st_dev, workspace_metadata.st_ino)
     }
     created_directories: list[tuple[str, tuple[int, int], int]] = []
-    created_files: list[tuple[str, tuple[int, int], int]] = []
+    created_files: list[tuple[str, tuple[int, ...], int]] = []
     try:
         for path in plan.directories:
             _validate_open_directories(
@@ -428,13 +539,22 @@ def apply_scaffold(plan: ScaffoldPlan) -> None:
                 identities,
             )
             parent_descriptor = descriptors[path.parent]
-            identity = _create_file(path, content, parent_descriptor)
-            if identity is not None:
+            revision = _create_file(path, content, parent_descriptor)
+            if revision is not None:
                 created_files.append(
-                    (path.name, identity, os.dup(parent_descriptor))
+                    (path.name, revision, os.dup(parent_descriptor))
                 )
         if plan.updates:
-            _apply_scaffold_updates(plan)
+            _apply_scaffold_updates(
+                plan,
+                descriptors[workspace / "knowledge"],
+            )
+            _validate_open_directories(
+                workspace,
+                workspace / "knowledge",
+                descriptors,
+                identities,
+            )
     except BaseException:
         _rollback(created_files, created_directories)
         raise
