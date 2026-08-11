@@ -344,13 +344,17 @@ def apply_setup(plan: SetupPlan, *, approved: bool) -> tuple[str, ...]:
         raise DidimError("SETUP_PLAN_INVALID", exit_code=EXIT_POLICY)
 
     _apply_personal(plan._personal)
-    personal_index.write_all(
-        data_root=plan._personal.root,
-        target=plan._personal.root / "index",
-    )
+    if _personal_check(plan._personal.root) != PERSONAL_INDEX_CURRENT:
+        personal_index.write_all(
+            data_root=plan._personal.root,
+            target=plan._personal.root / "index",
+        )
     if plan._project is not None:
         apply_scaffold(plan._project)
-    if plan._project_root is not None:
+    if (
+        plan._project_root is not None
+        and _project_check(plan._project_root) != PROJECT_INDEX_CURRENT
+    ):
         write_index(plan._project_root)
     if plan._project_exclude is not None:
         apply_git_exclude(plan._project_exclude)
