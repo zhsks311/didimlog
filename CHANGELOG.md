@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-08-12
+
 ### 변경
 
 - 프로젝트 evidence 경로를 `knowledge/raw/` 아래로 제한하고 scaffold 문서를 현재 CLI 기준으로 정리했습니다.
@@ -30,4 +32,7 @@
 - create-only 원문 저장, symlink/path escape 차단, 조건부 rollback과 상태 진단.
 - macOS·Linux 및 Python 3.11~3.14 지원 계약.
 
+
+[Unreleased]: https://github.com/zhsks311/didimlog/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/zhsks311/didimlog/releases/tag/v0.0.2
 [0.0.1]: https://github.com/zhsks311/didimlog/releases/tag/v0.0.1

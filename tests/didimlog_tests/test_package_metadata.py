@@ -15,7 +15,7 @@ class PackageMetadataTests(unittest.TestCase):
             pyproject = tomllib.load(stream)
 
         self.assertEqual(pyproject["project"]["name"], "didimlog")
-        self.assertEqual(pyproject["project"]["version"], "0.0.1")
+        self.assertEqual(pyproject["project"]["version"], "0.0.2")
         self.assertEqual(pyproject["project"]["requires-python"], ">=3.11")
         self.assertEqual(pyproject["project"]["dependencies"], ["Markdown==3.10.2"])
         self.assertEqual(pyproject["project"]["scripts"], {"didim": "didimlog.cli:main"})
@@ -29,7 +29,7 @@ class PackageMetadataTests(unittest.TestCase):
         import didimlog
 
         installed_version = importlib.metadata.version("didimlog")
-        self.assertEqual(installed_version, "0.0.1")
+        self.assertEqual(installed_version, "0.0.2")
         self.assertEqual(didimlog.version(), installed_version)
 
     def test_console_script_points_to_cli_main(self):
@@ -54,7 +54,7 @@ class PackageMetadataTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "Didimlog 0.0.1\n")
+        self.assertEqual(result.stdout, "Didimlog 0.0.2\n")
         self.assertEqual(result.stderr, "")
 
 

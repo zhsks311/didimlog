@@ -11,7 +11,7 @@ import yaml
 
 
 REPO = Path(__file__).resolve().parents[2]
-VERSION = "0.0.1"
+VERSION = "0.0.2"
 DIST_ROOT = f"didimlog-{VERSION}"
 PUBLIC_SOURCE_FILES = {
     "CHANGELOG.md",
