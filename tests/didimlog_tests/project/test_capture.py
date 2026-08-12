@@ -519,6 +519,544 @@ class CaptureTests(unittest.TestCase):
         )
         self.assertEqual(readme.read_bytes(), current)
 
+    def test_capture_rejects_workspace_replaced_after_scaffold_validation(self):
+        current_readme = (self.workspace / "knowledge/README.md").read_bytes()
+        legacy_readme = _legacy_readme(current_readme)
+        original_readme = self.workspace / "knowledge/README.md"
+        original_readme.write_bytes(legacy_readme)
+
+        replacement = self.root / "replacement"
+        replacement.mkdir()
+        self._git("init", "-q", workspace=replacement)
+        apply_scaffold(plan_scaffold(replacement))
+        replacement_readme = replacement / "knowledge/README.md"
+        replacement_readme.write_bytes(legacy_readme)
+
+        backup = self.root / "workspace-backup"
+        real_require_scaffold = capture_module._require_scaffold
+        replaced = False
+
+        def require_scaffold_then_replace(workspace):
+            nonlocal replaced
+            plan = real_require_scaffold(workspace)
+            if not replaced:
+                self.workspace.rename(backup)
+                replacement.rename(self.workspace)
+                replaced = True
+            return plan
+
+        raised = None
+        with mock.patch.object(
+            capture_module,
+            "_require_scaffold",
+            side_effect=require_scaffold_then_replace,
+        ):
+            try:
+                capture(
+                    self.workspace,
+                    _observation_request("교체된 저장소에 쓰이면 안 됨"),
+                )
+            except DidimError as error:
+                raised = error
+
+        original_record_directory = (
+            backup / "knowledge/records/observation"
+        )
+        replacement_record_directory = (
+            self.workspace / "knowledge/records/observation"
+        )
+        with self.subTest("capture rejects the workspace replacement"):
+            self.assertIsNotNone(raised)
+            if raised is not None:
+                self.assertEqual(raised.exit_code, EXIT_POLICY)
+        with self.subTest("original README bytes remain untouched"):
+            self.assertEqual(
+                (backup / "knowledge/README.md").read_bytes(),
+                legacy_readme,
+            )
+        with self.subTest("original record directory remains empty"):
+            self.assertEqual(list(original_record_directory.iterdir()), [])
+        with self.subTest("replacement README bytes remain untouched"):
+            self.assertEqual(
+                (self.workspace / "knowledge/README.md").read_bytes(),
+                legacy_readme,
+            )
+        with self.subTest("replacement record directory remains empty"):
+            self.assertEqual(list(replacement_record_directory.iterdir()), [])
+
+    def test_capture_preserves_pinned_record_when_workspace_is_replaced_after_publish(self):
+        replacement = self.root / "replacement-after-publish"
+        replacement.mkdir()
+        self._git("init", "-q", workspace=replacement)
+        apply_scaffold(plan_scaffold(replacement))
+        replacement_record = capture(
+            replacement,
+            _observation_request("교체 저장소의 기존 기록"),
+        )
+        replacement_readme = replacement / "knowledge/README.md"
+        replacement_index = replacement / "knowledge/index/INDEX.md"
+        replacement_readme_bytes = b"# Replacement README\n\nuser-owned bytes\n"
+        replacement_index_bytes = b"# Replacement index\n\nuser-owned bytes\n"
+        replacement_readme.write_bytes(replacement_readme_bytes)
+        replacement_index.write_bytes(replacement_index_bytes)
+        replacement_records = replacement / "knowledge/records/observation"
+        replacement_record_bytes = {
+            path.name: path.read_bytes()
+            for path in replacement_records.iterdir()
+        }
+        self.assertEqual(
+            replacement_record_bytes,
+            {replacement_record.name: replacement_record.read_bytes()},
+        )
+
+        backup = self.root / "workspace-after-publish-backup"
+        real_publish = capture_module._write_create_only
+        replaced = False
+
+        def publish_then_replace(target, data):
+            nonlocal replaced
+            real_publish(target, data)
+            if not replaced:
+                self.workspace.rename(backup)
+                replacement.rename(self.workspace)
+                replaced = True
+
+        result = None
+        raised = None
+        with mock.patch.object(
+            capture_module,
+            "_write_create_only",
+            side_effect=publish_then_replace,
+        ):
+            try:
+                result = capture(
+                    self.workspace,
+                    _observation_request("실패 뒤 보존되는 원본 기록"),
+                )
+            except DidimError as error:
+                raised = error
+
+        with self.subTest("capture fails closed after the pathname replacement"):
+            self.assertIsNone(result)
+            self.assertIsNotNone(raised)
+            if raised is not None:
+                self.assertEqual(raised.exit_code, EXIT_POLICY)
+        with self.subTest("the pinned original record is preserved"):
+            original_records = list(
+                (backup / "knowledge/records/observation").iterdir()
+            )
+            self.assertEqual(len(original_records), 1)
+            self.assertEqual(
+                original_records[0].name,
+                "OBS-20260714-01.md",
+            )
+        with self.subTest("the replacement README bytes remain untouched"):
+            self.assertEqual(
+                (self.workspace / "knowledge/README.md").read_bytes(),
+                replacement_readme_bytes,
+            )
+        with self.subTest("the replacement index bytes remain untouched"):
+            self.assertEqual(
+                (self.workspace / "knowledge/index/INDEX.md").read_bytes(),
+                replacement_index_bytes,
+            )
+        with self.subTest("the replacement records remain at their original bytes"):
+            self.assertEqual(
+                {
+                    path.name: path.read_bytes()
+                    for path in (
+                        self.workspace / "knowledge/records/observation"
+                    ).iterdir()
+                },
+                replacement_record_bytes,
+            )
+
+
+    def test_capture_preserves_same_inode_user_edit_when_workspace_is_replaced_after_publish(self):
+        record_directory = (
+            self.workspace / "knowledge/records/observation"
+        )
+        backup = self.root / "observation-after-user-edit-backup"
+        record_name = "OBS-20260714-01.md"
+        request = _observation_request("published bytes")
+        edited_bytes = None
+
+        real_publish = capture_module._write_create_only
+        replaced = False
+
+        def publish_edit_then_replace(target, data):
+            nonlocal edited_bytes, replaced
+            publication = real_publish(target, data)
+            record_path = target.path
+            published_bytes = record_path.read_bytes()
+            self.assertEqual(published_bytes, data)
+            self.assertEqual(published_bytes.count(b"published bytes"), 1)
+            edited_bytes = published_bytes.replace(
+                b"published bytes",
+                b"user edit bytes",
+            )
+            self.assertNotEqual(edited_bytes, published_bytes)
+            self.assertEqual(len(edited_bytes), len(published_bytes))
+            with record_path.open("r+b", buffering=0) as record:
+                record.write(edited_bytes)
+                os.fsync(record.fileno())
+            os.utime(
+                record_path,
+                ns=(publication.st_atime_ns, publication.st_mtime_ns),
+            )
+            edited = record_path.stat()
+            self.assertEqual(
+                (edited.st_dev, edited.st_ino),
+                (publication.st_dev, publication.st_ino),
+            )
+            self.assertEqual(edited.st_mtime_ns, publication.st_mtime_ns)
+            record_directory.rename(backup)
+            record_directory.mkdir()
+            replaced = True
+            return publication
+
+        try:
+            with mock.patch.object(
+                capture_module,
+                "_write_create_only",
+                side_effect=publish_edit_then_replace,
+            ):
+                with self.assertRaises(DidimError) as raised:
+                    capture(self.workspace, request)
+
+            self.assertEqual(raised.exception.exit_code, EXIT_POLICY)
+            self.assertEqual(
+                raised.exception.token,
+                "PROJECT_SCAFFOLD_MISSING",
+            )
+            self.assertEqual(
+                (backup / record_name).read_bytes(),
+                edited_bytes,
+            )
+            self.assertEqual(list(record_directory.iterdir()), [])
+        finally:
+            if replaced:
+                record_directory.rmdir()
+                backup.rename(record_directory)
+
+    def test_capture_preserves_publication_instead_of_racing_a_concurrent_writer(self):
+        record_directory = (
+            self.workspace / "knowledge/records/observation"
+        )
+        backup = self.root / "observation-rollback-race-backup"
+        record_name = "OBS-20260714-01.md"
+        request = _observation_request("published bytes")
+        published_bytes = None
+        replaced = False
+
+        real_publish = capture_module._write_create_only
+
+        def publish_then_replace(target, data):
+            nonlocal published_bytes, replaced
+            publication = real_publish(target, data)
+            published_bytes = target.path.read_bytes()
+            record_directory.rename(backup)
+            record_directory.mkdir()
+            replaced = True
+            return publication
+
+        try:
+            with mock.patch.object(
+                capture_module,
+                "_write_create_only",
+                side_effect=publish_then_replace,
+            ):
+                with self.assertRaises(DidimError) as raised:
+                    capture(self.workspace, request)
+
+            self.assertEqual(raised.exception.exit_code, EXIT_POLICY)
+            self.assertEqual(
+                raised.exception.token,
+                "PROJECT_SCAFFOLD_MISSING",
+            )
+            self.assertEqual(
+                (backup / record_name).read_bytes(),
+                published_bytes,
+            )
+            self.assertEqual(list(record_directory.iterdir()), [])
+        finally:
+            if replaced:
+                record_directory.rmdir()
+                backup.rename(record_directory)
+
+    def test_capture_rejects_record_type_path_replaced_after_descriptor_open(self):
+        record_directory = (
+            self.workspace / "knowledge/records/observation"
+        )
+        backup = self.root / "observation-pinned-backup"
+        replacement = self.root / "observation-path-replacement"
+        real_publish = capture_module._write_create_only
+        replaced = False
+
+        def replace_record_directory_then_publish(target, data):
+            nonlocal replaced
+            if not replaced:
+                record_directory.rename(backup)
+                record_directory.mkdir()
+                replaced = True
+            return real_publish(target, data)
+
+        result = None
+        raised = None
+        try:
+            with mock.patch.object(
+                capture_module,
+                "_write_create_only",
+                side_effect=replace_record_directory_then_publish,
+            ):
+                try:
+                    result = capture(
+                        self.workspace,
+                        _observation_request(
+                            "교체된 record 경로에 성공을 반환하면 안 됨"
+                        ),
+                    )
+                except DidimError as error:
+                    raised = error
+
+            with self.subTest("capture fails closed on the pathname replacement"):
+                self.assertIsNone(result)
+                self.assertIsNotNone(raised)
+                if raised is not None:
+                    self.assertEqual(raised.exit_code, EXIT_POLICY)
+                    self.assertEqual(
+                        raised.token,
+                        "PROJECT_SCAFFOLD_MISSING",
+                    )
+            with self.subTest("the pinned publication is preserved"):
+                publications = list(backup.iterdir())
+                self.assertEqual(len(publications), 1)
+                self.assertEqual(
+                    publications[0].name,
+                    "OBS-20260714-01.md",
+                )
+            with self.subTest("the replacement directory remains untouched"):
+                self.assertEqual(list(record_directory.iterdir()), [])
+        finally:
+            if replaced:
+                if record_directory.exists():
+                    record_directory.rename(replacement)
+                if backup.exists():
+                    backup.rename(record_directory)
+
+    def test_workspace_replacement_rollback_rebuilds_index_from_pinned_records(self):
+        replacement = self.root / "replacement-during-index-rollback"
+        replacement.mkdir()
+        self._git("init", "-q", workspace=replacement)
+        apply_scaffold(plan_scaffold(replacement))
+        replacement_record = capture(
+            replacement,
+            _observation_request("교체 저장소의 기존 기록"),
+        )
+        replacement_index = replacement / "knowledge/index/INDEX.md"
+        replacement_index_bytes = b"# Replacement index\n\nuser-owned bytes\n"
+        replacement_index.write_bytes(replacement_index_bytes)
+        replacement_source_bytes = {
+            path.name: path.read_bytes()
+            for path in (
+                replacement / "knowledge/records/observation"
+            ).iterdir()
+        }
+        self.assertEqual(
+            replacement_source_bytes,
+            {replacement_record.name: replacement_record.read_bytes()},
+        )
+
+        backup = self.root / "workspace-index-rollback-backup"
+        original_records = self.workspace / "knowledge/records/observation"
+        concurrent_path = original_records / "OBS-20260714-99.md"
+        concurrent_bytes = serialize_record(
+            "OBS-20260714-99",
+            "observation",
+            "동시 작성자",
+            "project",
+            DATE,
+            [],
+            [],
+            {"body": "## Observation\n\n동시에 발행된 원문\n"},
+        ).encode("utf-8")
+        real_refresh = capture_module._refresh_index
+        refresh_calls = 0
+        replaced = False
+
+        def refresh_then_publish_concurrent_record_and_replace(
+            workspace,
+            workspace_descriptor,
+            knowledge_descriptor,
+        ):
+            nonlocal refresh_calls, replaced
+            real_refresh(
+                workspace,
+                workspace_descriptor,
+                knowledge_descriptor,
+            )
+            refresh_calls += 1
+            if refresh_calls != 1:
+                return
+
+            with concurrent_path.open("xb") as stream:
+                stream.write(concurrent_bytes)
+                stream.flush()
+                try:
+                    os.fsync(stream.fileno())
+                except OSError:
+                    pass
+            try:
+                record_directory_descriptor = os.open(
+                    original_records,
+                    os.O_RDONLY,
+                )
+                try:
+                    os.fsync(record_directory_descriptor)
+                finally:
+                    os.close(record_directory_descriptor)
+            except OSError:
+                pass
+
+            self.workspace.rename(backup)
+            replacement.rename(self.workspace)
+            replaced = True
+
+        try:
+            with mock.patch.object(
+                capture_module,
+                "_refresh_index",
+                side_effect=refresh_then_publish_concurrent_record_and_replace,
+            ):
+                with self.assertRaises(DidimError) as raised:
+                    capture(
+                        self.workspace,
+                        _observation_request("실패 뒤 보존되어야 하는 원본 기록"),
+                    )
+
+            with self.subTest("capture fails closed after the pathname replacement"):
+                self.assertEqual(raised.exception.exit_code, EXIT_POLICY)
+            backup_records = backup / "knowledge/records/observation"
+            with self.subTest("both complete publications are preserved"):
+                self.assertTrue(
+                    (backup_records / "OBS-20260714-01.md").is_file()
+                )
+                self.assertEqual(
+                    (backup_records / "OBS-20260714-99.md").read_bytes(),
+                    concurrent_bytes,
+                )
+            with self.subTest("the pinned index retains both valid records"):
+                index_text = (
+                    backup / "knowledge/index/INDEX.md"
+                ).read_text(encoding="utf-8")
+                self.assertIn("OBS-20260714-01", index_text)
+                self.assertIn("OBS-20260714-99", index_text)
+            with self.subTest("the replacement index remains user-owned"):
+                self.assertEqual(
+                    (self.workspace / "knowledge/index/INDEX.md").read_bytes(),
+                    replacement_index_bytes,
+                )
+            with self.subTest("the replacement record sources remain untouched"):
+                self.assertEqual(
+                    {
+                        path.name: path.read_bytes()
+                        for path in (
+                            self.workspace / "knowledge/records/observation"
+                        ).iterdir()
+                    },
+                    replacement_source_bytes,
+                )
+        finally:
+            if replaced:
+                self.workspace.rename(replacement)
+                backup.rename(self.workspace)
+
+    def test_capture_allocates_id_from_pinned_snapshot_when_validation_path_is_temporarily_replaced(self):
+        replacement = self.root / "replacement-during-validation"
+        replacement.mkdir()
+        self._git("init", "-q", workspace=replacement)
+        apply_scaffold(plan_scaffold(replacement))
+        replacement_record = capture(
+            replacement,
+            _observation_request("교체 저장소의 첫 기록"),
+        )
+        replacement_record_bytes = replacement_record.read_bytes()
+        backup = self.root / "workspace-during-validation-backup"
+        real_validate_record_tree = capture_module.validate_record_tree
+
+        def validate_replacement_then_restore(workspace):
+            self.workspace.rename(backup)
+            replacement.rename(self.workspace)
+            try:
+                return real_validate_record_tree(workspace)
+            finally:
+                self.workspace.rename(replacement)
+                backup.rename(self.workspace)
+
+        with mock.patch.object(
+            capture_module,
+            "validate_record_tree",
+            side_effect=validate_replacement_then_restore,
+        ):
+            path = capture(
+                self.workspace,
+                _observation_request("고정된 원본의 첫 기록"),
+            )
+
+        original_records = self.workspace / "knowledge/records/observation"
+        expected_path = original_records / "OBS-20260714-01.md"
+        with self.subTest("the result names the first ID in the pinned original"):
+            self.assertEqual(path, expected_path)
+            self.assertIn(
+                "고정된 원본의 첫 기록",
+                expected_path.read_text(encoding="utf-8"),
+            )
+        with self.subTest("no replacement-derived second ID is written"):
+            self.assertEqual(
+                sorted(record.name for record in original_records.iterdir()),
+                ["OBS-20260714-01.md"],
+            )
+            self.assertFalse((original_records / "OBS-20260714-02.md").exists())
+        with self.subTest("the replacement record tree remains untouched"):
+            self.assertEqual(
+                {
+                    record.name: record.read_bytes()
+                    for record in (
+                        replacement / "knowledge/records/observation"
+                    ).iterdir()
+                },
+                {replacement_record.name: replacement_record_bytes},
+            )
+
+    def test_capture_preserves_scaffold_conflict_when_readme_changes_after_plan(self):
+        readme = self.workspace / "knowledge/README.md"
+        current = readme.read_bytes()
+        readme.write_bytes(_legacy_readme(current))
+        user_readme = b"# User README\n\nConcurrent user edit.\n"
+        real_require_scaffold = capture_module._require_scaffold
+
+        def change_readme_after_plan(workspace):
+            legacy_plan = real_require_scaffold(workspace)
+            readme.write_bytes(user_readme)
+            return legacy_plan
+
+        with mock.patch.object(
+            capture_module,
+            "_require_scaffold",
+            side_effect=change_readme_after_plan,
+        ):
+            with self.assertRaises(DidimError) as raised:
+                capture(
+                    self.workspace,
+                    _observation_request("충돌 시 생성되면 안 되는 원문"),
+                )
+
+        self.assertEqual(raised.exception.token, "SCAFFOLD_CONFLICT")
+        self.assertEqual(readme.read_bytes(), user_readme)
+        self.assertFalse(
+            self._record_path("observation", "OBS-20260714-01").exists()
+        )
+
 
     def test_atomic_collision_retries_with_the_next_id(self):
         real_link = os.link
@@ -660,7 +1198,7 @@ class CaptureTests(unittest.TestCase):
         self.assertFalse(target.exists())
         self.assertEqual(list(target.parent.iterdir()), [])
 
-    def test_directory_fsync_failure_rolls_back_the_published_record(self):
+    def test_directory_fsync_failure_preserves_the_complete_published_record(self):
         target = self.workspace / "knowledge" / "records" / "observation" / "OBS-20260714-01.md"
         real_fsync = os.fsync
         failed = []
@@ -679,8 +1217,8 @@ class CaptureTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 _write_create_only(target, b"complete record bytes")
 
-        self.assertFalse(target.exists())
-        self.assertEqual(list(target.parent.iterdir()), [])
+        self.assertEqual(target.read_bytes(), b"complete record bytes")
+        self.assertEqual(list(target.parent.iterdir()), [target])
 
     def test_two_publishers_expose_one_complete_winner(self):
         target = self.workspace / "knowledge" / "records" / "observation" / "OBS-20260714-01.md"

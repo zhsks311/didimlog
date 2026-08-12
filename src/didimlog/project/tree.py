@@ -122,8 +122,24 @@ def _walk_record_documents(directory_descriptor: int, directory: Path):
             )
 
 
-def _iter_record_documents(workspace: Path):
-    workspace_descriptor, absolute_workspace = _open_directory_path(workspace)
+def _iter_record_documents(
+    workspace: Path,
+    workspace_descriptor: int | None = None,
+):
+    absolute_workspace = Path(os.path.abspath(workspace))
+    if workspace_descriptor is None:
+        workspace_descriptor, absolute_workspace = _open_directory_path(workspace)
+    else:
+        duplicate: int | None = None
+        try:
+            duplicate = os.dup(workspace_descriptor)
+            if not stat.S_ISDIR(os.fstat(duplicate).st_mode):
+                raise OSError("workspace descriptor is not a directory")
+        except OSError as error:
+            if duplicate is not None:
+                os.close(duplicate)
+            raise _path_escape(absolute_workspace) from error
+        workspace_descriptor = duplicate
     knowledge = absolute_workspace / "knowledge"
     records = knowledge / "records"
     knowledge_descriptor: int | None = None
@@ -190,7 +206,12 @@ def _parse_document(raw: bytes):
     return fields, frontmatter_lines, body
 
 
-def _load_record(workspace: Path, path: Path, raw: bytes):
+def _load_record(
+    workspace: Path,
+    path: Path,
+    raw: bytes,
+    workspace_descriptor: int | None = None,
+):
     fields, frontmatter_lines, body = _parse_document(raw)
     record = validate_frontmatter(fields)
     canonical = _render_frontmatter(list(fields.items()))
@@ -218,6 +239,7 @@ def _load_record(workspace: Path, path: Path, raw: bytes):
                 record["artifact_path"],
                 record["artifact_sha256"],
                 record["id"],
+                workspace_descriptor=workspace_descriptor,
             )
         else:
             verify_artifact_git(
@@ -225,6 +247,7 @@ def _load_record(workspace: Path, path: Path, raw: bytes):
                 record["artifact_path"],
                 record["artifact_git"],
                 record["id"],
+                workspace_descriptor=workspace_descriptor,
             )
     record["content_bytes"] = raw
     record["path"] = str(path)
@@ -337,13 +360,31 @@ def record_tree_digest(records) -> str:
     return hashlib.sha256(b"".join(parts)).hexdigest()
 
 
-def validate_record_tree(workspace, collision_id=None):
-    """Validate the complete record tree before returning any record map."""
+def validate_record_tree(
+    workspace,
+    collision_id=None,
+    workspace_descriptor: int | None = None,
+):
+    """Validate the complete record tree before returning any record map.
 
+    ``workspace_descriptor`` is borrowed. The tree walk duplicates it and
+    closes only the duplicate, so callers can pin one workspace across a
+    larger transaction.
+    """
+    if workspace_descriptor is None:
+        workspace_descriptor = getattr(workspace, "workspace_descriptor", None)
     root = Path(workspace)
     records = [
-        _load_record(root, path, raw)
-        for path, raw in _iter_record_documents(root)
+        _load_record(
+            root,
+            path,
+            raw,
+            workspace_descriptor=workspace_descriptor,
+        )
+        for path, raw in _iter_record_documents(
+            root,
+            workspace_descriptor=workspace_descriptor,
+        )
     ]
 
     identifiers = set()

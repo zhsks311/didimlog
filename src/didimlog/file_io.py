@@ -274,7 +274,7 @@ def _rollback_published_file_at(
                 pass
 
 
-def replace_regular_file_at_if_unchanged(
+def _replace_regular_file_at_if_unchanged(
     parent_descriptor: int,
     name: str,
     expected: bytes,
@@ -282,13 +282,14 @@ def replace_regular_file_at_if_unchanged(
     mode: int,
     *,
     expected_info: os.stat_result | None = None,
-) -> bool:
-    """Publish replacement without overwriting a concurrent pathname writer."""
+) -> tuple[os.stat_result, int] | None:
+    """Publish replacement and transfer ownership of its open descriptor."""
     _check_child_name(name)
     if not isinstance(expected, bytes) or not isinstance(replacement, bytes):
         raise TypeError("expected and replacement must be bytes")
 
     temporary_name: str | None = None
+    temporary_descriptor: int | None = None
     backup_name: str | None = None
     backup_moved = False
     published_revision: tuple[int, ...] | None = None
@@ -299,12 +300,9 @@ def replace_regular_file_at_if_unchanged(
             ".didim-replacement-",
             mode,
         )
-        try:
-            _write_all_and_sync(temporary_descriptor, replacement)
-            temporary_info = os.fstat(temporary_descriptor)
-            published_revision = _conditional_replace_revision(temporary_info)
-        finally:
-            os.close(temporary_descriptor)
+        _write_all_and_sync(temporary_descriptor, replacement)
+        temporary_info = os.fstat(temporary_descriptor)
+        published_revision = _conditional_replace_revision(temporary_info)
 
         backup_name, backup_descriptor = _create_temporary_file_at(
             parent_descriptor,
@@ -320,7 +318,7 @@ def replace_regular_file_at_if_unchanged(
                 dst_dir_fd=parent_descriptor,
             )
         except FileNotFoundError:
-            return False
+            return None
         backup_moved = True
 
         moved_data, moved_info = read_regular_file_at_with_stat(
@@ -336,7 +334,7 @@ def replace_regular_file_at_if_unchanged(
                 != _conditional_replace_revision(expected_info)
             )
         ):
-            return False
+            return None
 
         try:
             os.link(
@@ -347,9 +345,9 @@ def replace_regular_file_at_if_unchanged(
                 follow_symlinks=False,
             )
         except FileExistsError:
-            return False
+            return None
 
-        published_data, published = read_regular_file_at_with_stat(
+        published_data, published_info = read_regular_file_at_with_stat(
             parent_descriptor,
             name,
             len(replacement),
@@ -361,7 +359,7 @@ def replace_regular_file_at_if_unchanged(
         )
         if (
             published_data != replacement
-            or _conditional_replace_revision(published) != published_revision
+            or _conditional_replace_revision(published_info) != published_revision
             or moved_after != expected
             or (
                 expected_info is not None
@@ -369,13 +367,15 @@ def replace_regular_file_at_if_unchanged(
                 != _conditional_replace_revision(expected_info)
             )
         ):
-            return False
+            return None
 
         # This parent sync is the commit point; the original backup still exists.
         os.fsync(parent_descriptor)
         publication_committed = True
         backup_moved = False
-        return True
+        ownership_descriptor = temporary_descriptor
+        temporary_descriptor = None
+        return temporary_info, ownership_descriptor
     except UnsafePathError:
         raise
     except OSError as error:
@@ -419,6 +419,78 @@ def replace_regular_file_at_if_unchanged(
                     os.fsync(parent_descriptor)
                 except OSError:
                     pass
+        if temporary_descriptor is not None:
+            os.close(temporary_descriptor)
+
+
+def replace_regular_file_at_if_unchanged_with_ownership(
+    parent_descriptor: int,
+    name: str,
+    expected: bytes,
+    replacement: bytes,
+    mode: int,
+    *,
+    expected_info: os.stat_result | None = None,
+) -> tuple[os.stat_result, int] | None:
+    """Publish replacement and return metadata plus its caller-owned descriptor."""
+    return _replace_regular_file_at_if_unchanged(
+        parent_descriptor,
+        name,
+        expected,
+        replacement,
+        mode,
+        expected_info=expected_info,
+    )
+
+
+def replace_regular_file_at_if_unchanged_with_info(
+    parent_descriptor: int,
+    name: str,
+    expected: bytes,
+    replacement: bytes,
+    mode: int,
+    *,
+    expected_info: os.stat_result | None = None,
+) -> os.stat_result | None:
+    """Publish replacement and return its inode information only on success."""
+    publication = replace_regular_file_at_if_unchanged_with_ownership(
+        parent_descriptor,
+        name,
+        expected,
+        replacement,
+        mode,
+        expected_info=expected_info,
+    )
+    if publication is None:
+        return None
+    published_info, ownership_descriptor = publication
+    try:
+        return published_info
+    finally:
+        os.close(ownership_descriptor)
+
+
+def replace_regular_file_at_if_unchanged(
+    parent_descriptor: int,
+    name: str,
+    expected: bytes,
+    replacement: bytes,
+    mode: int,
+    *,
+    expected_info: os.stat_result | None = None,
+) -> bool:
+    """Publish replacement without overwriting a concurrent pathname writer."""
+    return (
+        replace_regular_file_at_if_unchanged_with_info(
+            parent_descriptor,
+            name,
+            expected,
+            replacement,
+            mode,
+            expected_info=expected_info,
+        )
+        is not None
+    )
 
 
 def open_directory_path(path: os.PathLike[str] | str) -> int:

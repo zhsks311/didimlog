@@ -5,10 +5,17 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import secrets
 import stat
 import tempfile
 from pathlib import Path
+
+from didimlog.file_io import (
+    open_directory_path,
+    read_regular_file_at_with_stat,
+    replace_regular_file_at_if_unchanged,
+)
+import stat
+
 
 _ABSENT = "ABSENT"
 
@@ -41,6 +48,7 @@ class InstallJournal:
         targets[name] = {
             "path": str(path),
             "original": _ABSENT if original is None else _digest(original),
+            "original_size": None if original is None else len(original),
             "installed": None,
             "backup": str(backup) if backup is not None else None,
             "phase": "prepared",
@@ -51,6 +59,7 @@ class InstallJournal:
         target = self._targets()[name]
         path = Path(target["path"])
         target["installed"] = _digest(data)
+        target["installed_size"] = len(data)
         target["installed_parent"] = self._parent_identity(path)
         target["phase"] = "installed"
         self._save()
@@ -94,35 +103,55 @@ class InstallJournal:
                 return True
 
             backup = target["backup"]
-            if backup is None:
-                return False
-            original = Path(backup).read_bytes()
-            if _digest(original) != target["original"]:
+            original_size = target.get("original_size")
+            installed_size = target.get("installed_size")
+            if (
+                backup is None
+                or not isinstance(original_size, int)
+                or isinstance(original_size, bool)
+                or original_size < 0
+                or not isinstance(installed_size, int)
+                or isinstance(installed_size, bool)
+                or installed_size < 0
+            ):
                 return False
 
-            descriptor, temporary_name = self._create_temporary(parent_descriptor)
-            temporary: str | None = temporary_name
+            backup_path = Path(backup)
+            backup_parent_descriptor = open_directory_path(backup_path.parent)
             try:
-                with os.fdopen(descriptor, "wb") as handle:
-                    handle.write(original)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                if self._digest_at(parent_descriptor, path.name) != target["installed"]:
-                    return False
-                os.replace(
-                    temporary_name,
-                    path.name,
-                    src_dir_fd=parent_descriptor,
-                    dst_dir_fd=parent_descriptor,
+                original, _ = read_regular_file_at_with_stat(
+                    backup_parent_descriptor,
+                    backup_path.name,
+                    original_size,
                 )
-                temporary = None
-                return True
             finally:
-                if temporary is not None:
-                    try:
-                        os.unlink(temporary, dir_fd=parent_descriptor)
-                    except FileNotFoundError:
-                        pass
+                os.close(backup_parent_descriptor)
+            if (
+                len(original) != original_size
+                or _digest(original) != target["original"]
+            ):
+                return False
+
+            if self._digest_at(parent_descriptor, path.name) != target["installed"]:
+                return False
+            installed, installed_info = read_regular_file_at_with_stat(
+                parent_descriptor,
+                path.name,
+                installed_size,
+            )
+            if (
+                len(installed) != installed_size
+                or _digest(installed) != target["installed"]
+            ):
+                return False
+            return replace_regular_file_at_if_unchanged(
+                parent_descriptor,
+                path.name,
+                installed,
+                original,
+                0o600,
+                expected_info=installed_info,
+            )
         finally:
             os.close(parent_descriptor)
 
@@ -188,17 +217,6 @@ class InstallJournal:
         finally:
             os.close(descriptor)
 
-    @staticmethod
-    def _create_temporary(parent_descriptor: int) -> tuple[int, str]:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        for _ in range(100):
-            name = ".rollback-" + secrets.token_hex(12)
-            try:
-                return os.open(name, flags, 0o600, dir_fd=parent_descriptor), name
-            except FileExistsError:
-                continue
-        raise FileExistsError("could not allocate rollback temporary file")
     @staticmethod
     def _current_digest(path: Path) -> str | None | bool:
         if path.is_symlink():

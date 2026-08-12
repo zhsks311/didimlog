@@ -191,19 +191,20 @@ class IndexServiceTests(unittest.TestCase):
         self.assertEqual(readme.read_bytes(), legacy)
 
     def test_index_accepts_current_readme_when_legacy_plan_turns_stale(self):
+        import os
+        import pathlib
+
         project = self._git_project()
         readme = project / "knowledge" / "README.md"
         readme.write_bytes(_legacy_readme(readme.read_bytes()))
-
-        def migrate_before_return(workspace):
-            stale_plan = plan_scaffold(workspace)
-            apply_scaffold(stale_plan)
-            return stale_plan
+        resolved_project = pathlib.Path(os.path.realpath(project))
+        stale_plan = plan_scaffold(resolved_project)
+        apply_scaffold(stale_plan)
 
         with mock.patch.object(
             indexing_module,
             "plan_scaffold",
-            side_effect=migrate_before_return,
+            return_value=stale_plan,
         ):
             result = run_index(check=False, home=self.home, cwd=project)
 

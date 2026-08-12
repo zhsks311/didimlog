@@ -5,9 +5,12 @@ import os
 import pathlib
 import re
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
+import didimlog.file_io as file_io_module
+import didimlog.indexing as indexing_module
 import didimlog.project.scaffold as scaffold_module
 
 from didimlog.errors import DidimError, EXIT_POLICY
@@ -282,6 +285,115 @@ class ScaffoldTests(unittest.TestCase):
         apply_scaffold(plan)
         self.assertEqual(readme.read_bytes(), current)
 
+    def test_prepared_project_reader_waits_for_legacy_readme_update_lock(self):
+        initial_plan = plan_scaffold(self.workspace)
+        current = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        readme = self.workspace / "knowledge/README.md"
+        readme.write_bytes(_legacy_readme(current))
+        migration_plan = plan_scaffold(self.workspace)
+
+        original_acquire_directory_lock = scaffold_module.acquire_directory_lock
+        original_path_lock = indexing_module.path_lock
+        writer_holds_lock = threading.Event()
+        allow_writer = threading.Event()
+        reader_progress = threading.Event()
+        reader_finished = threading.Event()
+        writer_errors = []
+        reader_errors = []
+        prepared_results = []
+
+        def pause_after_knowledge_lock(
+            parent_descriptor,
+            *,
+            shared=False,
+            blocking=True,
+        ):
+            lock_descriptor = original_acquire_directory_lock(
+                parent_descriptor,
+                shared=shared,
+                blocking=blocking,
+            )
+            writer_holds_lock.set()
+            if not allow_writer.wait(5):
+                os.close(lock_descriptor)
+                raise AssertionError("scaffold update lock was not released")
+            return lock_descriptor
+
+        def observe_reader_lock(*args, **kwargs):
+            try:
+                with original_path_lock(*args, blocking=False, **kwargs):
+                    raise AssertionError(
+                        "reader acquired scaffold update lock without blocking"
+                    )
+            except BlockingIOError:
+                reader_progress.set()
+            return original_path_lock(*args, **kwargs)
+
+        def migrate_readme():
+            try:
+                apply_scaffold(migration_plan)
+            except BaseException as error:
+                writer_errors.append(error)
+
+        def read_prepared_project():
+            try:
+                prepared_results.append(
+                    indexing_module._prepared_project(self.workspace)
+                )
+            except BaseException as error:
+                reader_errors.append(error)
+            finally:
+                reader_finished.set()
+                reader_progress.set()
+
+        with (
+            mock.patch.object(
+                scaffold_module,
+                "acquire_directory_lock",
+                side_effect=pause_after_knowledge_lock,
+            ),
+            mock.patch.object(
+                indexing_module,
+                "path_lock",
+                side_effect=observe_reader_lock,
+            ),
+        ):
+            migration = threading.Thread(
+                target=migrate_readme,
+                name="legacy-readme-migration",
+                daemon=True,
+            )
+            reader = threading.Thread(
+                target=read_prepared_project,
+                name="prepared-project-reader",
+                daemon=True,
+            )
+            migration.start()
+            try:
+                self.assertTrue(writer_holds_lock.wait(5))
+                reader.start()
+                self.assertTrue(reader_progress.wait(5))
+                reader_finished_before_release = reader_finished.is_set()
+                reader_alive_before_release = reader.is_alive()
+            finally:
+                allow_writer.set()
+                migration.join(10)
+                if reader.ident is not None:
+                    reader.join(10)
+
+        self.assertFalse(reader_finished_before_release)
+        self.assertTrue(reader_alive_before_release)
+        self.assertFalse(migration.is_alive())
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(writer_errors, [])
+        self.assertEqual(reader_errors, [])
+        self.assertEqual(prepared_results, [True])
+        self.assertTrue(readme.is_file())
+        self.assertEqual(readme.read_bytes(), current)
+
     def test_stale_legacy_update_plan_is_idempotent_after_another_apply(self):
         initial_plan = plan_scaffold(self.workspace)
         current = self._planned_bytes(initial_plan)[
@@ -437,6 +549,228 @@ class ScaffoldTests(unittest.TestCase):
                 self.workspace.rename(replacement)
             if backup.exists():
                 backup.rename(self.workspace)
+
+    def test_path_escape_after_legacy_update_restores_original_readme_without_touching_replacement(
+        self,
+    ):
+        initial_plan = plan_scaffold(self.workspace)
+        intended = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        readme = self.workspace / "knowledge/README.md"
+        legacy = _legacy_readme(intended)
+        readme.write_bytes(legacy)
+        plan = plan_scaffold(self.workspace)
+
+        replacement = self.root / "replacement"
+        replacement.mkdir()
+        self._make_empty_git_repository(replacement)
+        replacement_readme = replacement / "knowledge/README.md"
+        replacement_readme.parent.mkdir()
+        replacement_bytes = b"replacement workspace readme\n"
+        replacement_readme.write_bytes(replacement_bytes)
+        replacement_user_data = replacement / "user-data.bin"
+        replacement_user_bytes = b"replacement workspace user data\n"
+        replacement_user_data.write_bytes(replacement_user_bytes)
+        original_workspace = self.root / "original-workspace"
+        original_update = scaffold_module._update_scaffold_file_at
+
+        def update_then_replace_workspace(
+            parent_descriptor,
+            path,
+            original,
+            current,
+        ):
+            update_result = original_update(
+                parent_descriptor,
+                path,
+                original,
+                current,
+            )
+            self.assertEqual(path.read_bytes(), intended)
+            self.workspace.rename(original_workspace)
+            replacement.rename(self.workspace)
+            return update_result
+
+        try:
+            with mock.patch.object(
+                scaffold_module,
+                "_update_scaffold_file_at",
+                side_effect=update_then_replace_workspace,
+            ):
+                with self.assertRaises(DidimError) as raised:
+                    apply_scaffold(plan)
+
+            self.assertEqual(
+                raised.exception.token,
+                f"PATH_ESCAPE {self.workspace}",
+            )
+            self.assertEqual(raised.exception.exit_code, EXIT_POLICY)
+            self.assertEqual(
+                (original_workspace / "knowledge/README.md").read_bytes(),
+                legacy,
+            )
+            self.assertEqual(
+                (self.workspace / "knowledge/README.md").read_bytes(),
+                replacement_bytes,
+            )
+            self.assertEqual(
+                (self.workspace / "user-data.bin").read_bytes(),
+                replacement_user_bytes,
+            )
+        finally:
+            if original_workspace.exists():
+                if self.workspace.exists():
+                    self.workspace.rename(replacement)
+                original_workspace.rename(self.workspace)
+
+    def test_path_escape_does_not_rollback_other_writer_publish_before_local_noop(
+        self,
+    ):
+        initial_plan = plan_scaffold(self.workspace)
+        intended = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        readme = self.workspace / "knowledge/README.md"
+        legacy = _legacy_readme(intended)
+        readme.write_bytes(legacy)
+        legacy_inode = readme.stat().st_ino
+        plan = plan_scaffold(self.workspace)
+
+        replacement_workspace = self.root / "replacement"
+        replacement_workspace.mkdir()
+        self._make_empty_git_repository(replacement_workspace)
+        original_workspace = self.root / "original-workspace"
+        original_update = scaffold_module._update_scaffold_file_at
+        other_writer_inode = None
+
+        def publish_by_other_writer_before_local_update(
+            parent_descriptor,
+            path,
+            original,
+            current,
+        ):
+            nonlocal other_writer_inode
+            staged = readme.with_name(".other-writer-readme")
+            staged.write_bytes(intended)
+            os.replace(staged, readme)
+            other_writer_inode = readme.stat().st_ino
+            self.assertNotEqual(other_writer_inode, legacy_inode)
+
+            update_result = original_update(
+                parent_descriptor,
+                path,
+                original,
+                current,
+            )
+            self.assertIsNone(update_result)
+            self.workspace.rename(original_workspace)
+            replacement_workspace.rename(self.workspace)
+            return update_result
+
+        try:
+            with mock.patch.object(
+                scaffold_module,
+                "_update_scaffold_file_at",
+                side_effect=publish_by_other_writer_before_local_update,
+            ):
+                with self.assertRaises(DidimError) as raised:
+                    apply_scaffold(plan)
+
+            self.assertEqual(
+                raised.exception.token,
+                f"PATH_ESCAPE {self.workspace}",
+            )
+            published = original_workspace / "knowledge/README.md"
+            self.assertEqual(published.read_bytes(), intended)
+            self.assertEqual(published.stat().st_ino, other_writer_inode)
+        finally:
+            if original_workspace.exists():
+                if self.workspace.exists():
+                    self.workspace.rename(replacement_workspace)
+                original_workspace.rename(self.workspace)
+
+    def test_path_escape_does_not_rollback_user_inode_replacing_local_publish(
+        self,
+    ):
+        initial_plan = plan_scaffold(self.workspace)
+        intended = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        readme = self.workspace / "knowledge/README.md"
+        readme.write_bytes(_legacy_readme(intended))
+        plan = plan_scaffold(self.workspace)
+
+        replacement_workspace = self.root / "replacement"
+        replacement_workspace.mkdir()
+        self._make_empty_git_repository(replacement_workspace)
+        original_workspace = self.root / "original-workspace"
+        original_replace = (
+            scaffold_module.replace_regular_file_at_if_unchanged_with_ownership
+        )
+        user_inode = None
+
+        def replace_locally_then_publish_user_inode(
+            parent_descriptor,
+            name,
+            expected,
+            replacement,
+            mode,
+            *,
+            expected_info=None,
+        ):
+            nonlocal user_inode
+            publication = original_replace(
+                parent_descriptor,
+                name,
+                expected,
+                replacement,
+                mode,
+                expected_info=expected_info,
+            )
+            self.assertIsNotNone(publication)
+            ownership_info, _ = publication
+            local_inode = ownership_info.st_ino
+            staged = readme.with_name(".user-readme")
+            staged.write_bytes(intended)
+            os.replace(staged, readme)
+            user_inode = readme.stat().st_ino
+            self.assertNotEqual(user_inode, local_inode)
+            self.workspace.rename(original_workspace)
+            replacement_workspace.rename(self.workspace)
+            return publication
+
+        try:
+            with (
+                mock.patch.object(
+                    file_io_module,
+                    "_conditional_replace_revision",
+                    return_value=(0,),
+                ),
+                mock.patch.object(
+                    scaffold_module,
+                    "replace_regular_file_at_if_unchanged_with_ownership",
+                    side_effect=replace_locally_then_publish_user_inode,
+                ),
+            ):
+                with self.assertRaises(DidimError) as raised:
+                    apply_scaffold(plan)
+
+            self.assertEqual(
+                raised.exception.token,
+                f"PATH_ESCAPE {self.workspace}",
+            )
+            published = original_workspace / "knowledge/README.md"
+            self.assertEqual(published.read_bytes(), intended)
+            self.assertEqual(published.stat().st_ino, user_inode)
+        finally:
+            if original_workspace.exists():
+                if self.workspace.exists():
+                    self.workspace.rename(replacement_workspace)
+                original_workspace.rename(self.workspace)
 
     def test_user_edit_of_new_pointer_survives_rollback_when_readme_update_fails(
         self,

@@ -16,6 +16,7 @@ from didimlog.file_io import (
     read_regular_file_at_with_stat,
     read_regular_file_beneath,
     replace_regular_file_at_if_unchanged,
+    replace_regular_file_at_if_unchanged_with_ownership,
 )
 from didimlog.locking import acquire_directory_lock, path_lock
 from didimlog.project.resources import read_project_resource
@@ -323,10 +324,76 @@ def _entry_revision(
         os.close(descriptor)
 
 
+def _rollback_scaffold_update(
+    parent_descriptor: int,
+    name: str,
+    original: bytes,
+    intended: bytes,
+    intended_info: os.stat_result,
+    ownership_descriptor: int,
+) -> None:
+    ownership_info = os.fstat(ownership_descriptor)
+    try:
+        current_info = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISREG(ownership_info.st_mode)
+        or not stat.S_ISREG(current_info.st_mode)
+        or (current_info.st_dev, current_info.st_ino)
+        != (ownership_info.st_dev, ownership_info.st_ino)
+    ):
+        return
+
+    lock_descriptor = acquire_directory_lock(parent_descriptor)
+    try:
+        replace_regular_file_at_if_unchanged(
+            parent_descriptor,
+            name,
+            intended,
+            original,
+            stat.S_IMODE(intended_info.st_mode),
+            expected_info=intended_info,
+        )
+    finally:
+        os.close(lock_descriptor)
+
+
 def _rollback(
+    applied_updates: list[
+        tuple[str, bytes, bytes, os.stat_result, int, int]
+    ],
     created_files: list[tuple[str, tuple[int, ...], int]],
     created_directories: list[tuple[str, tuple[int, int], int]],
 ) -> None:
+    for (
+        name,
+        original,
+        intended,
+        intended_info,
+        ownership_descriptor,
+        parent_descriptor,
+    ) in reversed(applied_updates):
+        try:
+            _rollback_scaffold_update(
+                parent_descriptor,
+                name,
+                original,
+                intended,
+                intended_info,
+                ownership_descriptor,
+            )
+        except (OSError, UnsafePathError):
+            pass
+        finally:
+            try:
+                os.close(ownership_descriptor)
+            finally:
+                os.close(parent_descriptor)
     for name, revision, parent_descriptor in reversed(created_files):
         try:
             if _entry_revision(parent_descriptor, name) == revision:
@@ -424,9 +491,10 @@ def _update_scaffold_file_at(
     path: Path,
     original: bytes,
     intended: bytes,
-) -> None:
-    """Conditionally update one regular file through a pinned directory."""
+) -> tuple[os.stat_result, int] | None:
+    """Conditionally update one regular file and retain its inode handle."""
     lock_descriptor = acquire_directory_lock(parent_descriptor)
+    publication: tuple[os.stat_result, int] | None = None
     try:
         maximum_bytes = max(len(original), len(intended))
         current, current_info = read_regular_file_at_with_stat(
@@ -435,10 +503,10 @@ def _update_scaffold_file_at(
             maximum_bytes,
         )
         if current == intended:
-            return
+            return None
         if current != original:
             raise ValueError("scaffold target changed after planning")
-        replaced = replace_regular_file_at_if_unchanged(
+        publication = replace_regular_file_at_if_unchanged_with_ownership(
             parent_descriptor,
             path.name,
             original,
@@ -446,8 +514,8 @@ def _update_scaffold_file_at(
             stat.S_IMODE(current_info.st_mode),
             expected_info=current_info,
         )
-        if replaced:
-            return
+        if publication is not None:
+            return publication
         current, _ = read_regular_file_at_with_stat(
             parent_descriptor,
             path.name,
@@ -455,13 +523,23 @@ def _update_scaffold_file_at(
         )
         if current != intended:
             raise ValueError("scaffold target changed before write")
+        return None
     finally:
-        os.close(lock_descriptor)
+        try:
+            os.close(lock_descriptor)
+        except BaseException:
+            if publication is not None:
+                os.close(publication[1])
+            raise
 
 
 def _apply_scaffold_updates(
     plan: ScaffoldPlan,
     knowledge_descriptor: int | None = None,
+    applied_updates: list[
+        tuple[str, bytes, bytes, os.stat_result, int, int]
+    ]
+    | None = None,
 ) -> None:
     """Apply validated updates through a pinned, locked knowledge directory."""
     if knowledge_descriptor is None:
@@ -475,15 +553,44 @@ def _apply_scaffold_updates(
     )
     with lock_context as pinned_knowledge:
         for path, original, intended in plan.updates:
+            publication: tuple[os.stat_result, int] | None = None
+            rollback_descriptor: int | None = None
             try:
-                _update_scaffold_file_at(
+                if applied_updates is not None:
+                    rollback_descriptor = os.dup(pinned_knowledge)
+                publication = _update_scaffold_file_at(
                     pinned_knowledge,
                     path,
                     original,
                     intended,
                 )
+                if (
+                    applied_updates is not None
+                    and rollback_descriptor is not None
+                    and publication is not None
+                ):
+                    publication_info, ownership_descriptor = publication
+                    applied_updates.append(
+                        (
+                            path.name,
+                            original,
+                            intended,
+                            publication_info,
+                            ownership_descriptor,
+                            rollback_descriptor,
+                        )
+                    )
+                    publication = None
+                    rollback_descriptor = None
             except (OSError, UnsafePathError, ValueError) as error:
                 raise _policy_error("SCAFFOLD_CONFLICT", path) from error
+            finally:
+                try:
+                    if publication is not None:
+                        os.close(publication[1])
+                finally:
+                    if rollback_descriptor is not None:
+                        os.close(rollback_descriptor)
 
 
 def apply_scaffold(plan: ScaffoldPlan) -> None:
@@ -517,6 +624,9 @@ def apply_scaffold(plan: ScaffoldPlan) -> None:
     }
     created_directories: list[tuple[str, tuple[int, int], int]] = []
     created_files: list[tuple[str, tuple[int, ...], int]] = []
+    applied_updates: list[
+        tuple[str, bytes, bytes, os.stat_result, int, int]
+    ] = []
     try:
         for path in plan.directories:
             _validate_open_directories(
@@ -562,6 +672,7 @@ def apply_scaffold(plan: ScaffoldPlan) -> None:
             _apply_scaffold_updates(
                 plan,
                 descriptors[workspace / "knowledge"],
+                applied_updates,
             )
             _validate_open_directories(
                 workspace,
@@ -570,9 +681,14 @@ def apply_scaffold(plan: ScaffoldPlan) -> None:
                 identities,
             )
     except BaseException:
-        _rollback(created_files, created_directories)
+        _rollback(applied_updates, created_files, created_directories)
         raise
     else:
+        for _, _, _, _, ownership_descriptor, parent_descriptor in applied_updates:
+            try:
+                os.close(ownership_descriptor)
+            finally:
+                os.close(parent_descriptor)
         for _, _, descriptor in created_files:
             os.close(descriptor)
         for _, _, descriptor in created_directories:

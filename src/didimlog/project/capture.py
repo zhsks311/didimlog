@@ -13,8 +13,15 @@ import sys
 import unicodedata
 
 from didimlog.errors import DidimError, EXIT_GIT, EXIT_POLICY
-from didimlog.locking import path_lock
-from didimlog.file_io import UnsafePathError, read_regular_file_beneath
+from didimlog.locking import acquire_directory_lock, path_lock
+from didimlog.file_io import (
+    UnsafePathError,
+    open_child_directory,
+    open_directory_path,
+    read_regular_file_at,
+    read_regular_file_at_with_stat,
+    read_regular_file_beneath,
+)
 from .artifacts import (
     check_artifact_path_format,
     verify_artifact_git,
@@ -71,8 +78,49 @@ class CaptureRequest:
     fields: dict[str, str]
 
 
+@dataclass(frozen=True)
+class _PinnedWorkspacePath:
+    path: Path
+    workspace_descriptor: int
+
+    def __fspath__(self) -> str:
+        return os.fspath(self.path)
+
+
+@dataclass
+class _PinnedRecordTarget:
+    path: Path
+    directory_descriptor: int
+    publication: os.stat_result | None = None
+    publication_descriptor: int | None = None
+
+
 def _project_error(token: str, help_text: str) -> DidimError:
     return DidimError(token, exit_code=EXIT_POLICY, help_text=help_text)
+
+
+def _scaffold_update_error(error: DidimError) -> DidimError:
+    token = error.token.partition(" ")[0]
+    if token == error.token:
+        return error
+    if isinstance(error, PolicyError):
+        return PolicyError(token)
+    return DidimError(
+        token,
+        exit_code=error.exit_code,
+        help_text=error.help_text,
+    )
+
+
+def _is_missing_scaffold_failure(error: BaseException) -> bool:
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        if isinstance(current, FileNotFoundError):
+            return True
+        seen.add(id(current))
+        current = current.__cause__
+    return False
 
 
 def _require_git_root(workspace: Path) -> Path:
@@ -108,26 +156,157 @@ def _require_git_root(workspace: Path) -> Path:
 def _require_scaffold(workspace: Path) -> ScaffoldPlan:
     try:
         expected = plan_scaffold(workspace)
-        updates = {
-            path: (original, intended)
-            for path, original, intended in expected.updates
-        }
-        for directory in expected.directories:
-            entry = directory.lstat()
-            if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
-                raise OSError("unsafe scaffold directory")
-        for path, content in expected.files:
-            accepted = updates.get(path, (content,))
-            relative = path.relative_to(workspace)
-            actual = read_regular_file_beneath(
-                workspace,
-                relative,
-                max(len(value) for value in accepted),
-            )
-            if actual not in accepted:
-                raise OSError("stale scaffold file")
+        with path_lock(workspace / "knowledge", shared=True):
+            updates = {
+                path: (original, intended)
+                for path, original, intended in expected.updates
+            }
+            for directory in expected.directories:
+                entry = directory.lstat()
+                if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
+                    raise OSError("unsafe scaffold directory")
+            for path, content in expected.files:
+                accepted = updates.get(path, (content,))
+                relative = path.relative_to(workspace)
+                actual = read_regular_file_beneath(
+                    workspace,
+                    relative,
+                    max(len(value) for value in accepted),
+                )
+                if actual not in accepted:
+                    raise OSError("stale scaffold file")
         return expected
     except (DidimError, OSError, UnsafePathError, ValueError):
+        raise _project_error(
+            "PROJECT_SCAFFOLD_MISSING",
+            "먼저 didim setup을 실행해 프로젝트 지식 저장소를 준비하세요.",
+        ) from None
+
+
+def _workspace_replaced_error() -> DidimError:
+    return _project_error(
+        "PROJECT_SCAFFOLD_MISSING",
+        "프로젝트 경로가 바뀌지 않은 상태에서 다시 실행하세요.",
+    )
+
+
+def _require_pinned_workspace(
+    workspace: Path,
+    workspace_descriptor: int,
+    knowledge_descriptor: int,
+) -> None:
+    try:
+        linked_workspace = workspace.lstat()
+        opened_workspace = os.fstat(workspace_descriptor)
+        linked_knowledge = os.stat(
+            "knowledge",
+            dir_fd=workspace_descriptor,
+            follow_symlinks=False,
+        )
+        opened_knowledge = os.fstat(knowledge_descriptor)
+    except OSError as error:
+        raise _workspace_replaced_error() from error
+
+    if (
+        stat.S_ISLNK(linked_workspace.st_mode)
+        or not stat.S_ISDIR(linked_workspace.st_mode)
+        or not stat.S_ISDIR(opened_workspace.st_mode)
+        or (linked_workspace.st_dev, linked_workspace.st_ino)
+        != (opened_workspace.st_dev, opened_workspace.st_ino)
+        or stat.S_ISLNK(linked_knowledge.st_mode)
+        or not stat.S_ISDIR(linked_knowledge.st_mode)
+        or not stat.S_ISDIR(opened_knowledge.st_mode)
+        or (linked_knowledge.st_dev, linked_knowledge.st_ino)
+        != (opened_knowledge.st_dev, opened_knowledge.st_ino)
+    ):
+        raise _workspace_replaced_error()
+
+
+def _require_pinned_record_directories(
+    knowledge_descriptor: int,
+    records_descriptor: int,
+    record_type: str,
+    record_type_descriptor: int,
+) -> None:
+    try:
+        linked_records = os.stat(
+            "records",
+            dir_fd=knowledge_descriptor,
+            follow_symlinks=False,
+        )
+        opened_records = os.fstat(records_descriptor)
+        linked_record_type = os.stat(
+            record_type,
+            dir_fd=records_descriptor,
+            follow_symlinks=False,
+        )
+        opened_record_type = os.fstat(record_type_descriptor)
+    except OSError as error:
+        raise _workspace_replaced_error() from error
+
+    if (
+        stat.S_ISLNK(linked_records.st_mode)
+        or not stat.S_ISDIR(linked_records.st_mode)
+        or not stat.S_ISDIR(opened_records.st_mode)
+        or (linked_records.st_dev, linked_records.st_ino)
+        != (opened_records.st_dev, opened_records.st_ino)
+        or stat.S_ISLNK(linked_record_type.st_mode)
+        or not stat.S_ISDIR(linked_record_type.st_mode)
+        or not stat.S_ISDIR(opened_record_type.st_mode)
+        or (linked_record_type.st_dev, linked_record_type.st_ino)
+        != (opened_record_type.st_dev, opened_record_type.st_ino)
+    ):
+        raise _workspace_replaced_error()
+
+
+def _open_scaffold_directory_at(
+    knowledge_descriptor: int,
+    relative: Path,
+) -> int:
+    descriptor = os.dup(knowledge_descriptor)
+    try:
+        for component in relative.parts:
+            child = open_child_directory(descriptor, component)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _require_scaffold_at(
+    workspace: Path,
+    scaffold: ScaffoldPlan,
+    knowledge_descriptor: int,
+) -> None:
+    knowledge = workspace / "knowledge"
+    try:
+        for directory in scaffold.directories:
+            relative = directory.relative_to(knowledge)
+            descriptor = _open_scaffold_directory_at(
+                knowledge_descriptor,
+                relative,
+            )
+            os.close(descriptor)
+
+        for path, expected in scaffold.files:
+            relative = path.relative_to(knowledge)
+            parent_descriptor = _open_scaffold_directory_at(
+                knowledge_descriptor,
+                relative.parent,
+            )
+            try:
+                actual = read_regular_file_at(
+                    parent_descriptor,
+                    relative.name,
+                    len(expected),
+                )
+            finally:
+                os.close(parent_descriptor)
+            if actual != expected:
+                raise UnsafePathError("stale scaffold file")
+    except (OSError, UnsafePathError, ValueError):
         raise _project_error(
             "PROJECT_SCAFFOLD_MISSING",
             "먼저 didim setup을 실행해 프로젝트 지식 저장소를 준비하세요.",
@@ -274,6 +453,7 @@ def _candidate_record(
 
 def _validate_candidate(
     workspace: Path,
+    workspace_descriptor: int,
     candidate,
     records,
     contradicts: list[str],
@@ -300,6 +480,7 @@ def _validate_candidate(
                 candidate["artifact_path"],
                 candidate["artifact_sha256"],
                 candidate["id"],
+                workspace_descriptor=workspace_descriptor,
             )
         else:
             verify_artifact_git(
@@ -307,6 +488,7 @@ def _validate_candidate(
                 candidate["artifact_path"],
                 candidate["artifact_git"],
                 candidate["id"],
+                workspace_descriptor=workspace_descriptor,
             )
 
 
@@ -323,40 +505,51 @@ def _next_id(records, prefix: str, compact_date: str) -> str:
     return "{}{:02d}".format(stem, next_suffix)
 
 
-def _write_create_only(path: Path, data: bytes) -> None:
-    directory = path.parent
+def _write_create_only(
+    path: Path | _PinnedRecordTarget,
+    data: bytes,
+) -> os.stat_result:
+    target = path.path if isinstance(path, _PinnedRecordTarget) else path
+    directory = target.parent
+    directory_descriptor: int | None = None
     try:
-        linked = directory.lstat()
-        directory_descriptor = os.open(
-            directory,
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0),
-        )
+        if isinstance(path, _PinnedRecordTarget):
+            directory_descriptor = os.dup(path.directory_descriptor)
+            opened = os.fstat(directory_descriptor)
+            if not stat.S_ISDIR(opened.st_mode):
+                raise OSError("record parent is not a directory")
+        else:
+            linked = directory.lstat()
+            directory_descriptor = os.open(
+                directory,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            opened = os.fstat(directory_descriptor)
+            if (
+                stat.S_ISLNK(linked.st_mode)
+                or not stat.S_ISDIR(opened.st_mode)
+                or opened.st_dev != linked.st_dev
+                or opened.st_ino != linked.st_ino
+            ):
+                raise OSError("record parent changed")
     except OSError as error:
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
         raise PolicyError("PATH_ESCAPE {}".format(directory)) from error
 
     temporary_name: str | None = None
     temporary_descriptor: int | None = None
-    published_identity: tuple[int, int] | None = None
     published = False
     try:
-        opened = os.fstat(directory_descriptor)
-        if (
-            stat.S_ISLNK(linked.st_mode)
-            or not stat.S_ISDIR(opened.st_mode)
-            or opened.st_dev != linked.st_dev
-            or opened.st_ino != linked.st_ino
-        ):
-            raise PolicyError("PATH_ESCAPE {}".format(directory))
-
         for _ in range(32):
             candidate = ".didim-record-{}.tmp".format(secrets.token_hex(12))
             try:
                 temporary_descriptor = os.open(
                     candidate,
-                    os.O_WRONLY
+                    os.O_RDWR
                     | os.O_CREAT
                     | os.O_EXCL
                     | getattr(os, "O_CLOEXEC", 0)
@@ -378,14 +571,10 @@ def _write_create_only(path: Path, data: bytes) -> None:
                 raise OSError("short write")
             remaining = remaining[written:]
         os.fsync(temporary_descriptor)
-        temporary_info = os.fstat(temporary_descriptor)
-        published_identity = (temporary_info.st_dev, temporary_info.st_ino)
-        os.close(temporary_descriptor)
-        temporary_descriptor = None
 
         os.link(
             temporary_name,
-            path.name,
+            target.name,
             src_dir_fd=directory_descriptor,
             dst_dir_fd=directory_descriptor,
             follow_symlinks=False,
@@ -395,19 +584,25 @@ def _write_create_only(path: Path, data: bytes) -> None:
         os.unlink(temporary_name, dir_fd=directory_descriptor)
         temporary_name = None
         os.fsync(directory_descriptor)
+
+        published_data, publication = read_regular_file_at_with_stat(
+            directory_descriptor,
+            target.name,
+            len(data),
+        )
+        owned = os.fstat(temporary_descriptor)
+        if (
+            published_data != data
+            or not _same_publication(owned, publication)
+        ):
+            raise OSError("record publication changed")
+
+        if isinstance(path, _PinnedRecordTarget):
+            path.publication = publication
+            path.publication_descriptor = temporary_descriptor
+            temporary_descriptor = None
+        return publication
     except BaseException:
-        if published and published_identity is not None:
-            try:
-                current = os.stat(
-                    path.name,
-                    dir_fd=directory_descriptor,
-                    follow_symlinks=False,
-                )
-                if (current.st_dev, current.st_ino) == published_identity:
-                    os.unlink(path.name, dir_fd=directory_descriptor)
-                    os.fsync(directory_descriptor)
-            except OSError:
-                pass
         raise
     finally:
         if temporary_descriptor is not None:
@@ -420,17 +615,54 @@ def _write_create_only(path: Path, data: bytes) -> None:
         os.close(directory_descriptor)
 
 
-def _refresh_index(workspace: Path) -> None:
+def _same_publication(
+    current: os.stat_result,
+    publication: os.stat_result,
+) -> bool:
+    return (
+        stat.S_ISREG(current.st_mode)
+        and current.st_dev == publication.st_dev
+        and current.st_ino == publication.st_ino
+        and current.st_mode == publication.st_mode
+        and current.st_uid == publication.st_uid
+        and current.st_gid == publication.st_gid
+        and current.st_nlink == publication.st_nlink
+        and current.st_size == publication.st_size
+        and current.st_mtime_ns == publication.st_mtime_ns
+        and current.st_ctime_ns == publication.st_ctime_ns
+    )
+
+
+def _require_record_rollback(
+    target: _PinnedRecordTarget,
+    publication: os.stat_result,
+    intended: bytes,
+) -> None:
+    """Fail closed without deleting a record another process may still edit."""
+    raise _workspace_replaced_error()
+
+
+def _refresh_index(
+    workspace: Path,
+    workspace_descriptor: int,
+    knowledge_descriptor: int,
+) -> None:
     try:
         from . import index
 
-        index._write_index_locked(workspace)
+        index._write_index_at(
+            workspace,
+            workspace_descriptor,
+            knowledge_descriptor,
+        )
     except Exception:
         print("PROJECT_INDEX_STALE: run didim index", file=sys.stderr)
 
 
 def _capture_locked(
     root: Path,
+    workspace_descriptor: int,
+    knowledge_descriptor: int,
     request: CaptureRequest,
     max_id_retries: int,
 ) -> Path:
@@ -445,45 +677,158 @@ def _capture_locked(
     prefix = _PREFIX_BY_TYPE[record_type]
     compact_date = request.date.replace("-", "")
 
-    for _ in range(max_id_retries):
-        records = validate_record_tree(root)
-        record_id = _next_id(records, prefix, compact_date)
-        type_fields, contradicts = _build_type_fields(
+    records_descriptor: int | None = None
+    record_type_descriptor: int | None = None
+    try:
+        records_descriptor = open_child_directory(
+            knowledge_descriptor,
+            "records",
+        )
+        record_type_descriptor = open_child_directory(
+            records_descriptor,
             record_type,
-            request.fields,
-            record_id,
         )
-        candidate = _candidate_record(
-            record_id,
-            request,
-            tags,
-            sources,
-            type_fields,
-        )
-        _validate_candidate(root, candidate, records, contradicts)
-        document = serialize_record(
-            record_id,
-            record_type,
-            request.title,
-            request.scope,
-            request.date,
-            tags,
-            sources,
-            type_fields,
-        ).encode("utf-8")
-        path = (
-            root
-            / "knowledge"
-            / "records"
-            / record_type
-            / "{}.md".format(record_id)
-        )
-        try:
-            _write_create_only(path, document)
-        except FileExistsError:
-            continue
-        _refresh_index(root)
-        return path
+    except UnsafePathError as error:
+        if record_type_descriptor is not None:
+            os.close(record_type_descriptor)
+        if records_descriptor is not None:
+            os.close(records_descriptor)
+        raise PolicyError(
+            "PATH_ESCAPE {}".format(
+                root / "knowledge" / "records" / record_type
+            )
+        ) from error
+
+    pinned_workspace = _PinnedWorkspacePath(root, workspace_descriptor)
+    try:
+        for _ in range(max_id_retries):
+            records = validate_record_tree(pinned_workspace)
+            record_id = _next_id(records, prefix, compact_date)
+            type_fields, contradicts = _build_type_fields(
+                record_type,
+                request.fields,
+                record_id,
+            )
+            candidate = _candidate_record(
+                record_id,
+                request,
+                tags,
+                sources,
+                type_fields,
+            )
+            _validate_candidate(
+                root,
+                workspace_descriptor,
+                candidate,
+                records,
+                contradicts,
+            )
+            document = serialize_record(
+                record_id,
+                record_type,
+                request.title,
+                request.scope,
+                request.date,
+                tags,
+                sources,
+                type_fields,
+            ).encode("utf-8")
+            path = (
+                root
+                / "knowledge"
+                / "records"
+                / record_type
+                / "{}.md".format(record_id)
+            )
+            _require_pinned_workspace(
+                root,
+                workspace_descriptor,
+                knowledge_descriptor,
+            )
+            _require_pinned_record_directories(
+                knowledge_descriptor,
+                records_descriptor,
+                record_type,
+                record_type_descriptor,
+            )
+            target = _PinnedRecordTarget(path, record_type_descriptor)
+            try:
+                try:
+                    publication = _write_create_only(target, document)
+                except FileExistsError:
+                    continue
+                if target.publication is not None:
+                    publication = target.publication
+                if not isinstance(publication, os.stat_result):
+                    raise OSError("record publication identity unavailable")
+
+                try:
+                    _require_pinned_workspace(
+                        root,
+                        workspace_descriptor,
+                        knowledge_descriptor,
+                    )
+                    _require_pinned_record_directories(
+                        knowledge_descriptor,
+                        records_descriptor,
+                        record_type,
+                        record_type_descriptor,
+                    )
+                except DidimError:
+                    try:
+                        _require_record_rollback(
+                            target,
+                            publication,
+                            document,
+                        )
+                    finally:
+                        _refresh_index(
+                            root,
+                            workspace_descriptor,
+                            knowledge_descriptor,
+                        )
+                    raise
+
+                _refresh_index(
+                    root,
+                    workspace_descriptor,
+                    knowledge_descriptor,
+                )
+                try:
+                    _require_pinned_workspace(
+                        root,
+                        workspace_descriptor,
+                        knowledge_descriptor,
+                    )
+                    _require_pinned_record_directories(
+                        knowledge_descriptor,
+                        records_descriptor,
+                        record_type,
+                        record_type_descriptor,
+                    )
+                except DidimError:
+                    try:
+                        _require_record_rollback(
+                            target,
+                            publication,
+                            document,
+                        )
+                    finally:
+                        _refresh_index(
+                            root,
+                            workspace_descriptor,
+                            knowledge_descriptor,
+                        )
+                    raise
+                return path
+            finally:
+                if target.publication_descriptor is not None:
+                    publication_descriptor = target.publication_descriptor
+                    target.publication_descriptor = None
+                    os.close(publication_descriptor)
+    finally:
+        os.close(record_type_descriptor)
+        os.close(records_descriptor)
 
     raise PolicyError("ID_ALLOCATION_RETRY_EXHAUSTED")
 
@@ -503,22 +848,74 @@ def capture(
         raise SchemaError("INVALID_ID_RETRIES")
 
     root = _require_git_root(Path(workspace))
-    scaffold = _require_scaffold(root)
-    # The conditional writer locks knowledge itself; migrate before the
-    # snapshot lock so the same process never acquires that flock twice.
-    if scaffold.updates:
-        try:
-            _apply_scaffold_updates(scaffold)
-        except (DidimError, OSError, UnsafePathError, ValueError):
-            raise _project_error(
-                "PROJECT_SCAFFOLD_MISSING",
-                "먼저 didim setup을 실행해 프로젝트 지식 저장소를 준비하세요.",
-            ) from None
-    with path_lock(root / "knowledge") as _knowledge_descriptor:
-        locked_scaffold = _require_scaffold(root)
-        if locked_scaffold.updates:
-            raise _project_error(
-                "PROJECT_SCAFFOLD_MISSING",
-                "먼저 didim setup을 실행해 프로젝트 지식 저장소를 준비하세요.",
-            )
-        return _capture_locked(root, request, max_id_retries)
+    workspace_descriptor: int | None = None
+    knowledge_descriptor: int | None = None
+    try:
+        workspace_descriptor = open_directory_path(root)
+        knowledge_descriptor = open_child_directory(
+            workspace_descriptor,
+            "knowledge",
+        )
+    except (OSError, UnsafePathError):
+        if workspace_descriptor is not None:
+            os.close(workspace_descriptor)
+        raise _project_error(
+            "PROJECT_SCAFFOLD_MISSING",
+            "먼저 didim setup을 실행해 프로젝트 지식 저장소를 준비하세요.",
+        ) from None
+
+    knowledge_lock: int | None = None
+    try:
+        scaffold = _require_scaffold(root)
+        _require_pinned_workspace(
+            root,
+            workspace_descriptor,
+            knowledge_descriptor,
+        )
+        # The conditional writer locks knowledge itself; migrate before the
+        # snapshot lock so this process never acquires that flock twice.
+        if scaffold.updates:
+            try:
+                _apply_scaffold_updates(scaffold, knowledge_descriptor)
+            except DidimError as error:
+                if _is_missing_scaffold_failure(error):
+                    raise _project_error(
+                        "PROJECT_SCAFFOLD_MISSING",
+                        "먼저 didim setup을 실행해 프로젝트 지식 저장소를 준비하세요.",
+                    ) from None
+                stable_error = _scaffold_update_error(error)
+                if stable_error is error:
+                    raise
+                raise stable_error from error
+            except (OSError, UnsafePathError, ValueError) as error:
+                if _is_missing_scaffold_failure(error):
+                    raise _project_error(
+                        "PROJECT_SCAFFOLD_MISSING",
+                        "먼저 didim setup을 실행해 프로젝트 지식 저장소를 준비하세요.",
+                    ) from None
+                raise PolicyError("SCAFFOLD_CONFLICT") from error
+
+        _require_pinned_workspace(
+            root,
+            workspace_descriptor,
+            knowledge_descriptor,
+        )
+        knowledge_lock = acquire_directory_lock(knowledge_descriptor)
+        _require_pinned_workspace(
+            root,
+            workspace_descriptor,
+            knowledge_descriptor,
+        )
+        _require_scaffold_at(root, scaffold, knowledge_descriptor)
+        return _capture_locked(
+            root,
+            workspace_descriptor,
+            knowledge_descriptor,
+            request,
+            max_id_retries,
+        )
+    finally:
+        if knowledge_lock is not None:
+            os.close(knowledge_lock)
+        os.close(knowledge_descriptor)
+        os.close(workspace_descriptor)

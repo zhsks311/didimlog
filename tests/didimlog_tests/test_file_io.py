@@ -431,6 +431,63 @@ class FileIoContractTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"managed")
             self.assertEqual([entry.name for entry in root.iterdir()], ["target"])
 
+    def test_concurrent_atomic_replace_before_publication_is_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "target"
+            concurrent = root / "concurrent"
+            target.write_bytes(b"original")
+            concurrent.write_bytes(b"latest")
+            expected_info = target.stat()
+            concurrent_info = concurrent.stat()
+            root_descriptor = os.open(
+                root,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            real_link = os.link
+            interleaving_occurred = False
+
+            def replace_target_before_replacement_link(
+                source_name,
+                destination_name,
+                *args,
+                **kwargs,
+            ):
+                nonlocal interleaving_occurred
+                if (
+                    not interleaving_occurred
+                    and source_name.startswith(".didim-replacement-")
+                ):
+                    concurrent.replace(target)
+                    interleaving_occurred = True
+                return real_link(source_name, destination_name, *args, **kwargs)
+
+            try:
+                with mock.patch.object(
+                    file_io.os,
+                    "link",
+                    side_effect=replace_target_before_replacement_link,
+                ):
+                    replaced = replace_regular_file_at_if_unchanged(
+                        root_descriptor,
+                        target.name,
+                        b"original",
+                        b"managed",
+                        0o600,
+                        expected_info=expected_info,
+                    )
+            finally:
+                os.close(root_descriptor)
+
+            self.assertFalse(replaced)
+            self.assertEqual(target.read_bytes(), b"latest")
+            target_info = target.stat()
+            self.assertEqual(
+                (target_info.st_dev, target_info.st_ino),
+                (concurrent_info.st_dev, concurrent_info.st_ino),
+            )
+            self.assertEqual([entry.name for entry in root.iterdir()], ["target"])
+
     def test_rollback_preserves_a_concurrent_replace_after_publish(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

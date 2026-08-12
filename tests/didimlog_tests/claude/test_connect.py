@@ -392,6 +392,139 @@ class DisconnectTests(unittest.TestCase):
             self.assertEqual(settings.read_bytes(), connected_settings)
 
 
+    def test_disconnect_rollback_preserves_user_rename_after_second_digest_check(self):
+        from didimlog.claude import transaction as transaction_module
+
+        user_bytes = {
+            "CLAUDE.md": b"# user rules\n",
+            "settings.json": b'{"theme":"dark"}\n',
+        }
+        replacements = {
+            "CLAUDE.md": b"# concurrent user replacement\n",
+            "settings.json": b'{"concurrent":"user replacement"}\n',
+        }
+        for raced_name, user_replacement in replacements.items():
+            with self.subTest(raced_name=raced_name):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    root = Path(temporary_directory)
+                    home = root / "home"
+                    config = home / ".claude"
+                    config.mkdir(parents=True)
+                    launcher = make_launcher(home)
+                    claude_md = config / "CLAUDE.md"
+                    settings = config / "settings.json"
+                    claude_md.write_bytes(user_bytes["CLAUDE.md"])
+                    settings.write_bytes(user_bytes["settings.json"])
+                    apply_connect(
+                        plan_connect(
+                            config,
+                            launcher=launcher,
+                            environ={},
+                            home=home,
+                        ),
+                        make_journal(root, "before-raced-disconnect"),
+                    )
+                    connected_bytes = {
+                        "CLAUDE.md": claude_md.read_bytes(),
+                        "settings.json": settings.read_bytes(),
+                    }
+                    disconnect_plan = plan_disconnect(config, environ={}, home=home)
+                    raced_path = disconnect_plan.config_dir / raced_name
+                    raced_change = next(
+                        change
+                        for change in disconnect_plan._files
+                        if change.path == raced_path
+                    )
+                    self.assertIsNotNone(raced_change.original)
+                    self.assertIsNotNone(raced_change.intended)
+                    removals = tuple(
+                        change
+                        for change in disconnect_plan._files
+                        if change.intended is None
+                    )
+                    self.assertEqual(len(removals), len(RESOURCE_NAMES))
+                    removal_to_restore, removal_to_fail = removals
+                    removal_to_fail.path.write_bytes(
+                        b"user changed resource after disconnect planning\n"
+                    )
+                    replacement_path = config / f".{raced_name}.user-replacement"
+                    replacement_path.write_bytes(user_replacement)
+                    journal = make_journal(root, f"raced-{raced_name}")
+                    original_write = connect_module.write_regular_file_if_unchanged
+                    original_replace = (
+                        transaction_module.replace_regular_file_at_if_unchanged
+                    )
+                    restoration_attempts = 0
+                    conditional_publish_results: list[bool] = []
+
+                    def fail_deleted_resource_restoration(
+                        path: Path,
+                        expected: bytes | None,
+                        intended: bytes | None,
+                    ) -> None:
+                        nonlocal restoration_attempts
+                        if path == removal_to_restore.path and expected is None:
+                            restoration_attempts += 1
+                            raise OSError(
+                                "forced managed resource restoration failure"
+                            )
+                        original_write(path, expected, intended)
+
+                    def replace_target_before_conditional_publish(
+                        parent_descriptor: int,
+                        name: str,
+                        expected: bytes,
+                        replacement: bytes,
+                        mode: int,
+                        *,
+                        expected_info=None,
+                    ) -> bool:
+                        if name == raced_path.name:
+                            replacement_path.replace(raced_path)
+                        replaced = original_replace(
+                            parent_descriptor,
+                            name,
+                            expected,
+                            replacement,
+                            mode,
+                            expected_info=expected_info,
+                        )
+                        if name == raced_path.name:
+                            conditional_publish_results.append(replaced)
+                        return replaced
+
+                    with (
+                        mock.patch.object(
+                            connect_module,
+                            "write_regular_file_if_unchanged",
+                            side_effect=fail_deleted_resource_restoration,
+                        ),
+                        mock.patch.object(
+                            transaction_module,
+                            "replace_regular_file_at_if_unchanged",
+                            side_effect=replace_target_before_conditional_publish,
+                        ),
+                        self.assertRaisesRegex(
+                            ValueError,
+                            "^managed resource changed after planning$",
+                        ),
+                    ):
+                        apply_disconnect(disconnect_plan, journal)
+
+                    self.assertEqual(restoration_attempts, 1)
+                    self.assertEqual(conditional_publish_results, [False])
+                    expected_bytes = dict(connected_bytes)
+                    expected_bytes[raced_name] = user_replacement
+                    self.assertEqual(
+                        claude_md.read_bytes(),
+                        expected_bytes["CLAUDE.md"],
+                    )
+                    self.assertEqual(
+                        settings.read_bytes(),
+                        expected_bytes["settings.json"],
+                    )
+
+
     def test_disconnect_of_an_unconnected_profile_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
