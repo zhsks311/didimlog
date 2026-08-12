@@ -9,8 +9,35 @@ import stat
 
 from .record import PolicyError
 from .tree import record_tree_digest, validate_record_tree
-from didimlog.file_io import UnsafePathError, read_regular_file_beneath
-from didimlog.locking import path_lock
+from didimlog.file_io import (
+    UnsafePathError,
+    open_child_directory,
+    open_directory_path,
+    read_regular_file_at,
+    read_regular_file_beneath,
+)
+from didimlog.locking import acquire_directory_lock
+
+
+class _PinnedWorkspacePath:
+    __slots__ = (
+        "path",
+        "workspace_descriptor",
+        "knowledge_descriptor",
+    )
+
+    def __init__(
+        self,
+        path: Path,
+        workspace_descriptor: int,
+        knowledge_descriptor: int | None = None,
+    ) -> None:
+        self.path = path
+        self.workspace_descriptor = workspace_descriptor
+        self.knowledge_descriptor = knowledge_descriptor
+
+    def __fspath__(self) -> str:
+        return os.fspath(self.path)
 
 
 INDEX_BANNER = (
@@ -71,13 +98,31 @@ def _build_row(record) -> str:
     return "\t".join(_guard_field(field, record_id) for field in fields)
 
 
-def build_index_bytes(workspace: Path) -> bytes:
-    """Validate the complete tree and return byte-stable UTF-8/LF index bytes."""
-    records = validate_record_tree(workspace)
+def _build_index_bytes(records) -> bytes:
     digest = record_tree_digest(records)
     lines = [INDEX_BANNER, DIGEST_PREFIX + digest, INDEX_HEADER]
-    lines.extend(_build_row(record) for record in sorted(records, key=lambda item: item["id"]))
+    lines.extend(
+        _build_row(record) for record in sorted(records, key=lambda item: item["id"])
+    )
     return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def build_index_bytes(
+    workspace: Path,
+    workspace_descriptor: int | None = None,
+    knowledge_descriptor: int | None = None,
+) -> bytes:
+    """Validate the complete tree and return byte-stable UTF-8/LF index bytes."""
+    if workspace_descriptor is None:
+        workspace_descriptor = getattr(workspace, "workspace_descriptor", None)
+    if knowledge_descriptor is None:
+        knowledge_descriptor = getattr(workspace, "knowledge_descriptor", None)
+    records = validate_record_tree(
+        workspace,
+        workspace_descriptor=workspace_descriptor,
+        knowledge_descriptor=knowledge_descriptor,
+    )
+    return _build_index_bytes(records)
 
 
 def _output_path(workspace: Path) -> Path:
@@ -126,6 +171,45 @@ def _open_directory_at(parent: int, name: str, path: Path) -> int:
         os.close(descriptor)
         raise PolicyError("INDEX_PATH_UNSAFE {}".format(path))
     return descriptor
+
+def _require_pinned_knowledge(
+    workspace: Path,
+    workspace_descriptor: int,
+    knowledge_descriptor: int,
+    path: Path,
+    *,
+    require_workspace_path: bool = False,
+) -> None:
+    root = Path(os.path.abspath(workspace))
+    try:
+        linked_workspace = root.lstat()
+        opened_workspace = os.fstat(workspace_descriptor)
+        opened_knowledge = os.fstat(knowledge_descriptor)
+        linked_knowledge = os.stat(
+            "knowledge",
+            dir_fd=workspace_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise PolicyError("INDEX_PATH_UNSAFE {}".format(path)) from error
+    if (
+        (
+            require_workspace_path
+            and (
+                stat.S_ISLNK(linked_workspace.st_mode)
+                or not stat.S_ISDIR(linked_workspace.st_mode)
+                or not stat.S_ISDIR(opened_workspace.st_mode)
+                or linked_workspace.st_dev != opened_workspace.st_dev
+                or linked_workspace.st_ino != opened_workspace.st_ino
+            )
+        )
+        or not stat.S_ISDIR(opened_knowledge.st_mode)
+        or stat.S_ISLNK(linked_knowledge.st_mode)
+        or not stat.S_ISDIR(linked_knowledge.st_mode)
+        or linked_knowledge.st_dev != opened_knowledge.st_dev
+        or linked_knowledge.st_ino != opened_knowledge.st_ino
+    ):
+        raise PolicyError("INDEX_PATH_UNSAFE {}".format(path))
 
 
 def _open_index_directory(workspace: Path) -> tuple[int, Path]:
@@ -190,6 +274,62 @@ def _open_index_directory(workspace: Path) -> tuple[int, Path]:
         os.close(workspace_descriptor)
 
 
+def _open_index_directory_at(
+    workspace: Path,
+    workspace_descriptor: int,
+    knowledge_descriptor: int,
+) -> tuple[int, Path]:
+    output = _output_path(workspace)
+    workspace_copy: int | None = None
+    knowledge_copy: int | None = None
+    index_descriptor: int | None = None
+    try:
+        workspace_copy = os.dup(workspace_descriptor)
+        knowledge_copy = os.dup(knowledge_descriptor)
+        _require_pinned_knowledge(
+            Path(workspace),
+            workspace_copy,
+            knowledge_copy,
+            output,
+        )
+        try:
+            os.mkdir("index", 0o755, dir_fd=knowledge_copy)
+            os.fsync(knowledge_copy)
+        except FileExistsError:
+            pass
+        index_descriptor = _open_directory_at(
+            knowledge_copy,
+            "index",
+            output.parent,
+        )
+        try:
+            existing = os.stat(
+                "INDEX.md",
+                dir_fd=index_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and (
+            stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode)
+        ):
+            raise PolicyError("INDEX_PATH_UNSAFE {}".format(output))
+        result = index_descriptor
+        index_descriptor = None
+        return result, output
+    except PolicyError:
+        raise
+    except OSError as error:
+        raise PolicyError("INDEX_PATH_UNSAFE {}".format(output)) from error
+    finally:
+        if index_descriptor is not None:
+            os.close(index_descriptor)
+        if knowledge_copy is not None:
+            os.close(knowledge_copy)
+        if workspace_copy is not None:
+            os.close(workspace_copy)
+
+
 def _write_all(descriptor: int, data: bytes) -> None:
     remaining = memoryview(data)
     while remaining:
@@ -200,13 +340,211 @@ def _write_all(descriptor: int, data: bytes) -> None:
     os.fsync(descriptor)
 
 
-def _write_index_locked(workspace: Path) -> Path:
+def _publication_revision(info: os.stat_result) -> tuple[int, ...]:
+    """Return file identity fields that stay stable across a rename."""
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_uid,
+        info.st_gid,
+        info.st_size,
+        info.st_mtime_ns,
+    )
+
+
+def _link_index_backup(directory_descriptor: int, output: Path) -> str | None:
+    try:
+        existing = os.stat(
+            "INDEX.md",
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
+        raise PolicyError("INDEX_PATH_UNSAFE {}".format(output))
+
+    for _ in range(32):
+        backup_name = ".didim-index-{}.bak".format(secrets.token_hex(12))
+        try:
+            os.link(
+                "INDEX.md",
+                backup_name,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            continue
+        try:
+            backup = os.stat(
+                backup_name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(backup.st_mode)
+                or backup.st_dev != existing.st_dev
+                or backup.st_ino != existing.st_ino
+            ):
+                raise PolicyError("INDEX_PATH_UNSAFE {}".format(output))
+            os.fsync(directory_descriptor)
+            return backup_name
+        except BaseException:
+            try:
+                os.unlink(backup_name, dir_fd=directory_descriptor)
+            except OSError:
+                pass
+            raise
+    raise OSError("could not allocate index backup link")
+
+
+def _rollback_index_publication(
+    directory_descriptor: int,
+    backup_name: str | None,
+    replacement: bytes,
+    published_revision: tuple[int, ...],
+) -> bool:
+    """Restore the old index without overwriting a concurrent pathname writer."""
+    recovery_name: str | None = None
+    keep_recovery = False
+    try:
+        for _ in range(32):
+            candidate = ".didim-index-{}.recovery".format(
+                secrets.token_hex(12)
+            )
+            try:
+                recovery_descriptor = os.open(
+                    candidate,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+            except FileExistsError:
+                continue
+            os.close(recovery_descriptor)
+            recovery_name = candidate
+            break
+        if recovery_name is None:
+            return False
+
+        try:
+            os.rename(
+                "INDEX.md",
+                recovery_name,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+            )
+        except FileNotFoundError:
+            os.unlink(recovery_name, dir_fd=directory_descriptor)
+            recovery_name = None
+            if backup_name is not None:
+                try:
+                    os.link(
+                        backup_name,
+                        "INDEX.md",
+                        src_dir_fd=directory_descriptor,
+                        dst_dir_fd=directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError:
+                    pass
+            return True
+
+        published_unchanged = False
+        try:
+            quarantined = read_regular_file_at(
+                directory_descriptor,
+                recovery_name,
+                len(replacement),
+            )
+            quarantined_info = os.stat(
+                recovery_name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            published_unchanged = (
+                quarantined == replacement
+                and _publication_revision(quarantined_info)
+                == published_revision
+            )
+        except (OSError, UnsafePathError):
+            pass
+
+        source_name = (
+            backup_name
+            if published_unchanged and backup_name is not None
+            else recovery_name
+        )
+        if published_unchanged and backup_name is None:
+            return True
+        try:
+            os.link(
+                source_name,
+                "INDEX.md",
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            if not published_unchanged:
+                keep_recovery = True
+        except OSError:
+            keep_recovery = True
+            return False
+        return True
+    finally:
+        if recovery_name is not None and not keep_recovery:
+            try:
+                os.unlink(recovery_name, dir_fd=directory_descriptor)
+            except FileNotFoundError:
+                pass
+
+
+def _write_index_locked(
+    workspace: Path,
+    workspace_descriptor: int | None = None,
+    knowledge_descriptor: int | None = None,
+    *,
+    require_workspace_path: bool = False,
+) -> Path:
     """Build and replace the index while the caller owns the project lock."""
-    _validate_output_target(Path(workspace), _output_path(Path(workspace)))
-    data = build_index_bytes(workspace)
-    directory_descriptor, output = _open_index_directory(Path(workspace))
+    if workspace_descriptor is None:
+        workspace_descriptor = getattr(workspace, "workspace_descriptor", None)
+    if knowledge_descriptor is None:
+        knowledge_descriptor = getattr(workspace, "knowledge_descriptor", None)
+    if (workspace_descriptor is None) != (knowledge_descriptor is None):
+        raise ValueError("both pinned index descriptors are required")
+    if workspace_descriptor is None:
+        _validate_output_target(Path(workspace), _output_path(Path(workspace)))
+        data = build_index_bytes(workspace)
+        directory_descriptor, output = _open_index_directory(Path(workspace))
+    else:
+        data = build_index_bytes(workspace)
+        if require_workspace_path:
+            _require_pinned_knowledge(
+                Path(workspace),
+                workspace_descriptor,
+                knowledge_descriptor,
+                _output_path(Path(workspace)),
+                require_workspace_path=True,
+            )
+        directory_descriptor, output = _open_index_directory_at(
+            Path(workspace),
+            workspace_descriptor,
+            knowledge_descriptor,
+        )
     temporary_name: str | None = None
     temporary_descriptor: int | None = None
+    backup_name: str | None = None
+    publication_started = False
+    publication_committed = False
+    published_revision: tuple[int, ...] | None = None
     try:
         for _ in range(32):
             temporary_name = ".didim-index-{}.tmp".format(secrets.token_hex(12))
@@ -227,8 +565,18 @@ def _write_index_locked(workspace: Path) -> Path:
         if temporary_descriptor is None or temporary_name is None:
             raise OSError("could not allocate index temporary file")
         _write_all(temporary_descriptor, data)
-        os.close(temporary_descriptor)
-        temporary_descriptor = None
+        published_revision = _publication_revision(
+            os.fstat(temporary_descriptor)
+        )
+        if require_workspace_path:
+            backup_name = _link_index_backup(directory_descriptor, output)
+            _require_pinned_knowledge(
+                Path(workspace),
+                workspace_descriptor,
+                knowledge_descriptor,
+                output,
+                require_workspace_path=True,
+            )
         os.replace(
             temporary_name,
             "INDEX.md",
@@ -236,9 +584,45 @@ def _write_index_locked(workspace: Path) -> Path:
             dst_dir_fd=directory_descriptor,
         )
         temporary_name = None
+        publication_started = True
+        if require_workspace_path:
+            _require_pinned_knowledge(
+                Path(workspace),
+                workspace_descriptor,
+                knowledge_descriptor,
+                output,
+                require_workspace_path=True,
+            )
         os.fsync(directory_descriptor)
+        publication_committed = True
         return output
     finally:
+        if (
+            publication_started
+            and not publication_committed
+            and published_revision is not None
+        ):
+            try:
+                rollback_succeeded = _rollback_index_publication(
+                    directory_descriptor,
+                    backup_name,
+                    data,
+                    published_revision,
+                )
+            except OSError:
+                rollback_succeeded = False
+            if rollback_succeeded:
+                try:
+                    os.fsync(directory_descriptor)
+                except OSError:
+                    backup_name = None
+            else:
+                backup_name = None
+        if backup_name is not None:
+            try:
+                os.unlink(backup_name, dir_fd=directory_descriptor)
+            except OSError:
+                pass
         if temporary_descriptor is not None:
             os.close(temporary_descriptor)
         if temporary_name is not None:
@@ -249,37 +633,184 @@ def _write_index_locked(workspace: Path) -> Path:
         os.close(directory_descriptor)
 
 
+def _write_index_at(
+    workspace: Path,
+    workspace_descriptor: int,
+    knowledge_descriptor: int,
+) -> Path:
+    """Replace the index using one caller-owned pinned project snapshot."""
+    return _write_index_locked(
+        _PinnedWorkspacePath(
+            Path(workspace),
+            workspace_descriptor,
+            knowledge_descriptor,
+        )
+    )
+
+
 def write_index(workspace: Path) -> Path:
     """Replace the fixed project index from one exclusive source snapshot."""
     root = Path(os.path.abspath(workspace))
-    with path_lock(root / "knowledge"):
-        return _write_index_locked(root)
+    _validate_output_target(root, _output_path(root))
+    workspace_descriptor = open_directory_path(root)
+    workspace_lock: int | None = None
+    knowledge_descriptor: int | None = None
+    knowledge_lock: int | None = None
+    try:
+        workspace_lock = acquire_directory_lock(workspace_descriptor)
+        knowledge_descriptor = open_child_directory(
+            workspace_descriptor,
+            "knowledge",
+        )
+        knowledge_lock = acquire_directory_lock(knowledge_descriptor)
+        pinned = _PinnedWorkspacePath(
+            root,
+            workspace_descriptor,
+            knowledge_descriptor,
+        )
+        _require_pinned_knowledge(
+            root,
+            workspace_descriptor,
+            knowledge_descriptor,
+            _output_path(root),
+            require_workspace_path=True,
+        )
+        return _write_index_locked(
+            pinned,
+            require_workspace_path=True,
+        )
+    finally:
+        if knowledge_lock is not None:
+            os.close(knowledge_lock)
+        if knowledge_descriptor is not None:
+            os.close(knowledge_descriptor)
+        if workspace_lock is not None:
+            os.close(workspace_lock)
+        os.close(workspace_descriptor)
 
 
 def _check_index_locked(workspace: Path) -> int:
     """Compare the fixed index while the caller owns the project lock."""
+    workspace_descriptor = getattr(workspace, "workspace_descriptor", None)
+    knowledge_descriptor = getattr(workspace, "knowledge_descriptor", None)
+    if (workspace_descriptor is None) != (knowledge_descriptor is None):
+        raise ValueError("both pinned index descriptors are required")
     expected = build_index_bytes(workspace)
     output = _output_path(Path(workspace))
     _validate_output_target(Path(workspace), output)
+    if workspace_descriptor is None:
+        try:
+            linked = output.lstat()
+        except FileNotFoundError:
+            return 1
+        if stat.S_ISLNK(linked.st_mode) or not stat.S_ISREG(linked.st_mode):
+            raise PolicyError("INDEX_PATH_UNSAFE {}".format(output))
+        try:
+            actual = read_regular_file_beneath(
+                Path(workspace),
+                Path("knowledge") / "index" / "INDEX.md",
+                len(expected),
+            )
+        except UnsafePathError as error:
+            raise PolicyError("INDEX_PATH_UNSAFE {}".format(output)) from error
+        return 0 if actual == expected else 1
+
+    _require_pinned_knowledge(
+        Path(workspace),
+        workspace_descriptor,
+        knowledge_descriptor,
+        output,
+    )
     try:
-        linked = output.lstat()
+        os.stat(
+            "index",
+            dir_fd=knowledge_descriptor,
+            follow_symlinks=False,
+        )
     except FileNotFoundError:
         return 1
-    if stat.S_ISLNK(linked.st_mode) or not stat.S_ISREG(linked.st_mode):
-        raise PolicyError("INDEX_PATH_UNSAFE {}".format(output))
+    index_descriptor = _open_directory_at(
+        knowledge_descriptor,
+        "index",
+        output.parent,
+    )
     try:
-        actual = read_regular_file_beneath(
+        try:
+            linked = os.stat(
+                "INDEX.md",
+                dir_fd=index_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return 1
+        if stat.S_ISLNK(linked.st_mode) or not stat.S_ISREG(linked.st_mode):
+            raise PolicyError("INDEX_PATH_UNSAFE {}".format(output))
+        try:
+            actual = read_regular_file_at(
+                index_descriptor,
+                "INDEX.md",
+                len(expected),
+            )
+        except UnsafePathError as error:
+            raise PolicyError("INDEX_PATH_UNSAFE {}".format(output)) from error
+        _require_pinned_knowledge(
             Path(workspace),
-            Path("knowledge") / "index" / "INDEX.md",
-            len(expected),
+            workspace_descriptor,
+            knowledge_descriptor,
+            output,
         )
-    except UnsafePathError as error:
-        raise PolicyError("INDEX_PATH_UNSAFE {}".format(output)) from error
-    return 0 if actual == expected else 1
+        return 0 if actual == expected else 1
+    finally:
+        os.close(index_descriptor)
 
 
 def check_index(workspace: Path) -> int:
     """Return zero only for one shared-lock-consistent project snapshot."""
     root = Path(os.path.abspath(workspace))
-    with path_lock(root / "knowledge", shared=True):
-        return _check_index_locked(root)
+    _validate_output_target(root, _output_path(root))
+    workspace_descriptor = open_directory_path(root)
+    workspace_lock: int | None = None
+    knowledge_descriptor: int | None = None
+    knowledge_lock: int | None = None
+    try:
+        workspace_lock = acquire_directory_lock(
+            workspace_descriptor,
+            shared=True,
+        )
+        knowledge_descriptor = open_child_directory(
+            workspace_descriptor,
+            "knowledge",
+        )
+        knowledge_lock = acquire_directory_lock(
+            knowledge_descriptor,
+            shared=True,
+        )
+        pinned = _PinnedWorkspacePath(
+            root,
+            workspace_descriptor,
+            knowledge_descriptor,
+        )
+        _require_pinned_knowledge(
+            root,
+            workspace_descriptor,
+            knowledge_descriptor,
+            _output_path(root),
+            require_workspace_path=True,
+        )
+        result = _check_index_locked(pinned)
+        _require_pinned_knowledge(
+            root,
+            workspace_descriptor,
+            knowledge_descriptor,
+            _output_path(root),
+            require_workspace_path=True,
+        )
+        return result
+    finally:
+        if knowledge_lock is not None:
+            os.close(knowledge_lock)
+        if knowledge_descriptor is not None:
+            os.close(knowledge_descriptor)
+        if workspace_lock is not None:
+            os.close(workspace_lock)
+        os.close(workspace_descriptor)

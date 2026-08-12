@@ -1,3 +1,4 @@
+import os
 import subprocess
 import tarfile
 import tempfile
@@ -90,6 +91,125 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIn("gh release download", workflow_text)
         self.assertIn("pypa/gh-action-pypi-publish@release/v1", workflow_text)
         self.assertNotIn("PYPI_API_TOKEN", workflow_text)
+
+    def test_release_checksum_manifest_exactly_covers_wheel_and_sdist(self):
+        workflow = yaml.safe_load(
+            (REPO / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        )
+        verification_script = next(
+            step["run"]
+            for step in workflow["jobs"]["publish"]["steps"]
+            if step.get("name") == "Verify tag, filenames, and checksums"
+        )
+        wheel = f"didimlog-{VERSION}-py3-none-any.whl"
+        sdist = f"didimlog-{VERSION}.tar.gz"
+        checksum = "0" * 64
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            packages = root / "packages"
+            verify = root / "verify"
+            binaries = root / "bin"
+            packages.mkdir()
+            verify.mkdir()
+            binaries.mkdir()
+            (packages / wheel).touch()
+            (packages / sdist).touch()
+
+            checksum_marker = root / "sha256sum-called"
+            fake_sha256sum = binaries / "sha256sum"
+            fake_sha256sum.write_text(
+                '#!/bin/sh\n'
+                'touch "$SHA256SUM_MARKER"\n'
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            fake_sha256sum.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "TAG": f"v{VERSION}",
+                    "PATH": f"{binaries}{os.pathsep}{environment['PATH']}",
+                    "SHA256SUM_MARKER": str(checksum_marker),
+                }
+            )
+
+            def run_verification(manifest: str):
+                (verify / "SHA256SUMS").write_text(
+                    manifest,
+                    encoding="utf-8",
+                )
+                checksum_marker.unlink(missing_ok=True)
+                result = subprocess.run(
+                    ["bash", "-e", "-c", verification_script],
+                    cwd=root,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                )
+                return result, checksum_marker.exists()
+
+            complete, checked_complete = run_verification(
+                f"{checksum}  {wheel}\n{checksum}  {sdist}\n"
+            )
+            self.assertEqual(complete.returncode, 0, complete.stderr)
+            self.assertTrue(checked_complete)
+
+            incomplete, checked_incomplete = run_verification(
+                f"{checksum}  {wheel}\n"
+            )
+            self.assertNotEqual(
+                incomplete.returncode,
+                0,
+                "verification accepted SHA256SUMS without the sdist",
+            )
+            self.assertFalse(
+                checked_incomplete,
+                "sha256sum --check ran before manifest coverage was rejected",
+            )
+
+            extra, checked_extra = run_verification(
+                f"{checksum}  {wheel}\n"
+                f"{checksum}  {sdist}\n"
+                f"{checksum}  unexpected-package.whl\n"
+            )
+            self.assertNotEqual(
+                extra.returncode,
+                0,
+                "verification accepted an extra manifest entry",
+            )
+            self.assertFalse(
+                checked_extra,
+                "sha256sum --check ran before extra manifest data was rejected",
+            )
+
+            bsd_tagged, checked_bsd_tagged = run_verification(
+                f"{checksum}  {wheel}\n"
+                f"{checksum}  {sdist}\n"
+                f"SHA256 ({wheel}) = {checksum}\n"
+            )
+            self.assertNotEqual(
+                bsd_tagged.returncode,
+                0,
+                "verification accepted a BSD-style tagged duplicate checksum entry",
+            )
+            self.assertFalse(
+                checked_bsd_tagged,
+                "sha256sum --check ran before BSD-style manifest data was rejected",
+            )
+
+            malformed, checked_malformed = run_verification(
+                f"{checksum}  {wheel}\n{sdist}\n"
+            )
+            self.assertNotEqual(
+                malformed.returncode,
+                0,
+                "verification accepted a filename without a checksum",
+            )
+            self.assertFalse(
+                checked_malformed,
+                "sha256sum --check ran before malformed manifest data was rejected",
+            )
 
     @classmethod
     def _contains_key(cls, value, expected):

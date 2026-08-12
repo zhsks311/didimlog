@@ -441,19 +441,24 @@ def apply_disconnect(plan: ClaudeChangePlan, journal: InstallJournal) -> None:
         except OSError:
             pass
     except BaseException:
-        for change in reversed(deleted):
-            if (
-                read_optional_regular_file(
-                    change.path,
-                    _MANAGED_FILE_MAXIMUM_BYTES,
-                )
-                is None
-                and change.original is not None
-            ):
-                write_regular_file_if_unchanged(
-                    change.path,
-                    None,
-                    change.original,
-                )
-        journal.rollback()
+        try:
+            for change in reversed(deleted):
+                try:
+                    if (
+                        read_optional_regular_file(
+                            change.path,
+                            _MANAGED_FILE_MAXIMUM_BYTES,
+                        )
+                        is None
+                        and change.original is not None
+                    ):
+                        write_regular_file_if_unchanged(
+                            change.path,
+                            None,
+                            change.original,
+                        )
+                except (OSError, ValueError):
+                    continue
+        finally:
+            journal.rollback()
         raise

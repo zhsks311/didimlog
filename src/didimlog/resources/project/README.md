@@ -45,8 +45,8 @@ v1은 세 가지 record type만 지원한다. `type` 값과 ID prefix는 반드�
 | `experiment` | `EXP` | 실험(Experiment) | 가설을 세우고 방법·결과·해석을 남길 때 |
 | `evidence` | `EVD` | 근거(Evidence) | 로그·산출물 같은 원자료를 참조·고정할 때 |
 
-- ID 형식은 `PREFIX-YYYYMMDD-NN` (예: `OBS-20260714-01`). 날짜와 2자리 순번을
-  사람이 직접 지정하며 자동 추측하지 않는다.
+- ID 형식은 `PREFIX-YYYYMMDD-NN` (예: `OBS-20260714-01`). `didim add`는
+  `--date YYYY-MM-DD`와 기존 record를 기준으로 ID의 날짜와 두 자리 순번을 자동 할당한다.
 - `finding`, `decision`, `playbook`, `failure_pattern`, `improvement_proposal`
   (FIN/DEC/PLB/FPT/IMP) 등 다른 type은 **v1에서 구현하지 않는다**(8절 참고).
 
@@ -175,7 +175,9 @@ byte 표현과 같아야 한다.
 
 ### 7.3 Experiment 모순 신호: `Contradicts:`
 
-`didim add experiment`는 `--contradicts`가 필수이며 기본값도 추론도 없다.
+`didim add experiment`는 JSON stdin의 `contradicts` 필드로 모순 ID를 입력한다. 값은
+모순이 없으면 `"none"`, 있으면 `"<ID>, <ID>, ..."`인 문자열이다. 이 필드는 필수이며
+기본값도 추론도 없다.
 `## Interpretation` 아래 첫 번째 비어 있지 않은 줄은 정확히 다음 중 하나다.
 
 - `Contradicts: none`

@@ -1,12 +1,16 @@
 import dataclasses
+import hashlib
 import json
 import os
 import pathlib
 import re
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
+import didimlog.file_io as file_io_module
+import didimlog.indexing as indexing_module
 import didimlog.project.scaffold as scaffold_module
 
 from didimlog.errors import DidimError, EXIT_POLICY
@@ -39,6 +43,48 @@ POINTER = (
     "`review_by`가 조회 기준일보다 이르면 STALE로 취급해 참고만 하고, 부정(refuted/failure) 결과는 지우지 않는다.\n"
     "active/harness.md에 사람이 직접 규칙을 쓰지 않는다(승격 게이트 전용, v1에서는 비어 있음).\n"
 ).encode("utf-8")
+
+
+def _legacy_readme(current):
+    replacements = (
+        (
+            (
+                "- ID 형식은 `PREFIX-YYYYMMDD-NN` (예: `OBS-20260714-01`). "
+                "`didim add`는\n"
+                "  `--date YYYY-MM-DD`와 기존 record를 기준으로 ID의 날짜와 두 자리 "
+                "순번을 자동 할당한다."
+            ),
+            (
+                "- ID 형식은 `PREFIX-YYYYMMDD-NN` (예: `OBS-20260714-01`). "
+                "날짜와 2자리 순번을\n"
+                "  사람이 직접 지정하며 자동 추측하지 않는다."
+            ),
+        ),
+        (
+            (
+                "`didim add experiment`는 JSON stdin의 `contradicts` 필드로 모순 ID를 "
+                "입력한다. 값은\n"
+                '모순이 없으면 `"none"`, 있으면 `"<ID>, <ID>, ..."`인 문자열이다. '
+                "이 필드는 필수이며\n"
+                "기본값도 추론도 없다."
+            ),
+            (
+                "`didim add experiment`는 `--contradicts`가 필수이며 기본값도 "
+                "추론도 없다."
+            ),
+        ),
+    )
+    text = current.decode("utf-8")
+    for current_paragraph, legacy_paragraph in replacements:
+        assert text.count(current_paragraph) == 1
+        text = text.replace(current_paragraph, legacy_paragraph)
+    legacy = text.encode("utf-8")
+    assert len(legacy) == 16_336
+    assert (
+        hashlib.sha256(legacy).hexdigest()
+        == "6347d06afaab04f94c9f409717e0539add7252d000e5b0d51ea68d00036b0961"
+    )
+    return legacy
 
 
 class ScaffoldTests(unittest.TestCase):
@@ -102,6 +148,7 @@ class ScaffoldTests(unittest.TestCase):
             plan.directories = ()
 
         planned = self._planned_bytes(plan)
+        readme = planned[pathlib.Path("knowledge/README.md")].decode("utf-8")
         self.assertTrue(planned[pathlib.Path("knowledge/README.md")].startswith(
             b"# Knowledge Harness (v1)"
         ))
@@ -109,6 +156,17 @@ class ScaffoldTests(unittest.TestCase):
             b"knowledge-harness-tutorial.html",
             planned[pathlib.Path("knowledge/README.md")],
         )
+        self.assertIn(
+            "`didim add`는\n"
+            "  `--date YYYY-MM-DD`와 기존 record를 기준으로 ID의 날짜와 두 자리 순번을 자동 할당한다.",
+            readme,
+        )
+        self.assertIn(
+            "`didim add experiment`는 JSON stdin의 `contradicts` 필드로 모순 ID를 입력한다.",
+            readme,
+        )
+        self.assertNotIn("사람이 직접 지정하며", readme)
+        self.assertNotIn("--contradicts", readme)
         self.assertEqual(planned[pathlib.Path("knowledge/POINTER.md")], POINTER)
         schema = json.loads(
             planned[pathlib.Path("knowledge/schema/record.schema.json")].decode("utf-8")
@@ -211,6 +269,542 @@ class ScaffoldTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), expected_bytes[relative])
             self.assertEqual(path.stat().st_mtime_ns, expected_timestamps[relative])
 
+    def test_exact_legacy_readme_is_planned_and_applied_as_only_update(self):
+        initial_plan = plan_scaffold(self.workspace)
+        current = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        readme = self.workspace / "knowledge/README.md"
+        legacy = _legacy_readme(current)
+        readme.write_bytes(legacy)
+
+        plan = plan_scaffold(self.workspace)
+
+        self.assertEqual(plan.updates, ((readme, legacy, current),))
+        apply_scaffold(plan)
+        self.assertEqual(readme.read_bytes(), current)
+
+    def test_prepared_project_reader_waits_for_legacy_readme_update_lock(self):
+        initial_plan = plan_scaffold(self.workspace)
+        current = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        readme = self.workspace / "knowledge/README.md"
+        readme.write_bytes(_legacy_readme(current))
+        migration_plan = plan_scaffold(self.workspace)
+
+        original_acquire_directory_lock = scaffold_module.acquire_directory_lock
+        original_path_lock = indexing_module.path_lock
+        writer_holds_lock = threading.Event()
+        allow_writer = threading.Event()
+        reader_progress = threading.Event()
+        reader_finished = threading.Event()
+        writer_errors = []
+        reader_errors = []
+        prepared_results = []
+
+        def pause_after_knowledge_lock(
+            parent_descriptor,
+            *,
+            shared=False,
+            blocking=True,
+        ):
+            lock_descriptor = original_acquire_directory_lock(
+                parent_descriptor,
+                shared=shared,
+                blocking=blocking,
+            )
+            writer_holds_lock.set()
+            if not allow_writer.wait(5):
+                os.close(lock_descriptor)
+                raise AssertionError("scaffold update lock was not released")
+            return lock_descriptor
+
+        def observe_reader_lock(*args, **kwargs):
+            try:
+                with original_path_lock(*args, blocking=False, **kwargs):
+                    raise AssertionError(
+                        "reader acquired scaffold update lock without blocking"
+                    )
+            except BlockingIOError:
+                reader_progress.set()
+            return original_path_lock(*args, **kwargs)
+
+        def migrate_readme():
+            try:
+                apply_scaffold(migration_plan)
+            except BaseException as error:
+                writer_errors.append(error)
+
+        def read_prepared_project():
+            try:
+                prepared_results.append(
+                    indexing_module._prepared_project(self.workspace)
+                )
+            except BaseException as error:
+                reader_errors.append(error)
+            finally:
+                reader_finished.set()
+                reader_progress.set()
+
+        with (
+            mock.patch.object(
+                scaffold_module,
+                "acquire_directory_lock",
+                side_effect=pause_after_knowledge_lock,
+            ),
+            mock.patch.object(
+                indexing_module,
+                "path_lock",
+                side_effect=observe_reader_lock,
+            ),
+        ):
+            migration = threading.Thread(
+                target=migrate_readme,
+                name="legacy-readme-migration",
+                daemon=True,
+            )
+            reader = threading.Thread(
+                target=read_prepared_project,
+                name="prepared-project-reader",
+                daemon=True,
+            )
+            migration.start()
+            try:
+                self.assertTrue(writer_holds_lock.wait(5))
+                reader.start()
+                self.assertTrue(reader_progress.wait(5))
+                reader_finished_before_release = reader_finished.is_set()
+                reader_alive_before_release = reader.is_alive()
+            finally:
+                allow_writer.set()
+                migration.join(10)
+                if reader.ident is not None:
+                    reader.join(10)
+
+        self.assertFalse(reader_finished_before_release)
+        self.assertTrue(reader_alive_before_release)
+        self.assertFalse(migration.is_alive())
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(writer_errors, [])
+        self.assertEqual(reader_errors, [])
+        self.assertEqual(prepared_results, [True])
+        self.assertTrue(readme.is_file())
+        self.assertEqual(readme.read_bytes(), current)
+
+    def test_stale_legacy_update_plan_is_idempotent_after_another_apply(self):
+        initial_plan = plan_scaffold(self.workspace)
+        current = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        readme = self.workspace / "knowledge/README.md"
+        readme.write_bytes(_legacy_readme(current))
+        stale_plan = plan_scaffold(self.workspace)
+
+        apply_scaffold(stale_plan)
+        migrated_timestamp = readme.stat().st_mtime_ns
+        apply_scaffold(stale_plan)
+
+        self.assertEqual(readme.read_bytes(), current)
+        self.assertEqual(readme.stat().st_mtime_ns, migrated_timestamp)
+
+    def test_readme_changed_after_legacy_migration_plan_aborts_without_overwrite(self):
+        initial_plan = plan_scaffold(self.workspace)
+        current = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        readme = self.workspace / "knowledge/README.md"
+        readme.write_bytes(_legacy_readme(current))
+        plan = plan_scaffold(self.workspace)
+        user_bytes = b"user edit after migration plan\n"
+        readme.write_bytes(user_bytes)
+
+        self._assert_policy_error(lambda: apply_scaffold(plan))
+
+        self.assertEqual(readme.read_bytes(), user_bytes)
+
+    def test_workspace_replaced_by_symlink_after_preflight_cannot_redirect_legacy_update(
+        self,
+    ):
+        initial_plan = plan_scaffold(self.workspace)
+        current = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        legacy = _legacy_readme(current)
+        readme = self.workspace / "knowledge/README.md"
+        readme.write_bytes(legacy)
+        plan = plan_scaffold(self.workspace)
+
+        outside = self.root / "outside"
+        outside.mkdir()
+        self._make_empty_git_repository(outside)
+        apply_scaffold(plan_scaffold(outside))
+        outside_readme = outside / "knowledge/README.md"
+        outside_readme.write_bytes(legacy)
+
+        backup = self.root / "workspace-backup"
+
+        def restore_workspace():
+            if self.workspace.is_symlink():
+                self.workspace.unlink()
+            if backup.exists() and not self.workspace.exists():
+                backup.rename(self.workspace)
+
+        original_write = scaffold_module._update_scaffold_file_at
+        replaced = False
+
+        def replace_workspace_before_update(
+            parent_descriptor,
+            path,
+            original,
+            intended,
+        ):
+            nonlocal replaced
+            if not replaced:
+                self.workspace.rename(backup)
+                self._symlink(
+                    self.workspace,
+                    outside,
+                    target_is_directory=True,
+                )
+                replaced = True
+            return original_write(parent_descriptor, path, original, intended)
+
+        try:
+            raised = None
+            with mock.patch.object(
+                scaffold_module,
+                "_update_scaffold_file_at",
+                side_effect=replace_workspace_before_update,
+            ):
+                try:
+                    apply_scaffold(plan)
+                except DidimError as error:
+                    raised = error
+
+            with self.subTest("apply rejects the path replacement"):
+                self.assertIsNotNone(raised)
+                if raised is not None:
+                    self.assertEqual(raised.exit_code, EXIT_POLICY)
+            with self.subTest("external scaffold remains untouched"):
+                self.assertEqual(outside_readme.read_bytes(), legacy)
+        finally:
+            restore_workspace()
+
+    def test_workspace_replaced_by_directory_after_preflight_cannot_redirect_update(
+        self,
+    ):
+        initial_plan = plan_scaffold(self.workspace)
+        current = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        legacy = _legacy_readme(current)
+        readme = self.workspace / "knowledge/README.md"
+        readme.write_bytes(legacy)
+        plan = plan_scaffold(self.workspace)
+
+        replacement = self.root / "replacement"
+        replacement.mkdir()
+        self._make_empty_git_repository(replacement)
+        apply_scaffold(plan_scaffold(replacement))
+        replacement_readme = replacement / "knowledge/README.md"
+        replacement_readme.write_bytes(legacy)
+        backup = self.root / "workspace-backup"
+        original_preflight = scaffold_module._preflight
+
+        def preflight_then_replace(candidate):
+            original_preflight(candidate)
+            self.workspace.rename(backup)
+            replacement.rename(self.workspace)
+
+        try:
+            raised = None
+            with mock.patch.object(
+                scaffold_module,
+                "_preflight",
+                side_effect=preflight_then_replace,
+            ):
+                try:
+                    apply_scaffold(plan)
+                except DidimError as error:
+                    raised = error
+
+            with self.subTest("apply rejects the directory replacement"):
+                self.assertIsNotNone(raised)
+                if raised is not None:
+                    self.assertEqual(raised.exit_code, EXIT_POLICY)
+            with self.subTest("replacement scaffold remains untouched"):
+                self.assertEqual(
+                    (self.workspace / "knowledge/README.md").read_bytes(),
+                    legacy,
+                )
+        finally:
+            if self.workspace.exists():
+                self.workspace.rename(replacement)
+            if backup.exists():
+                backup.rename(self.workspace)
+
+    def test_path_escape_after_legacy_update_restores_original_readme_without_touching_replacement(
+        self,
+    ):
+        initial_plan = plan_scaffold(self.workspace)
+        intended = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        readme = self.workspace / "knowledge/README.md"
+        legacy = _legacy_readme(intended)
+        readme.write_bytes(legacy)
+        plan = plan_scaffold(self.workspace)
+
+        replacement = self.root / "replacement"
+        replacement.mkdir()
+        self._make_empty_git_repository(replacement)
+        replacement_readme = replacement / "knowledge/README.md"
+        replacement_readme.parent.mkdir()
+        replacement_bytes = b"replacement workspace readme\n"
+        replacement_readme.write_bytes(replacement_bytes)
+        replacement_user_data = replacement / "user-data.bin"
+        replacement_user_bytes = b"replacement workspace user data\n"
+        replacement_user_data.write_bytes(replacement_user_bytes)
+        original_workspace = self.root / "original-workspace"
+        original_update = scaffold_module._update_scaffold_file_at
+
+        def update_then_replace_workspace(
+            parent_descriptor,
+            path,
+            original,
+            current,
+        ):
+            update_result = original_update(
+                parent_descriptor,
+                path,
+                original,
+                current,
+            )
+            self.assertEqual(path.read_bytes(), intended)
+            self.workspace.rename(original_workspace)
+            replacement.rename(self.workspace)
+            return update_result
+
+        try:
+            with mock.patch.object(
+                scaffold_module,
+                "_update_scaffold_file_at",
+                side_effect=update_then_replace_workspace,
+            ):
+                with self.assertRaises(DidimError) as raised:
+                    apply_scaffold(plan)
+
+            self.assertEqual(
+                raised.exception.token,
+                f"PATH_ESCAPE {self.workspace}",
+            )
+            self.assertEqual(raised.exception.exit_code, EXIT_POLICY)
+            self.assertEqual(
+                (original_workspace / "knowledge/README.md").read_bytes(),
+                legacy,
+            )
+            self.assertEqual(
+                (self.workspace / "knowledge/README.md").read_bytes(),
+                replacement_bytes,
+            )
+            self.assertEqual(
+                (self.workspace / "user-data.bin").read_bytes(),
+                replacement_user_bytes,
+            )
+        finally:
+            if original_workspace.exists():
+                if self.workspace.exists():
+                    self.workspace.rename(replacement)
+                original_workspace.rename(self.workspace)
+
+    def test_path_escape_does_not_rollback_other_writer_publish_before_local_noop(
+        self,
+    ):
+        initial_plan = plan_scaffold(self.workspace)
+        intended = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        readme = self.workspace / "knowledge/README.md"
+        legacy = _legacy_readme(intended)
+        readme.write_bytes(legacy)
+        legacy_inode = readme.stat().st_ino
+        plan = plan_scaffold(self.workspace)
+
+        replacement_workspace = self.root / "replacement"
+        replacement_workspace.mkdir()
+        self._make_empty_git_repository(replacement_workspace)
+        original_workspace = self.root / "original-workspace"
+        original_update = scaffold_module._update_scaffold_file_at
+        other_writer_inode = None
+
+        def publish_by_other_writer_before_local_update(
+            parent_descriptor,
+            path,
+            original,
+            current,
+        ):
+            nonlocal other_writer_inode
+            staged = readme.with_name(".other-writer-readme")
+            staged.write_bytes(intended)
+            os.replace(staged, readme)
+            other_writer_inode = readme.stat().st_ino
+            self.assertNotEqual(other_writer_inode, legacy_inode)
+
+            update_result = original_update(
+                parent_descriptor,
+                path,
+                original,
+                current,
+            )
+            self.assertIsNone(update_result)
+            self.workspace.rename(original_workspace)
+            replacement_workspace.rename(self.workspace)
+            return update_result
+
+        try:
+            with mock.patch.object(
+                scaffold_module,
+                "_update_scaffold_file_at",
+                side_effect=publish_by_other_writer_before_local_update,
+            ):
+                with self.assertRaises(DidimError) as raised:
+                    apply_scaffold(plan)
+
+            self.assertEqual(
+                raised.exception.token,
+                f"PATH_ESCAPE {self.workspace}",
+            )
+            published = original_workspace / "knowledge/README.md"
+            self.assertEqual(published.read_bytes(), intended)
+            self.assertEqual(published.stat().st_ino, other_writer_inode)
+        finally:
+            if original_workspace.exists():
+                if self.workspace.exists():
+                    self.workspace.rename(replacement_workspace)
+                original_workspace.rename(self.workspace)
+
+    def test_path_escape_does_not_rollback_user_inode_replacing_local_publish(
+        self,
+    ):
+        initial_plan = plan_scaffold(self.workspace)
+        intended = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        readme = self.workspace / "knowledge/README.md"
+        readme.write_bytes(_legacy_readme(intended))
+        plan = plan_scaffold(self.workspace)
+
+        replacement_workspace = self.root / "replacement"
+        replacement_workspace.mkdir()
+        self._make_empty_git_repository(replacement_workspace)
+        original_workspace = self.root / "original-workspace"
+        original_replace = (
+            scaffold_module.replace_regular_file_at_if_unchanged_with_ownership
+        )
+        user_inode = None
+
+        def replace_locally_then_publish_user_inode(
+            parent_descriptor,
+            name,
+            expected,
+            replacement,
+            mode,
+            *,
+            expected_info=None,
+        ):
+            nonlocal user_inode
+            publication = original_replace(
+                parent_descriptor,
+                name,
+                expected,
+                replacement,
+                mode,
+                expected_info=expected_info,
+            )
+            self.assertIsNotNone(publication)
+            ownership_info, _ = publication
+            local_inode = ownership_info.st_ino
+            staged = readme.with_name(".user-readme")
+            staged.write_bytes(intended)
+            os.replace(staged, readme)
+            user_inode = readme.stat().st_ino
+            self.assertNotEqual(user_inode, local_inode)
+            self.workspace.rename(original_workspace)
+            replacement_workspace.rename(self.workspace)
+            return publication
+
+        try:
+            with (
+                mock.patch.object(
+                    file_io_module,
+                    "_conditional_replace_revision",
+                    return_value=(0,),
+                ),
+                mock.patch.object(
+                    scaffold_module,
+                    "replace_regular_file_at_if_unchanged_with_ownership",
+                    side_effect=replace_locally_then_publish_user_inode,
+                ),
+            ):
+                with self.assertRaises(DidimError) as raised:
+                    apply_scaffold(plan)
+
+            self.assertEqual(
+                raised.exception.token,
+                f"PATH_ESCAPE {self.workspace}",
+            )
+            published = original_workspace / "knowledge/README.md"
+            self.assertEqual(published.read_bytes(), intended)
+            self.assertEqual(published.stat().st_ino, user_inode)
+        finally:
+            if original_workspace.exists():
+                if self.workspace.exists():
+                    self.workspace.rename(replacement_workspace)
+                original_workspace.rename(self.workspace)
+
+    def test_user_edit_of_new_pointer_survives_rollback_when_readme_update_fails(
+        self,
+    ):
+        initial_plan = plan_scaffold(self.workspace)
+        current = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        readme = self.workspace / "knowledge/README.md"
+        readme.write_bytes(_legacy_readme(current))
+        pointer = self.workspace / "knowledge/POINTER.md"
+        pointer.unlink()
+        plan = plan_scaffold(self.workspace)
+        user_bytes = b"user edit after pointer creation\n"
+
+        def edit_pointer_then_fail(*_args):
+            created_identity = pointer.stat().st_ino
+            pointer.write_bytes(user_bytes)
+            self.assertEqual(pointer.stat().st_ino, created_identity)
+            raise OSError("injected README update failure")
+
+        with mock.patch.object(
+            scaffold_module,
+            "_update_scaffold_file_at",
+            side_effect=edit_pointer_then_fail,
+        ):
+            self._assert_policy_error(lambda: apply_scaffold(plan))
+
+        self.assertTrue(pointer.exists())
+        self.assertEqual(pointer.read_bytes(), user_bytes)
+
+
+
     def test_regular_file_where_directory_is_required_blocks_all_writes(self):
         knowledge = self.workspace / "knowledge"
         knowledge.mkdir()
@@ -309,6 +903,43 @@ class ScaffoldTests(unittest.TestCase):
 
         self.assertFalse((self.workspace / "knowledge").exists())
         self.assertFalse((self.root / "escaped.md").exists())
+
+    def test_forged_update_paths_are_rejected_before_any_mutation(self):
+        plan = plan_scaffold(self.workspace)
+        inside = self.workspace / "escaped.md"
+        outside = self.workspace / "knowledge/../../escaped.md"
+        forged = dataclasses.replace(
+            plan,
+            updates=(
+                (inside, b"old", b"new"),
+                (outside, b"old", b"new"),
+            ),
+        )
+
+        self._assert_policy_error(lambda: apply_scaffold(forged))
+
+        self.assertFalse((self.workspace / "knowledge").exists())
+        self.assertFalse(inside.exists())
+        self.assertFalse((self.root / "escaped.md").exists())
+
+    def test_forged_readme_update_bytes_are_rejected_without_rewriting_current_file(
+        self,
+    ):
+        initial_plan = plan_scaffold(self.workspace)
+        current = self._planned_bytes(initial_plan)[
+            pathlib.Path("knowledge/README.md")
+        ]
+        apply_scaffold(initial_plan)
+        readme = self.workspace / "knowledge/README.md"
+        plan = plan_scaffold(self.workspace)
+        forged = dataclasses.replace(
+            plan,
+            updates=((readme, b"unknown original", b"unknown intended"),),
+        )
+
+        self._assert_policy_error(lambda: apply_scaffold(forged))
+
+        self.assertEqual(readme.read_bytes(), current)
 
     def test_symlinked_workspace_alias_is_rejected_as_path_escape(self):
         alias = self.root / "workspace-alias"

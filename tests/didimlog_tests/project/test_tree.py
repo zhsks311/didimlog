@@ -1,9 +1,11 @@
 import hashlib
 import json
+import os
 import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from didimlog.errors import DidimError
 from didimlog.project.record import (
@@ -604,6 +606,64 @@ class RecordTreeValidationTests(unittest.TestCase):
             self.assertEqual(records[0]["artifact_mode"], "local")
             self.assertEqual(Path(records[0]["path"]), path)
             self.assertEqual(records[0]["content_bytes"], path.read_bytes())
+
+    def test_local_artifact_validation_stays_on_pinned_knowledge_after_swap(self):
+        from didimlog.project import tree as tree_module
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            _write_record(
+                workspace,
+                "EVD-20260714-01",
+                "evidence",
+                artifact_bytes=b"bound artifact\n",
+            )
+            replacement = root / "replacement"
+            replacement_artifact = replacement / "raw" / "artifact.bin"
+            replacement_artifact.parent.mkdir(parents=True)
+            replacement_artifact.write_bytes(b"replacement artifact\n")
+            knowledge = workspace / "knowledge"
+            knowledge_backup = root / "knowledge.original"
+            workspace_descriptor = os.open(workspace, os.O_RDONLY)
+            knowledge_descriptor = os.open(
+                "knowledge",
+                os.O_RDONLY,
+                dir_fd=workspace_descriptor,
+            )
+            real_iter = tree_module._iter_record_documents
+            swapped = False
+
+            def swap_after_record_read(*args, **kwargs):
+                nonlocal swapped
+                for item in real_iter(*args, **kwargs):
+                    knowledge.rename(knowledge_backup)
+                    replacement.rename(knowledge)
+                    swapped = True
+                    yield item
+
+            try:
+                with mock.patch.object(
+                    tree_module,
+                    "_iter_record_documents",
+                    side_effect=swap_after_record_read,
+                ):
+                    records = validate_record_tree(
+                        workspace,
+                        workspace_descriptor=workspace_descriptor,
+                        knowledge_descriptor=knowledge_descriptor,
+                    )
+                self.assertEqual(
+                    [record["id"] for record in records],
+                    ["EVD-20260714-01"],
+                )
+            finally:
+                if swapped:
+                    knowledge.rename(replacement)
+                    knowledge_backup.rename(knowledge)
+                os.close(knowledge_descriptor)
+                os.close(workspace_descriptor)
 
     def test_missing_and_digest_mismatched_artifacts_fail_closed(self):
         cases = (

@@ -45,7 +45,7 @@ didim setup --yes
 3. Claude Code 설정에 Didimlog가 관리하는 조회 지침과 SessionStart hook을 연결합니다.
 4. 실제 파일과 연결 상태를 다시 검사합니다.
 
-사용자가 직접 작성한 `~/knowledge`, 프로젝트 `knowledge/`, Claude 설정의 사용자 소유 본문은 덮어쓰지 않습니다. 기존 파일과 충돌하거나 symlink·path escape가 발견되면 쓰기 전에 중단합니다.
+사용자가 직접 작성한 `~/knowledge`, 프로젝트 `knowledge/`, Claude 설정의 사용자 소유 본문은 덮어쓰지 않습니다. 기존 파일과 충돌하거나 symlink·path escape가 발견되면 쓰기를 중단합니다. 계획을 확인한 뒤 다른 프로세스가 파일을 바꾼 경우에도 작업을 중단하고, Didimlog가 만든 내용 중 그대로 남아 있는 것만 되돌립니다. 동시에 저장된 사용자 변경은 되돌리거나 덮어쓰지 않습니다.
 
 프로젝트 `knowledge/`의 기본값은 로컬 전용입니다. `.gitignore`를 바꾸지 않고 현재 로컬 Git 저장소가 사용하는 `info/exclude` 파일(일반 저장소의 `.git/info/exclude`)에 `/knowledge/` 규칙을 추가합니다. 같은 로컬 저장소에 연결된 작업 트리(linked worktree)는 이 파일을 공유하므로 한 작업 트리의 설정이 다른 연결된 작업 트리에도 적용됩니다.
 
@@ -122,9 +122,11 @@ didim add evidence --help
 
 - observation: 실제로 관찰한 재사용 가능한 사실
 - experiment: 가설, 방법, 결과, 해석을 함께 남기는 실험
-- evidence: SHA-256 또는 검증된 Git object에 결합한 원자료
+- evidence: SHA-256 또는 검증된 Git object에 결합한 원자료. Git object 방식은 현재 shell의 Git 환경 변수나 외부 alternates를 사용하지 않고, 명령을 시작할 때 확인한 저장소의 object database에서만 검증합니다. linked worktree에서는 공통 object database를 사용합니다.
 
-ID는 `OBS-YYYYMMDD-NN`, `EXP-YYYYMMDD-NN`, `EVD-YYYYMMDD-NN` 형식으로 Didimlog가 할당합니다. 기록 파일을 만든 뒤 project index 갱신에 실패해도 새 원문은 지우지 않고 복구 명령을 출력합니다.
+ID는 `OBS-YYYYMMDD-NN`, `EXP-YYYYMMDD-NN`, `EVD-YYYYMMDD-NN` 형식으로 Didimlog가 할당합니다. 기록을 저장하는 동안 프로젝트 경로나 `knowledge/records`가 다른 디렉터리로 교체되면 새 경로에 기록하지 않고 중단합니다. 기록 파일이 원래 디렉터리에 완전히 만들어진 뒤 project index 갱신에 실패하면 원문은 보존하고 `PROJECT_INDEX_STALE: run didim index`를 출력합니다.
+
+Git metadata나 object database가 검증 도중 바뀌어 같은 저장소라고 확정할 수 없으면 `GIT_UNVERIFIABLE <record-id>`로 중단합니다. 검증 실패를 성공으로 간주하거나 다른 저장소에서 object를 찾지 않습니다.
 
 ### index 다시 만들기
 

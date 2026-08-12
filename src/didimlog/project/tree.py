@@ -122,36 +122,78 @@ def _walk_record_documents(directory_descriptor: int, directory: Path):
             )
 
 
-def _iter_record_documents(workspace: Path):
-    workspace_descriptor, absolute_workspace = _open_directory_path(workspace)
+def _iter_record_documents(
+    workspace: Path,
+    workspace_descriptor: int | None = None,
+    knowledge_descriptor: int | None = None,
+):
+    absolute_workspace = Path(os.path.abspath(workspace))
+    if workspace_descriptor is None:
+        if knowledge_descriptor is not None:
+            raise ValueError("knowledge descriptor requires workspace descriptor")
+        workspace_descriptor, absolute_workspace = _open_directory_path(workspace)
+    else:
+        duplicate: int | None = None
+        try:
+            duplicate = os.dup(workspace_descriptor)
+            if not stat.S_ISDIR(os.fstat(duplicate).st_mode):
+                raise OSError("workspace descriptor is not a directory")
+        except OSError as error:
+            if duplicate is not None:
+                os.close(duplicate)
+            raise _path_escape(absolute_workspace) from error
+        workspace_descriptor = duplicate
     knowledge = absolute_workspace / "knowledge"
     records = knowledge / "records"
-    knowledge_descriptor: int | None = None
+    opened_knowledge: int | None = None
     records_descriptor: int | None = None
     try:
-        try:
-            os.stat(
+        if knowledge_descriptor is None:
+            try:
+                os.stat(
+                    "knowledge",
+                    dir_fd=workspace_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return
+            opened_knowledge = _open_child_directory(
+                workspace_descriptor,
                 "knowledge",
-                dir_fd=workspace_descriptor,
-                follow_symlinks=False,
+                knowledge,
             )
-        except FileNotFoundError:
-            return
-        knowledge_descriptor = _open_child_directory(
-            workspace_descriptor,
-            "knowledge",
-            knowledge,
-        )
+        else:
+            try:
+                opened_knowledge = os.dup(knowledge_descriptor)
+                linked_knowledge = os.stat(
+                    "knowledge",
+                    dir_fd=workspace_descriptor,
+                    follow_symlinks=False,
+                )
+                current_knowledge = os.fstat(opened_knowledge)
+            except OSError as error:
+                if opened_knowledge is not None:
+                    os.close(opened_knowledge)
+                    opened_knowledge = None
+                raise _path_escape(knowledge) from error
+            if (
+                stat.S_ISLNK(linked_knowledge.st_mode)
+                or not stat.S_ISDIR(linked_knowledge.st_mode)
+                or not stat.S_ISDIR(current_knowledge.st_mode)
+                or linked_knowledge.st_dev != current_knowledge.st_dev
+                or linked_knowledge.st_ino != current_knowledge.st_ino
+            ):
+                raise _path_escape(knowledge)
         try:
             os.stat(
                 "records",
-                dir_fd=knowledge_descriptor,
+                dir_fd=opened_knowledge,
                 follow_symlinks=False,
             )
         except FileNotFoundError:
             return
         records_descriptor = _open_child_directory(
-            knowledge_descriptor,
+            opened_knowledge,
             "records",
             records,
         )
@@ -159,8 +201,8 @@ def _iter_record_documents(workspace: Path):
     finally:
         if records_descriptor is not None:
             os.close(records_descriptor)
-        if knowledge_descriptor is not None:
-            os.close(knowledge_descriptor)
+        if opened_knowledge is not None:
+            os.close(opened_knowledge)
         os.close(workspace_descriptor)
 
 
@@ -190,7 +232,13 @@ def _parse_document(raw: bytes):
     return fields, frontmatter_lines, body
 
 
-def _load_record(workspace: Path, path: Path, raw: bytes):
+def _load_record(
+    workspace: Path,
+    path: Path,
+    raw: bytes,
+    workspace_descriptor: int | None = None,
+    knowledge_descriptor: int | None = None,
+):
     fields, frontmatter_lines, body = _parse_document(raw)
     record = validate_frontmatter(fields)
     canonical = _render_frontmatter(list(fields.items()))
@@ -218,6 +266,8 @@ def _load_record(workspace: Path, path: Path, raw: bytes):
                 record["artifact_path"],
                 record["artifact_sha256"],
                 record["id"],
+                workspace_descriptor=workspace_descriptor,
+                knowledge_descriptor=knowledge_descriptor,
             )
         else:
             verify_artifact_git(
@@ -225,6 +275,7 @@ def _load_record(workspace: Path, path: Path, raw: bytes):
                 record["artifact_path"],
                 record["artifact_git"],
                 record["id"],
+                workspace_descriptor=workspace_descriptor,
             )
     record["content_bytes"] = raw
     record["path"] = str(path)
@@ -337,13 +388,35 @@ def record_tree_digest(records) -> str:
     return hashlib.sha256(b"".join(parts)).hexdigest()
 
 
-def validate_record_tree(workspace, collision_id=None):
-    """Validate the complete record tree before returning any record map."""
+def validate_record_tree(
+    workspace,
+    collision_id=None,
+    workspace_descriptor: int | None = None,
+    knowledge_descriptor: int | None = None,
+):
+    """Validate the complete record tree before returning any record map.
 
+    Borrowed descriptors are duplicated for the tree walk and remain owned by
+    the caller, allowing one pinned workspace snapshot to span a transaction.
+    """
+    if workspace_descriptor is None:
+        workspace_descriptor = getattr(workspace, "workspace_descriptor", None)
+    if knowledge_descriptor is None:
+        knowledge_descriptor = getattr(workspace, "knowledge_descriptor", None)
     root = Path(workspace)
     records = [
-        _load_record(root, path, raw)
-        for path, raw in _iter_record_documents(root)
+        _load_record(
+            root,
+            path,
+            raw,
+            workspace_descriptor=workspace_descriptor,
+            knowledge_descriptor=knowledge_descriptor,
+        )
+        for path, raw in _iter_record_documents(
+            root,
+            workspace_descriptor=workspace_descriptor,
+            knowledge_descriptor=knowledge_descriptor,
+        )
     ]
 
     identifiers = set()

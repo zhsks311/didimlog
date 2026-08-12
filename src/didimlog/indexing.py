@@ -93,15 +93,26 @@ def _discover_git_root(cwd) -> Path | None:
 
 def _prepared_project(root: Path) -> bool:
     try:
-        plan = plan_scaffold(root)
-        for directory in plan.directories:
-            linked = directory.lstat()
-            if stat.S_ISLNK(linked.st_mode) or not stat.S_ISDIR(linked.st_mode):
-                return False
-        for path, expected in plan.files:
-            relative = path.relative_to(root)
-            if read_regular_file_beneath(root, relative, len(expected)) != expected:
-                return False
+        with path_lock(root / "knowledge", shared=True):
+            plan = plan_scaffold(root)
+            for directory in plan.directories:
+                linked = directory.lstat()
+                if stat.S_ISLNK(linked.st_mode) or not stat.S_ISDIR(linked.st_mode):
+                    return False
+            updates = {
+                path: (original, intended)
+                for path, original, intended in plan.updates
+            }
+            for path, expected in plan.files:
+                relative = path.relative_to(root)
+                accepted = updates.get(path, (expected,))
+                actual = read_regular_file_beneath(
+                    root,
+                    relative,
+                    max(len(value) for value in accepted),
+                )
+                if actual not in accepted:
+                    return False
     except (OSError, UnsafePathError, ValueError):
         return False
     return True

@@ -1,6 +1,8 @@
 import hashlib
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -317,6 +319,403 @@ class ProjectIndexWriteContractTests(unittest.TestCase):
             self.assertEqual(check_index(workspace), 1)
             self.assertEqual(output.read_bytes(), current)
 
+    def test_public_index_surfaces_reject_workspace_path_replacement(self):
+        for operation in (write_index, check_index):
+            with self.subTest(operation=operation.__name__):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    workspace = root / "workspace"
+                    replacement = root / "replacement"
+                    _write_record(
+                        workspace,
+                        "OBS-20260714-01",
+                        "observation",
+                        title="original",
+                    )
+                    _write_record(
+                        replacement,
+                        "OBS-20260714-01",
+                        "observation",
+                        title="replacement",
+                    )
+                    write_index(workspace)
+                    original_index = workspace / "knowledge/index/INDEX.md"
+                    original_index.write_bytes(b"stale original index\n")
+                    original_before = original_index.read_bytes()
+                    write_index(replacement)
+                    workspace_backup = root / "workspace.original"
+                    real_acquire = project_index.acquire_directory_lock
+                    replaced = False
+
+                    def replace_workspace_then_lock(descriptor, **kwargs):
+                        nonlocal replaced
+                        if not replaced:
+                            workspace.rename(workspace_backup)
+                            replacement.rename(workspace)
+                            replaced = True
+                        return real_acquire(descriptor, **kwargs)
+
+                    try:
+                        with mock.patch.object(
+                            project_index,
+                            "acquire_directory_lock",
+                            side_effect=replace_workspace_then_lock,
+                        ):
+                            with self.assertRaises(DidimError) as caught:
+                                operation(workspace)
+                        self.assertIn("INDEX_PATH_UNSAFE", caught.exception.token)
+                        self.assertEqual(caught.exception.exit_code, 3)
+                    finally:
+                        self.assertEqual(
+                            (
+                                workspace_backup / "knowledge/index/INDEX.md"
+                            ).read_bytes(),
+                            original_before,
+                        )
+                        if replaced:
+                            workspace.rename(replacement)
+                            workspace_backup.rename(workspace)
+
+    def test_public_write_rejects_workspace_replacement_during_build_before_publish(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            replacement = root / "replacement"
+            _write_record(
+                workspace,
+                "OBS-20260714-01",
+                "observation",
+                title="original",
+            )
+            _write_record(
+                replacement,
+                "OBS-20260714-01",
+                "observation",
+                title="replacement",
+            )
+            write_index(workspace)
+            write_index(replacement)
+            original_index = workspace / "knowledge/index/INDEX.md"
+            original_index.write_bytes(b"stale original index\n")
+            original_before = original_index.read_bytes()
+            workspace_backup = root / "workspace.original"
+            real_build = project_index.build_index_bytes
+            replaced = False
+
+            def replace_workspace_after_build(pinned):
+                nonlocal replaced
+                data = real_build(pinned)
+                workspace.rename(workspace_backup)
+                replacement.rename(workspace)
+                replaced = True
+                return data
+
+            try:
+                with mock.patch.object(
+                    project_index,
+                    "build_index_bytes",
+                    side_effect=replace_workspace_after_build,
+                ):
+                    with self.assertRaises(DidimError) as caught:
+                        write_index(workspace)
+                self.assertIn("INDEX_PATH_UNSAFE", caught.exception.token)
+                self.assertEqual(caught.exception.exit_code, 3)
+                self.assertEqual(
+                    (
+                        workspace_backup / "knowledge/index/INDEX.md"
+                    ).read_bytes(),
+                    original_before,
+                )
+            finally:
+                if replaced:
+                    workspace.rename(replacement)
+                    workspace_backup.rename(workspace)
+
+    def test_public_write_rolls_back_if_workspace_detaches_at_publish(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            replacement = root / "replacement"
+            _write_record(
+                workspace,
+                "OBS-20260714-01",
+                "observation",
+                title="original",
+            )
+            _write_record(
+                replacement,
+                "OBS-20260714-01",
+                "observation",
+                title="replacement",
+            )
+            write_index(workspace)
+            write_index(replacement)
+            original_index = workspace / "knowledge/index/INDEX.md"
+            original_index.write_bytes(b"stale original index\n")
+            original_before = original_index.read_bytes()
+            workspace_backup = root / "workspace.original"
+            real_require = project_index._require_pinned_knowledge
+            required_path_checks = 0
+            replaced = False
+
+            def replace_workspace_after_last_check(*args, **kwargs):
+                nonlocal required_path_checks, replaced
+                result = real_require(*args, **kwargs)
+                if kwargs.get("require_workspace_path"):
+                    required_path_checks += 1
+                    if required_path_checks == 3:
+                        workspace.rename(workspace_backup)
+                        replacement.rename(workspace)
+                        replaced = True
+                return result
+
+            try:
+                with mock.patch.object(
+                    project_index,
+                    "_require_pinned_knowledge",
+                    side_effect=replace_workspace_after_last_check,
+                ):
+                    with self.assertRaises(DidimError) as caught:
+                        write_index(workspace)
+                self.assertIn("INDEX_PATH_UNSAFE", caught.exception.token)
+                self.assertEqual(caught.exception.exit_code, 3)
+                self.assertEqual(
+                    (
+                        workspace_backup / "knowledge/index/INDEX.md"
+                    ).read_bytes(),
+                    original_before,
+                )
+            finally:
+                if replaced:
+                    workspace.rename(replacement)
+                    workspace_backup.rename(workspace)
+
+    def test_public_write_removes_new_index_if_workspace_detaches_at_publish(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            replacement = root / "replacement"
+            _write_record(
+                workspace,
+                "OBS-20260714-01",
+                "observation",
+                title="original",
+            )
+            _write_record(
+                replacement,
+                "OBS-20260714-01",
+                "observation",
+                title="replacement",
+            )
+            write_index(replacement)
+            workspace_backup = root / "workspace.original"
+            real_require = project_index._require_pinned_knowledge
+            required_path_checks = 0
+            replaced = False
+
+            def replace_workspace_after_last_check(*args, **kwargs):
+                nonlocal required_path_checks, replaced
+                result = real_require(*args, **kwargs)
+                if kwargs.get("require_workspace_path"):
+                    required_path_checks += 1
+                    if required_path_checks == 3:
+                        workspace.rename(workspace_backup)
+                        replacement.rename(workspace)
+                        replaced = True
+                return result
+
+            try:
+                with mock.patch.object(
+                    project_index,
+                    "_require_pinned_knowledge",
+                    side_effect=replace_workspace_after_last_check,
+                ):
+                    with self.assertRaises(DidimError) as caught:
+                        write_index(workspace)
+                self.assertIn("INDEX_PATH_UNSAFE", caught.exception.token)
+                self.assertEqual(caught.exception.exit_code, 3)
+                self.assertFalse(
+                    (
+                        workspace_backup / "knowledge/index/INDEX.md"
+                    ).exists()
+                )
+            finally:
+                if replaced:
+                    workspace.rename(replacement)
+                    workspace_backup.rename(workspace)
+
+
+    def test_public_write_treats_inner_fsync_as_commit_boundary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            replacement = root / "replacement"
+            _write_record(
+                workspace,
+                "OBS-20260714-01",
+                "observation",
+                title="original",
+            )
+            _write_record(
+                replacement,
+                "OBS-20260714-01",
+                "observation",
+                title="replacement",
+            )
+            write_index(replacement)
+            workspace_backup = root / "workspace.original"
+            real_write = project_index._write_index_locked
+            replaced = False
+
+            def replace_workspace_after_commit(*args, **kwargs):
+                nonlocal replaced
+                output = real_write(*args, **kwargs)
+                workspace.rename(workspace_backup)
+                replacement.rename(workspace)
+                replaced = True
+                return output
+
+            try:
+                with mock.patch.object(
+                    project_index,
+                    "_write_index_locked",
+                    side_effect=replace_workspace_after_commit,
+                ):
+                    self.assertEqual(
+                        write_index(workspace),
+                        workspace / "knowledge/index/INDEX.md",
+                    )
+                self.assertIn(
+                    b"original",
+                    (
+                        workspace_backup / "knowledge/index/INDEX.md"
+                    ).read_bytes(),
+                )
+            finally:
+                if replaced:
+                    workspace.rename(replacement)
+                    workspace_backup.rename(workspace)
+
+    def test_public_write_preserves_original_error_if_rollback_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            replacement = root / "replacement"
+            _write_record(
+                workspace,
+                "OBS-20260714-01",
+                "observation",
+                title="original",
+            )
+            _write_record(
+                replacement,
+                "OBS-20260714-01",
+                "observation",
+                title="replacement",
+            )
+            write_index(workspace)
+            write_index(replacement)
+            workspace_backup = root / "workspace.original"
+            real_require = project_index._require_pinned_knowledge
+            real_open = os.open
+            required_path_checks = 0
+            opened_descriptors = []
+            replaced = False
+
+            def replace_workspace_after_last_check(*args, **kwargs):
+                nonlocal required_path_checks, replaced
+                result = real_require(*args, **kwargs)
+                if kwargs.get("require_workspace_path"):
+                    required_path_checks += 1
+                    if required_path_checks == 3:
+                        workspace.rename(workspace_backup)
+                        replacement.rename(workspace)
+                        replaced = True
+                return result
+
+            def track_open(*args, **kwargs):
+                descriptor = real_open(*args, **kwargs)
+                opened_descriptors.append(descriptor)
+                return descriptor
+
+            try:
+                with mock.patch.object(
+                    project_index,
+                    "_require_pinned_knowledge",
+                    side_effect=replace_workspace_after_last_check,
+                ), mock.patch.object(
+                    project_index,
+                    "_rollback_index_publication",
+                    side_effect=OSError("rollback failed"),
+                ), mock.patch.object(
+                    project_index.os,
+                    "open",
+                    side_effect=track_open,
+                ):
+                    with self.assertRaises(DidimError) as caught:
+                        write_index(workspace)
+                self.assertIn("INDEX_PATH_UNSAFE", caught.exception.token)
+                self.assertEqual(caught.exception.exit_code, 3)
+                for descriptor in opened_descriptors:
+                    with self.assertRaises(OSError):
+                        os.fstat(descriptor)
+            finally:
+                if replaced:
+                    workspace.rename(replacement)
+                    workspace_backup.rename(workspace)
+
+    def test_backup_link_is_removed_if_prepublication_sync_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir) / "workspace"
+            _write_record(
+                workspace,
+                "OBS-20260714-01",
+                "observation",
+                title="original",
+            )
+            write_index(workspace)
+            output = workspace / "knowledge/index/INDEX.md"
+            original = output.read_bytes()
+            real_link = os.link
+            real_fsync = os.fsync
+            backup_linked = False
+
+            def track_backup_link(*args, **kwargs):
+                nonlocal backup_linked
+                result = real_link(*args, **kwargs)
+                backup_linked = True
+                return result
+
+            def fail_after_backup_link(descriptor):
+                if backup_linked:
+                    raise OSError("directory fsync failed")
+                return real_fsync(descriptor)
+
+            with mock.patch.object(
+                project_index.os,
+                "link",
+                side_effect=track_backup_link,
+            ), mock.patch.object(
+                project_index.os,
+                "fsync",
+                side_effect=fail_after_backup_link,
+            ):
+                with self.assertRaises(OSError):
+                    write_index(workspace)
+
+            self.assertEqual(output.read_bytes(), original)
+            self.assertEqual(
+                [
+                    path.name
+                    for path in output.parent.iterdir()
+                    if path.name.endswith(".bak")
+                ],
+                [],
+            )
 
 class ProjectIndexGitContractTests(unittest.TestCase):
     def test_git_evidence_fails_closed_when_git_is_unavailable(self):
@@ -346,6 +745,83 @@ class ProjectIndexGitContractTests(unittest.TestCase):
                 caught.exception.token, "GIT_UNAVAILABLE EVD-20260714-01"
             )
             self.assertEqual(caught.exception.exit_code, 7)
+
+    @unittest.skipUnless(shutil.which("git"), "git required")
+    def test_public_index_surfaces_reject_external_git_alternates(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            replacement = root / "replacement"
+            workspace.mkdir()
+            replacement.mkdir()
+            subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+            subprocess.run(["git", "init", "-q", str(replacement)], check=True)
+
+            artifact_path = "knowledge/raw/data/replacement-only.bin"
+            artifact = replacement / artifact_path
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(b"replacement-only artifact\n")
+            git_environment = os.environ.copy()
+            git_environment.update(
+                {
+                    "GIT_AUTHOR_NAME": "Didimlog Tests",
+                    "GIT_AUTHOR_EMAIL": "didimlog-tests@example.invalid",
+                    "GIT_COMMITTER_NAME": "Didimlog Tests",
+                    "GIT_COMMITTER_EMAIL": "didimlog-tests@example.invalid",
+                }
+            )
+            subprocess.run(
+                ["git", "-C", str(replacement), "add", "--", artifact_path],
+                check=True,
+                env=git_environment,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(replacement),
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "replacement",
+                ],
+                check=True,
+                env=git_environment,
+            )
+            replacement_commit = subprocess.run(
+                ["git", "-C", str(replacement), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            alternates = workspace / ".git" / "objects" / "info" / "alternates"
+            alternates.write_text(
+                str(replacement / ".git" / "objects") + "\n",
+                encoding="utf-8",
+            )
+            _write_record(
+                workspace,
+                "EVD-20260714-01",
+                "evidence",
+                title="external alternate",
+                artifact_path=artifact_path,
+                artifact_git=replacement_commit,
+            )
+            output = workspace / "knowledge" / "index" / "INDEX.md"
+            output.parent.mkdir(parents=True)
+            output.write_bytes(build_index_bytes(workspace))
+
+            for operation in (write_index, check_index):
+                with self.subTest(operation=operation.__name__):
+                    with self.assertRaises(DidimError) as caught:
+                        operation(workspace)
+                    self.assertEqual(
+                        caught.exception.token,
+                        "GIT_UNVERIFIABLE EVD-20260714-01",
+                    )
+                    self.assertEqual(caught.exception.exit_code, 7)
 
 
 if __name__ == "__main__":

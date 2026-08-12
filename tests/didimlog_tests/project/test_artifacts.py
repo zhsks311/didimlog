@@ -141,6 +141,72 @@ class ArtifactPathContractTests(ErrorContractMixin, unittest.TestCase):
                 ),
             )
 
+    def test_borrowed_knowledge_dup_fstat_failure_is_mapped_and_closed(self):
+        from didimlog.project import artifacts as artifacts_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "project"
+            (workspace / "knowledge/raw/data").mkdir(parents=True)
+            knowledge_descriptor = os.open(
+                workspace / "knowledge",
+                os.O_RDONLY,
+            )
+            try:
+                operations = (
+                    lambda: check_artifact_path_policy(
+                        workspace,
+                        ARTIFACT_PATH,
+                        RECORD_ID,
+                        knowledge_descriptor=knowledge_descriptor,
+                    ),
+                    lambda: artifacts_module._open_artifact(
+                        workspace,
+                        ARTIFACT_PATH,
+                        RECORD_ID,
+                        knowledge_descriptor=knowledge_descriptor,
+                    ),
+                )
+                for operation in operations:
+                    with self.subTest(operation=operation):
+                        real_dup = os.dup
+                        real_fstat = os.fstat
+                        duplicated = []
+
+                        def tracked_dup(descriptor):
+                            duplicate = real_dup(descriptor)
+                            duplicated.append(duplicate)
+                            return duplicate
+
+                        def fail_duplicate_fstat(descriptor):
+                            if descriptor in duplicated:
+                                raise OSError("fstat failed")
+                            return real_fstat(descriptor)
+
+                        try:
+                            with mock.patch.object(
+                                artifacts_module.os,
+                                "dup",
+                                side_effect=tracked_dup,
+                            ), mock.patch.object(
+                                artifacts_module.os,
+                                "fstat",
+                                side_effect=fail_duplicate_fstat,
+                            ):
+                                self.assert_didim_error(
+                                    PolicyError,
+                                    (
+                                        f"ARTIFACT_PATH_ESCAPE {RECORD_ID} "
+                                        f"{ARTIFACT_PATH}"
+                                    ),
+                                    3,
+                                    operation,
+                                )
+                        finally:
+                            for duplicate in duplicated:
+                                with self.assertRaises(OSError):
+                                    real_fstat(duplicate)
+            finally:
+                os.close(knowledge_descriptor)
 
 class LocalArtifactContractTests(ErrorContractMixin, unittest.TestCase):
     def _workspace_with_artifact(self, root):
@@ -303,6 +369,36 @@ class GitArtifactContractTests(ErrorContractMixin, unittest.TestCase):
         ).stdout.strip()
         return workspace, commit, blob
 
+    def _seed_replacement_repository(self, root):
+        workspace, _, _ = self._seed_repository(root)
+        git = shutil.which("git")
+        artifact = workspace / ARTIFACT_PATH
+        artifact.write_bytes(b"replacement-only artifact\n")
+        env = os.environ.copy()
+        env.update(
+            {
+                "GIT_AUTHOR_NAME": "Didimlog Tests",
+                "GIT_AUTHOR_EMAIL": "didimlog-tests@example.invalid",
+                "GIT_COMMITTER_NAME": "Didimlog Tests",
+                "GIT_COMMITTER_EMAIL": "didimlog-tests@example.invalid",
+            }
+        )
+        self._git(git, workspace, ["add", "--", ARTIFACT_PATH], env)
+        self._git(
+            git,
+            workspace,
+            ["-c", "commit.gpgsign=false", "commit", "-q", "-m", "replacement"],
+            env,
+        )
+        commit = self._git(
+            git,
+            workspace,
+            ["rev-parse", "HEAD"],
+            env,
+        ).stdout.strip()
+        return workspace, commit
+
+
     def test_verified_commit_and_blob_path_binding_succeeds(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace, commit, _ = self._seed_repository(tmp)
@@ -310,6 +406,647 @@ class GitArtifactContractTests(ErrorContractMixin, unittest.TestCase):
             result = verify_artifact_git(
                 str(workspace), ARTIFACT_PATH, commit, RECORD_ID
             )
+
+            self.assertIsNone(result)
+
+    def test_borrowed_workspace_descriptor_rejects_current_artifact_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, commit, _ = self._seed_repository(tmp)
+            artifact = workspace / ARTIFACT_PATH
+            target = artifact.with_name("target.bin")
+            artifact.unlink()
+            target.write_bytes(ARTIFACT_BYTES)
+            artifact.symlink_to(target.name)
+            workspace_descriptor = os.open(workspace, os.O_RDONLY)
+
+            try:
+                self.assert_didim_error(
+                    PolicyError,
+                    f"ARTIFACT_PATH_ESCAPE {RECORD_ID} {ARTIFACT_PATH}",
+                    3,
+                    lambda: verify_artifact_git(
+                        str(workspace),
+                        ARTIFACT_PATH,
+                        commit,
+                        RECORD_ID,
+                        workspace_descriptor=workspace_descriptor,
+                    ),
+                )
+            finally:
+                os.close(workspace_descriptor)
+
+    def test_borrowed_workspace_descriptor_rejects_git_directory_swap_after_pin(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original_workspace, _, _ = self._seed_repository(root / "original")
+            replacement_workspace, _, _ = self._seed_repository(root / "replacement")
+            git = shutil.which("git")
+            replacement_artifact = replacement_workspace / ARTIFACT_PATH
+            replacement_artifact.write_bytes(b"replacement-only artifact\n")
+            env = os.environ.copy()
+            env.update(
+                {
+                    "GIT_AUTHOR_NAME": "Didimlog Tests",
+                    "GIT_AUTHOR_EMAIL": "didimlog-tests@example.invalid",
+                    "GIT_COMMITTER_NAME": "Didimlog Tests",
+                    "GIT_COMMITTER_EMAIL": "didimlog-tests@example.invalid",
+                }
+            )
+            self._git(git, replacement_workspace, ["add", "--", ARTIFACT_PATH], env)
+            self._git(
+                git,
+                replacement_workspace,
+                ["-c", "commit.gpgsign=false", "commit", "-q", "-m", "replacement"],
+                env,
+            )
+            replacement_commit = self._git(
+                git,
+                replacement_workspace,
+                ["rev-parse", "HEAD"],
+                env,
+            ).stdout.strip()
+
+            original_git = original_workspace / ".git"
+            original_git_backup = original_workspace / ".git.original"
+            replacement_git = replacement_workspace / ".git"
+            workspace_descriptor = os.open(original_workspace, os.O_RDONLY)
+            real_subprocess_run = subprocess.run
+            original_git_moved = False
+            replacement_git_moved = False
+
+            def swap_git_directory_then_run(argv, **kwargs):
+                nonlocal original_git_moved, replacement_git_moved
+                if not original_git_moved:
+                    original_git.rename(original_git_backup)
+                    original_git_moved = True
+                    replacement_git.rename(original_git)
+                    replacement_git_moved = True
+                return real_subprocess_run(argv, **kwargs)
+
+            try:
+                with mock.patch(
+                    "didimlog.project.artifacts.subprocess.run",
+                    side_effect=swap_git_directory_then_run,
+                ):
+                    self.assert_didim_error(
+                        GitUnavailable,
+                        f"GIT_UNVERIFIABLE {RECORD_ID}",
+                        7,
+                        lambda: verify_artifact_git(
+                            str(original_workspace),
+                            ARTIFACT_PATH,
+                            replacement_commit,
+                            RECORD_ID,
+                            workspace_descriptor=workspace_descriptor,
+                        ),
+                    )
+            finally:
+                os.close(workspace_descriptor)
+                if replacement_git_moved:
+                    original_git.rename(replacement_git)
+                if original_git_moved:
+                    original_git_backup.rename(original_git)
+
+    def test_borrowed_workspace_descriptor_rejects_git_directory_to_gitfile_swap(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, commit, _ = self._seed_repository(Path(tmp))
+            git_directory = workspace / ".git"
+            git_backup = workspace / ".git.original"
+            workspace_descriptor = os.open(workspace, os.O_RDONLY)
+            real_subprocess_run = subprocess.run
+            swapped = False
+
+            def swap_to_gitfile_then_run(argv, **kwargs):
+                nonlocal swapped
+                if not swapped:
+                    git_directory.rename(git_backup)
+                    git_directory.write_text(
+                        "gitdir: .git.original\n",
+                        encoding="utf-8",
+                    )
+                    swapped = True
+                return real_subprocess_run(argv, **kwargs)
+
+            try:
+                with mock.patch(
+                    "didimlog.project.artifacts.subprocess.run",
+                    side_effect=swap_to_gitfile_then_run,
+                ):
+                    self.assert_didim_error(
+                        GitUnavailable,
+                        f"GIT_UNVERIFIABLE {RECORD_ID}",
+                        7,
+                        lambda: verify_artifact_git(
+                            workspace,
+                            ARTIFACT_PATH,
+                            commit,
+                            RECORD_ID,
+                            workspace_descriptor=workspace_descriptor,
+                        ),
+                    )
+            finally:
+                os.close(workspace_descriptor)
+                if swapped:
+                    git_directory.unlink()
+                    git_backup.rename(git_directory)
+
+    def test_borrowed_workspace_descriptor_rejects_transient_git_directory_swap_during_pin(
+        self,
+    ):
+        from didimlog.project import artifacts as artifacts_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original_workspace, _, _ = self._seed_repository(root / "original")
+            replacement_workspace, replacement_commit = (
+                self._seed_replacement_repository(root / "replacement")
+            )
+            original_git = original_workspace / ".git"
+            original_git_backup = original_workspace / ".git.original"
+            replacement_git = replacement_workspace / ".git"
+            workspace_descriptor = os.open(original_workspace, os.O_RDONLY)
+            real_open = artifacts_module._open_pinned_git_directory
+            first_open = True
+
+            def open_transient_replacement(descriptor):
+                nonlocal first_open
+                if not first_open:
+                    return real_open(descriptor)
+                first_open = False
+                original_git.rename(original_git_backup)
+                replacement_git.rename(original_git)
+                try:
+                    return real_open(descriptor)
+                finally:
+                    original_git.rename(replacement_git)
+                    original_git_backup.rename(original_git)
+
+            try:
+                with mock.patch.object(
+                    artifacts_module,
+                    "_open_pinned_git_directory",
+                    side_effect=open_transient_replacement,
+                ):
+                    self.assert_didim_error(
+                        GitUnavailable,
+                        f"GIT_UNVERIFIABLE {RECORD_ID}",
+                        7,
+                        lambda: verify_artifact_git(
+                            str(original_workspace),
+                            ARTIFACT_PATH,
+                            replacement_commit,
+                            RECORD_ID,
+                            workspace_descriptor=workspace_descriptor,
+                        ),
+                    )
+            finally:
+                os.close(workspace_descriptor)
+
+    def test_borrowed_workspace_descriptor_maps_post_pin_git_removal_to_unverifiable(
+        self,
+    ):
+        from didimlog.project import artifacts as artifacts_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, commit, _ = self._seed_repository(Path(tmp))
+            workspace_descriptor = os.open(workspace, os.O_RDONLY)
+            real_open = artifacts_module._open_pinned_git_directory
+            open_count = 0
+
+            def remove_git_after_pin(descriptor):
+                nonlocal open_count
+                open_count += 1
+                if open_count == 2:
+                    shutil.rmtree(workspace / ".git")
+                return real_open(descriptor)
+
+            try:
+                with mock.patch.object(
+                    artifacts_module,
+                    "_open_pinned_git_directory",
+                    side_effect=remove_git_after_pin,
+                ):
+                    self.assert_didim_error(
+                        GitUnavailable,
+                        f"GIT_UNVERIFIABLE {RECORD_ID}",
+                        7,
+                        lambda: verify_artifact_git(
+                            workspace,
+                            ARTIFACT_PATH,
+                            commit,
+                            RECORD_ID,
+                            workspace_descriptor=workspace_descriptor,
+                        ),
+                    )
+            finally:
+                os.close(workspace_descriptor)
+
+    def test_borrowed_workspace_descriptor_maps_git_removal_during_pin_to_unverifiable(
+        self,
+    ):
+        from didimlog.project import artifacts as artifacts_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, commit, _ = self._seed_repository(Path(tmp))
+            workspace_descriptor = os.open(workspace, os.O_RDONLY)
+            real_open = artifacts_module._open_pinned_git_directory
+
+            def remove_git_after_open(descriptor):
+                git_descriptor = real_open(descriptor)
+                shutil.rmtree(workspace / ".git")
+                return git_descriptor
+
+            try:
+                with mock.patch.object(
+                    artifacts_module,
+                    "_open_pinned_git_directory",
+                    side_effect=remove_git_after_open,
+                ):
+                    self.assert_didim_error(
+                        GitUnavailable,
+                        f"GIT_UNVERIFIABLE {RECORD_ID}",
+                        7,
+                        lambda: verify_artifact_git(
+                            workspace,
+                            ARTIFACT_PATH,
+                            commit,
+                            RECORD_ID,
+                            workspace_descriptor=workspace_descriptor,
+                        ),
+                    )
+            finally:
+                os.close(workspace_descriptor)
+
+    def test_borrowed_workspace_descriptor_rejects_objects_directory_swap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original_workspace, _, _ = self._seed_repository(root / "original")
+            replacement_workspace, replacement_commit = (
+                self._seed_replacement_repository(root / "replacement")
+            )
+            original_objects = original_workspace / ".git/objects"
+            original_objects_backup = original_workspace / ".git/objects.original"
+            replacement_objects = replacement_workspace / ".git/objects"
+            workspace_descriptor = os.open(original_workspace, os.O_RDONLY)
+            real_subprocess_run = subprocess.run
+            original_objects_moved = False
+            replacement_objects_moved = False
+
+            def swap_objects_then_run(argv, **kwargs):
+                nonlocal original_objects_moved, replacement_objects_moved
+                if not original_objects_moved:
+                    original_objects.rename(original_objects_backup)
+                    original_objects_moved = True
+                    replacement_objects.rename(original_objects)
+                    replacement_objects_moved = True
+                return real_subprocess_run(argv, **kwargs)
+
+            try:
+                with mock.patch(
+                    "didimlog.project.artifacts.subprocess.run",
+                    side_effect=swap_objects_then_run,
+                ):
+                    self.assert_didim_error(
+                        GitUnavailable,
+                        f"GIT_UNVERIFIABLE {RECORD_ID}",
+                        7,
+                        lambda: verify_artifact_git(
+                            str(original_workspace),
+                            ARTIFACT_PATH,
+                            replacement_commit,
+                            RECORD_ID,
+                            workspace_descriptor=workspace_descriptor,
+                        ),
+                    )
+            finally:
+                os.close(workspace_descriptor)
+                if replacement_objects_moved:
+                    original_objects.rename(replacement_objects)
+                if original_objects_moved:
+                    original_objects_backup.rename(original_objects)
+
+    def test_borrowed_workspace_descriptor_ignores_ambient_git_object_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original_workspace, _, _ = self._seed_repository(root / "original")
+            replacement_workspace, replacement_commit = (
+                self._seed_replacement_repository(root / "replacement")
+            )
+            workspace_descriptor = os.open(original_workspace, os.O_RDONLY)
+
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "GIT_OBJECT_DIRECTORY": str(
+                            replacement_workspace / ".git/objects"
+                        )
+                    },
+                ):
+                    self.assert_didim_error(
+                        PolicyError,
+                        f"ARTIFACT_GIT_MISSING {RECORD_ID} {replacement_commit}",
+                        3,
+                        lambda: verify_artifact_git(
+                            str(original_workspace),
+                            ARTIFACT_PATH,
+                            replacement_commit,
+                            RECORD_ID,
+                            workspace_descriptor=workspace_descriptor,
+                        ),
+                    )
+            finally:
+                os.close(workspace_descriptor)
+
+
+    def test_object_database_revision_failure_closes_pinned_descriptor(self):
+        from didimlog.project import artifacts as artifacts_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, commit, _ = self._seed_repository(tmp)
+            workspace_descriptor = os.open(workspace, os.O_RDONLY)
+            real_directory_revision = artifacts_module._directory_revision
+            pinned_descriptors = []
+
+            def fail_first_revision(descriptor):
+                if not pinned_descriptors:
+                    pinned_descriptors.append(descriptor)
+                    raise OSError("injected object database fstat failure")
+                return real_directory_revision(descriptor)
+
+            try:
+                with mock.patch.object(
+                    artifacts_module,
+                    "_directory_revision",
+                    side_effect=fail_first_revision,
+                ):
+                    self.assert_didim_error(
+                        GitUnavailable,
+                        f"GIT_UNVERIFIABLE {RECORD_ID}",
+                        7,
+                        lambda: verify_artifact_git(
+                            str(workspace),
+                            ARTIFACT_PATH,
+                            commit,
+                            RECORD_ID,
+                            workspace_descriptor=workspace_descriptor,
+                        ),
+                    )
+            finally:
+                os.close(workspace_descriptor)
+
+            self.assertEqual(len(pinned_descriptors), 1)
+            with self.assertRaises(OSError):
+                os.fstat(pinned_descriptors[0])
+
+    def test_info_revision_failure_closes_pinned_descriptors(self):
+        from didimlog.project import artifacts as artifacts_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, commit, _ = self._seed_repository(tmp)
+            workspace_descriptor = os.open(workspace, os.O_RDONLY)
+            real_directory_revision = artifacts_module._directory_revision
+            pinned_descriptors = []
+
+            def fail_second_revision(descriptor):
+                pinned_descriptors.append(descriptor)
+                if len(pinned_descriptors) == 2:
+                    raise OSError("injected info fstat failure")
+                return real_directory_revision(descriptor)
+
+            try:
+                with mock.patch.object(
+                    artifacts_module,
+                    "_directory_revision",
+                    side_effect=fail_second_revision,
+                ):
+                    self.assert_didim_error(
+                        GitUnavailable,
+                        f"GIT_UNVERIFIABLE {RECORD_ID}",
+                        7,
+                        lambda: verify_artifact_git(
+                            str(workspace),
+                            ARTIFACT_PATH,
+                            commit,
+                            RECORD_ID,
+                            workspace_descriptor=workspace_descriptor,
+                        ),
+                    )
+            finally:
+                os.close(workspace_descriptor)
+
+            self.assertEqual(len(pinned_descriptors), 2)
+            for descriptor in pinned_descriptors:
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+
+    def test_missing_info_dup_failure_closes_pinned_object_database(self):
+        from didimlog.project import artifacts as artifacts_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, commit, _ = self._seed_repository(tmp)
+            (workspace / ".git/objects/info").rmdir()
+            object_database_info = (workspace / ".git/objects").stat()
+            workspace_descriptor = os.open(workspace, os.O_RDONLY)
+            real_dup = os.dup
+            pinned_descriptors = []
+
+            def fail_object_database_dup(descriptor):
+                opened = os.fstat(descriptor)
+                if (
+                    opened.st_dev == object_database_info.st_dev
+                    and opened.st_ino == object_database_info.st_ino
+                    and not pinned_descriptors
+                ):
+                    pinned_descriptors.append(descriptor)
+                    raise OSError("injected missing-info dup failure")
+                return real_dup(descriptor)
+
+            try:
+                with mock.patch.object(
+                    artifacts_module.os,
+                    "dup",
+                    side_effect=fail_object_database_dup,
+                ):
+                    self.assert_didim_error(
+                        GitUnavailable,
+                        f"GIT_UNVERIFIABLE {RECORD_ID}",
+                        7,
+                        lambda: verify_artifact_git(
+                            str(workspace),
+                            ARTIFACT_PATH,
+                            commit,
+                            RECORD_ID,
+                            workspace_descriptor=workspace_descriptor,
+                        ),
+                    )
+            finally:
+                os.close(workspace_descriptor)
+
+            self.assertEqual(len(pinned_descriptors), 1)
+            with self.assertRaises(OSError):
+                os.fstat(pinned_descriptors[0])
+
+    def test_borrowed_workspace_descriptor_rejects_unpinned_git_alternates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original_workspace, _, _ = self._seed_repository(root / "original")
+            replacement_workspace, replacement_commit = (
+                self._seed_replacement_repository(root / "replacement")
+            )
+            alternates = original_workspace / ".git/objects/info/alternates"
+            alternates.write_text(
+                str(replacement_workspace / ".git/objects") + "\n",
+                encoding="utf-8",
+            )
+            workspace_descriptor = os.open(original_workspace, os.O_RDONLY)
+
+            try:
+                self.assert_didim_error(
+                    GitUnavailable,
+                    f"GIT_UNVERIFIABLE {RECORD_ID}",
+                    7,
+                    lambda: verify_artifact_git(
+                        str(original_workspace),
+                        ARTIFACT_PATH,
+                        replacement_commit,
+                        RECORD_ID,
+                        workspace_descriptor=workspace_descriptor,
+                    ),
+                )
+            finally:
+                os.close(workspace_descriptor)
+
+    def test_borrowed_workspace_descriptor_detects_transient_git_alternates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original_workspace, _, _ = self._seed_repository(root / "original")
+            replacement_workspace, replacement_commit = (
+                self._seed_replacement_repository(root / "replacement")
+            )
+            alternates = original_workspace / ".git/objects/info/alternates"
+            alternate_objects = replacement_workspace / ".git/objects"
+            workspace_descriptor = os.open(original_workspace, os.O_RDONLY)
+            real_subprocess_run = subprocess.run
+
+            def run_with_transient_alternate(argv, **kwargs):
+                alternates.write_text(
+                    str(alternate_objects) + "\n",
+                    encoding="utf-8",
+                )
+                try:
+                    return real_subprocess_run(argv, **kwargs)
+                finally:
+                    alternates.unlink()
+
+            try:
+                with mock.patch(
+                    "didimlog.project.artifacts.subprocess.run",
+                    side_effect=run_with_transient_alternate,
+                ):
+                    self.assert_didim_error(
+                        GitUnavailable,
+                        f"GIT_UNVERIFIABLE {RECORD_ID}",
+                        7,
+                        lambda: verify_artifact_git(
+                            str(original_workspace),
+                            ARTIFACT_PATH,
+                            replacement_commit,
+                            RECORD_ID,
+                            workspace_descriptor=workspace_descriptor,
+                        ),
+                    )
+            finally:
+                os.close(workspace_descriptor)
+
+    def test_borrowed_workspace_descriptor_rejects_info_replaced_after_open(self):
+        from didimlog.project import artifacts as artifacts_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original_workspace, _, _ = self._seed_repository(root / "original")
+            replacement_workspace, replacement_commit = (
+                self._seed_replacement_repository(root / "replacement")
+            )
+            info = original_workspace / ".git/objects/info"
+            original_info = original_workspace / ".git/objects/info-original"
+            alternate_objects = replacement_workspace / ".git/objects"
+            workspace_descriptor = os.open(original_workspace, os.O_RDONLY)
+            real_open_component = artifacts_module._open_git_directory_component
+            replaced = False
+
+            def open_then_replace(parent_descriptor, name):
+                nonlocal replaced
+                descriptor = real_open_component(parent_descriptor, name)
+                if name == b"info" and not replaced:
+                    info.rename(original_info)
+                    info.mkdir()
+                    (info / "alternates").write_text(
+                        str(alternate_objects) + "\n",
+                        encoding="utf-8",
+                    )
+                    replaced = True
+                return descriptor
+
+            try:
+                with mock.patch.object(
+                    artifacts_module,
+                    "_open_git_directory_component",
+                    side_effect=open_then_replace,
+                ):
+                    self.assert_didim_error(
+                        GitUnavailable,
+                        f"GIT_UNVERIFIABLE {RECORD_ID}",
+                        7,
+                        lambda: verify_artifact_git(
+                            str(original_workspace),
+                            ARTIFACT_PATH,
+                            replacement_commit,
+                            RECORD_ID,
+                            workspace_descriptor=workspace_descriptor,
+                        ),
+                    )
+                self.assertTrue(replaced)
+            finally:
+                os.close(workspace_descriptor)
+
+    def test_borrowed_linked_worktree_descriptor_verifies_common_objects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace, commit, _ = self._seed_repository(root / "original")
+            linked_workspace = root / "linked"
+            git = shutil.which("git")
+            env = os.environ.copy()
+            env["GIT_CONFIG_NOSYSTEM"] = "1"
+            self._git(
+                git,
+                workspace,
+                [
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "linked-artifact-test",
+                    str(linked_workspace),
+                ],
+                env,
+            )
+            workspace_descriptor = os.open(linked_workspace, os.O_RDONLY)
+
+            try:
+                result = verify_artifact_git(
+                    str(linked_workspace),
+                    ARTIFACT_PATH,
+                    commit,
+                    RECORD_ID,
+                    workspace_descriptor=workspace_descriptor,
+                )
+            finally:
+                os.close(workspace_descriptor)
 
             self.assertIsNone(result)
 
@@ -450,19 +1187,21 @@ class GitFailureContractTests(ErrorContractMixin, unittest.TestCase):
                 self.fail("Git verification must use a positive bounded timeout")
             raise subprocess.TimeoutExpired(argv, timeout)
 
-        with tempfile.TemporaryDirectory() as tmp, mock.patch(
-            "didimlog.project.artifacts.shutil.which", return_value="/usr/bin/git"
-        ), mock.patch(
-            "didimlog.project.artifacts.subprocess.run", side_effect=time_out
-        ):
-            self.assert_didim_error(
-                GitUnavailable,
-                f"GIT_UNVERIFIABLE {RECORD_ID}",
-                7,
-                lambda: verify_artifact_git(
-                    tmp, ARTIFACT_PATH, "a" * 40, RECORD_ID
-                ),
-            )
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / ".git").mkdir()
+            with mock.patch(
+                "didimlog.project.artifacts.shutil.which", return_value="/usr/bin/git"
+            ), mock.patch(
+                "didimlog.project.artifacts.subprocess.run", side_effect=time_out
+            ):
+                self.assert_didim_error(
+                    GitUnavailable,
+                    f"GIT_UNVERIFIABLE {RECORD_ID}",
+                    7,
+                    lambda: verify_artifact_git(
+                        tmp, ARTIFACT_PATH, "a" * 40, RECORD_ID
+                    ),
+                )
         self.assertEqual(len(observed_timeouts), 1)
 
 

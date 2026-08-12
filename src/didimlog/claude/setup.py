@@ -146,6 +146,8 @@ def _project_changes(
     for path, _ in plan.files:
         if not path.exists():
             changes.append("프로젝트 근거 파일 생성: {}".format(path))
+    for path, _, _ in plan.updates:
+        changes.append("프로젝트 근거 파일 갱신: {}".format(path))
     if not _prepared_project(root) or not _project_check(root).endswith(
         "PROJECT_INDEX_CURRENT"
     ):
