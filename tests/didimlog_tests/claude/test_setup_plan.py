@@ -120,7 +120,7 @@ class SetupPlanTests(unittest.TestCase):
         plan = self._plan(cwd=project)
 
         self.assertIsInstance(plan, SetupPlan)
-        self.assertEqual(plan.version, "0.0.1")
+        self.assertEqual(plan.version, "0.0.2")
         self.assertIn("개인 지식 디렉터리 생성", "\n".join(plan.personal_changes))
         self.assertIn("MY-RULES.md 생성", "\n".join(plan.personal_changes))
         self.assertIn("프로젝트 근거 저장소 생성", "\n".join(plan.project_changes))

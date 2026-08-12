@@ -181,7 +181,7 @@ class StatusDoctorTests(unittest.TestCase):
 
         self.assertEqual(
             text,
-            "Didimlog 0.0.1\n"
+            "Didimlog 0.0.2\n"
             "개인 지식: 최신\n"
             "현재 프로젝트: demo-project\n"
             "프로젝트 근거: 최신\n"

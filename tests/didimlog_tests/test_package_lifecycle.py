@@ -13,7 +13,7 @@ from didimlog.claude.probe import inspect
 
 REPO = Path(__file__).resolve().parents[2]
 DATE = "2026-08-05"
-VERSION = "0.0.1"
+VERSION = "0.0.2"
 
 
 def _tree_bytes(root):
@@ -49,7 +49,7 @@ class PackageLifecycleTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-            wheel = next(build.glob("didimlog-0.0.1-*.whl"))
+            wheel = next(build.glob("didimlog-0.0.2-*.whl"))
             subprocess.run(
                 [uv, "venv", str(virtual_environment), "--python", sys.executable],
                 check=True,
@@ -113,7 +113,7 @@ class PackageLifecycleTests(unittest.TestCase):
                 )
                 return result
 
-            self.assertEqual(run("--version").stdout.strip(), "Didimlog 0.0.1")
+            self.assertEqual(run("--version").stdout.strip(), "Didimlog 0.0.2")
             steps.append("version")
             dry_run = run("setup", "--dry-run", "--config-dir", str(config))
             self.assertIn("개인 지식", dry_run.stdout)
@@ -224,7 +224,7 @@ date: 2026-08-05
             self.assertIn("PERSONAL_INDEX_CURRENT", index_check.stdout)
             self.assertIn("PROJECT_INDEX_CURRENT", index_check.stdout)
             status = run("status", "--config-dir", str(config))
-            self.assertIn("Didimlog 0.0.1", status.stdout)
+            self.assertIn("Didimlog 0.0.2", status.stdout)
             doctor = run("doctor", "--config-dir", str(config))
             self.assertIn("문제 없음", doctor.stdout)
             steps.extend(("index-check", "status", "doctor"))
