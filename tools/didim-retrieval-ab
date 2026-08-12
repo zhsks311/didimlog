@@ -1,0 +1,674 @@
+#!/usr/bin/env python3
+"""Didimlog 조회 지침이 실제 Claude Code 세션에서 발동하는지 A/B로 확인한다.
+
+control, treatment, forced 세션을 세 번 실행한다. treatment는 평소 요청만으로
+현재 프로젝트와 _global index를 검색하고 관련 lesson만 최대 5건 읽어야 한다.
+forced는 조회 절차를 명시해 저장·조회 메커니즘 자체의 생존 여부를 구분한다.
+
+인증 원본은 수정하거나 복제하지 않는다. 활성 macOS Keychain에서 access token만
+추출하고, 격리 Claude Code 자식 프로세스의 환경에만 전달한다.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import shlex
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+REPO = Path(__file__).resolve().parent.parent
+USAGE = REPO / "src/didimlog/resources/personal/KNOWLEDGE_USAGE.md"
+PROMPT = (
+    "이 저장소의 README.md 내용을 한 줄로 정리한 조사 결과 보고서 파일을 만들어라. "
+    "파일을 실제로 생성하고, 마지막에 생성한 파일 경로를 알려줘."
+)
+FORCED_PROMPT = "Didimlog 지식 사용 지침의 조회 절차를 따른 뒤, " + PROMPT
+SENTINEL_DIR = "zeta-out"
+DECOY_DIR = "omega-archive"
+DETAIL_MARKERS = (
+    "/knowledge/lessons/",
+    "/knowledge/docs/",
+    "/knowledge/book/",
+)
+RUN_COUNT = 3
+SESSION_TIMEOUT_SECONDS = 600
+AUTH_FIELDS = ("userID", "oauthAccount", "claudeCodeFirstTokenDate")
+KEYCHAIN_PREFIX = "Claude Code-credentials"
+CLAUDE_ENVIRONMENT_KEYS = ("LANG", "LC_ALL", "LC_CTYPE", "PATH", "TMPDIR")
+
+SENTINEL_LESSON = """---
+topic: report-output
+title: 조사 결과 보고서는 zeta-out 디렉터리에 저장한다
+summary: proj-alpha에서 보고서 산출물 경로는 docs가 아니라 zeta-out이다
+tags: [output-path, report]
+date: 2026-08-05
+---
+## 상황
+proj-alpha는 빌드 산출물 수집기가 저장소 최상위 `zeta-out/`만 스캔한다.
+관행적으로 `docs/`나 `reports/`에 보고서를 쓰면 수집되지 않는다.
+## 교훈
+proj-alpha에서 조사·분석 결과 보고서 파일을 만들 때는 반드시 저장소 최상위
+`zeta-out/` 디렉터리에 저장한다. `docs/`, `reports/`, `output/`을 쓰지 않는다.
+## 근거
+수집기 설정과 누락 사례로 확인했다.
+"""
+
+DECOY_LESSON = """---
+topic: report-output
+title: 조사 결과 보고서는 omega-archive 디렉터리에 저장한다
+summary: proj-beta에서 보고서 산출물 경로는 omega-archive다
+tags: [output-path, report]
+date: 2026-08-05
+---
+## 상황
+proj-beta 전용 규칙이다. proj-alpha 작업에서는 읽히면 안 된다.
+## 교훈
+proj-beta에서 보고서는 `omega-archive/`에 저장한다.
+## 근거
+proj-beta 저장소 설정에서 확인했다.
+"""
+
+GLOBAL_LESSON = """---
+topic: commit-message
+title: 커밋 메시지 제목은 영어 명령형으로 쓴다
+summary: 모든 프로젝트에서 커밋 제목 형식을 통일한다
+tags: [commit, git]
+date: 2026-08-05
+---
+## 상황
+프로젝트마다 커밋 제목 언어가 달라 이력 검색이 어려웠다.
+## 교훈
+커밋 메시지 제목은 영어 명령형 동사로 시작한다.
+## 근거
+여러 저장소 이력에서 확인했다.
+"""
+
+
+def oauth_free_environment(**overrides):
+    environment = dict(os.environ)
+    environment.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    environment.update(overrides)
+    return environment
+
+
+def claude_environment(**overrides):
+    environment = {
+        key: os.environ[key]
+        for key in CLAUDE_ENVIRONMENT_KEYS
+        if key in os.environ
+    }
+    environment.update(overrides)
+    return environment
+
+
+def run(command, **kwargs):
+    kwargs.setdefault("env", oauth_free_environment())
+    return subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        **kwargs,
+    )
+
+
+def active_config_dir():
+    override = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(override) if override else Path.home() / ".claude"
+
+
+
+def active_metadata_path():
+    native = Path.home() / ".claude.json"
+    if native.is_file():
+        return native
+    return active_config_dir() / ".claude.json"
+
+def keychain_service(config_dir):
+    canonical = Path(config_dir).resolve()
+    digest = hashlib.sha256(str(canonical).encode()).hexdigest()[:8]
+    return "{}-{}".format(KEYCHAIN_PREFIX, digest)
+
+
+def read_active_secret():
+    for service in (keychain_service(active_config_dir()), KEYCHAIN_PREFIX):
+        found = subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-w"],
+            capture_output=True,
+            text=True,
+            env=oauth_free_environment(),
+        )
+        if found.returncode == 0 and found.stdout.strip():
+            return found.stdout.strip()
+    return None
+
+
+def oauth_access_token(secret):
+    try:
+        value = json.loads(secret)
+        token = value["claudeAiOauth"]["accessToken"]
+    except (KeyError, TypeError, ValueError):
+        return None
+    return token if isinstance(token, str) and token else None
+
+
+
+
+def seed_auth(config_dir):
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_dir = config_dir.resolve()
+    source = active_metadata_path()
+    if not source.is_file():
+        raise SystemExit("활성 Claude 설정을 찾을 수 없습니다: {}".format(source))
+    data = json.loads(source.read_text(encoding="utf-8"))
+    seeded = {key: data[key] for key in AUTH_FIELDS if key in data}
+    if "oauthAccount" not in seeded:
+        raise SystemExit("활성 Claude 설정에 로그인 정보가 없습니다. 먼저 claude에 로그인하세요")
+    seeded["hasCompletedOnboarding"] = True
+    target = config_dir / ".claude.json"
+    target.write_text(json.dumps(seeded, indent=2) + "\n", encoding="utf-8")
+    os.chmod(target, 0o600)
+    return config_dir
+
+
+def didim_executable():
+    executable = shutil.which("didim")
+    if executable is None:
+        raise SystemExit("didim CLI를 찾을 수 없습니다. 먼저 현재 package를 설치하세요")
+    return executable
+
+
+def claude_executable():
+    markers = (b"frogprogsy", b"runClaudeLauncherProcess")
+    seen = set()
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if not directory:
+            continue
+        candidate = Path(directory) / "claude"
+        try:
+            resolved = candidate.resolve(strict=True)
+            identity = str(resolved)
+            if identity in seen or not resolved.is_file() or not os.access(resolved, os.X_OK):
+                continue
+            seen.add(identity)
+            prefix = resolved.read_bytes()[:8192]
+        except OSError:
+            continue
+        if any(marker in prefix for marker in markers):
+            continue
+        return str(resolved)
+    raise SystemExit("실제 Claude Code 실행 파일을 찾을 수 없습니다")
+
+
+def context_contract(config, sentinel):
+    claude_md = (config / "CLAUDE.md").read_text(encoding="utf-8")
+    managed = (config / "didimlog" / "KNOWLEDGE_USAGE.md").read_text(
+        encoding="utf-8"
+    )
+    combined = claude_md + "\n" + managed
+    return {
+        "usage_only": "KNOWLEDGE_USAGE.md" in claude_md,
+        "embedded_index": (
+            "report-output-directory.md" in combined
+            or "proj-alpha에서 보고서 산출물" in combined
+        ),
+        "embedded_body": sentinel in combined,
+    }
+
+
+def seed_case(case_root):
+    home = case_root / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    config = seed_auth(home / ".claude")
+    root_auth = home / ".claude.json"
+    root_auth.write_bytes((config / ".claude.json").read_bytes())
+    os.chmod(root_auth, 0o600)
+    return config, home
+
+
+def install(case_root):
+    config, home = seed_case(case_root)
+    actual_didim = didim_executable()
+    wrapper_directory = case_root / "bin"
+    wrapper_directory.mkdir()
+    wrapper = wrapper_directory / "didim"
+    wrapper.write_text(
+        "#!/bin/sh\nHOME={} exec {} \"$@\"\n".format(
+            shlex.quote(str(home)),
+            shlex.quote(actual_didim),
+        ),
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    environment = oauth_free_environment(
+        HOME=str(home),
+        CLAUDE_CONFIG_DIR=str(config),
+        PATH=str(wrapper_directory) + os.pathsep + os.environ.get("PATH", ""),
+        PYTHONDONTWRITEBYTECODE="1",
+    )
+    run(
+        [
+            actual_didim,
+            "setup",
+            "--yes",
+            "--config-dir",
+            str(config),
+        ],
+        cwd=case_root,
+        env=environment,
+    )
+
+    claude_md = config / "CLAUDE.md"
+    claude_md.write_text(
+        claude_md.read_text(encoding="utf-8").replace(
+            "@~/knowledge/",
+            "@{}/knowledge/".format(home),
+        ),
+        encoding="utf-8",
+    )
+    usage = config / "didimlog" / "KNOWLEDGE_USAGE.md"
+    usage.write_text(
+        usage.read_text(encoding="utf-8").replace(
+            "~/knowledge/",
+            "{}/knowledge/".format(home),
+        ),
+        encoding="utf-8",
+    )
+
+    knowledge = home / "knowledge"
+    fixtures = (
+        ("proj-alpha", "report-output-directory.md", SENTINEL_LESSON),
+        ("proj-beta", "report-output-directory.md", DECOY_LESSON),
+        ("_global", "commit-message-language.md", GLOBAL_LESSON),
+    )
+    for project, name, body in fixtures:
+        target = knowledge / "lessons" / project
+        target.mkdir(parents=True, exist_ok=True)
+        (target / name).write_text(body, encoding="utf-8")
+    run([actual_didim, "index"], cwd=case_root, env=environment)
+    return (
+        config,
+        home,
+        context_contract(config, "수집기 설정과 누락 사례"),
+        wrapper_directory,
+    )
+
+
+def make_git_project(path):
+    path.mkdir(parents=True, exist_ok=True)
+    run(["git", "init", "-q"], cwd=path)
+    run(["git", "config", "user.email", "ab@example.invalid"], cwd=path)
+    run(["git", "config", "user.name", "ab"], cwd=path)
+    (path / "README.md").write_text("# {}\n".format(path.name), encoding="utf-8")
+    run(["git", "add", "-A"], cwd=path)
+    run(["git", "commit", "-qm", "init"], cwd=path)
+
+def session(
+    project_dir,
+    home,
+    config_dir,
+    claude,
+    prompt,
+    log_path,
+    oauth_token,
+    path_prefix=None,
+):
+    if not isinstance(oauth_token, str) or not oauth_token:
+        raise ValueError("OAuth access token is required")
+    environment = claude_environment(
+        HOME=str(home),
+        CLAUDE_CONFIG_DIR=str(config_dir),
+        PYTHONDONTWRITEBYTECODE="1",
+    )
+    environment["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
+    if path_prefix is not None:
+        environment["PATH"] = (
+            str(path_prefix) + os.pathsep + environment.get("PATH", os.defpath)
+        )
+    try:
+        completed = subprocess.run(
+            [
+                claude,
+                "-p",
+                prompt,
+                "--no-session-persistence",
+                "--permission-mode",
+                "bypassPermissions",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+            ],
+            cwd=project_dir,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=SESSION_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as expired:
+        output = expired.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", "replace")
+        elif not isinstance(output, str):
+            output = ""
+        log_path.write_text(output, encoding="utf-8")
+        observed = parse(output)
+        observed["is_error"] = True
+        observed["timed_out"] = True
+        observed["timeout_seconds"] = SESSION_TIMEOUT_SECONDS
+        observed["returncode"] = 124
+        return observed
+    log_path.write_text(completed.stdout, encoding="utf-8")
+    observed = parse(completed.stdout)
+    observed["returncode"] = completed.returncode
+    return observed
+
+
+def parse(stream):
+    reads = []
+    result = ""
+    error = None
+    model = None
+    runtime = None
+    for line in stream.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("type") == "system" and event.get("subtype") == "init":
+            model = event.get("model")
+            runtime = event.get("claude_code_version") or event.get("version")
+        elif event.get("type") == "assistant":
+            message = event.get("message")
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                name = block.get("name")
+                tool_input = block.get("input")
+                if not isinstance(name, str) or not name or not isinstance(tool_input, dict):
+                    continue
+                reads.append(
+                    (
+                        name,
+                        json.dumps(tool_input, ensure_ascii=False),
+                    )
+                )
+        elif event.get("type") == "result":
+            result = str(event.get("result") or "")
+            error = bool(event.get("is_error"))
+    return {
+        "tools": reads,
+        "result": result,
+        "is_error": error,
+        "model": model,
+        "runtime": runtime,
+    }
+
+
+def created_files(project_dir):
+    return sorted(
+        str(path.relative_to(project_dir))
+        for path in project_dir.rglob("*")
+        if path.is_file() and ".git" not in path.parts
+    )
+
+
+def judge(observed, project_dir, sandbox):
+    files = created_files(project_dir)
+    tool_inputs = [text for _, text in observed["tools"]]
+    body = " ".join(tool_inputs)
+    detail_reads = sum(
+        1 for text in tool_inputs if any(marker in text for marker in DETAIL_MARKERS)
+    )
+    sanitized_result = observed["result"].replace(str(project_dir), "<project-root>")
+    sanitized_result = sanitized_result.replace(str(sandbox), "<sandbox>")
+    return {
+        "files": files,
+        "followed_sentinel": any(
+            name.startswith(SENTINEL_DIR + "/") for name in files
+        ),
+        "searched_project_index": "/knowledge/index/proj-alpha.md" in body,
+        "searched_global_index": "/knowledge/index/_global.md" in body,
+        "read_sentinel": (
+            "/knowledge/lessons/proj-alpha/" in body
+            and "report-output-directory.md" in body
+        ),
+        "detail_reads": detail_reads,
+        "read_decoy": DECOY_DIR in body or "proj-beta" in body,
+        "is_error": observed["is_error"],
+        "returncode": observed.get("returncode", 0),
+        "result": sanitized_result[:400],
+        "model": observed.get("model"),
+        "runtime": observed.get("runtime"),
+    }
+
+
+def failure_reasons(cases):
+    failures = []
+    for name, case in cases.items():
+        if case.get("returncode") != 0 or case.get("is_error") is not False:
+            failures.append("{} Claude 세션이 오류로 종료됐다".format(name))
+    if cases["control"]["followed_sentinel"]:
+        failures.append("control이 sentinel 규칙을 따랐다. 대조군이 무효다")
+    treatment = cases["treatment"]
+    if not treatment["searched_project_index"]:
+        failures.append("treatment가 현재 프로젝트 index를 검색하지 않았다")
+    if not treatment["searched_global_index"]:
+        failures.append("treatment가 _global index를 검색하지 않았다")
+    if not treatment["read_sentinel"]:
+        failures.append("treatment가 sentinel lesson을 읽지 않았다")
+    if not treatment["followed_sentinel"]:
+        failures.append("treatment가 sentinel lesson을 적용하지 않았다")
+    if treatment["read_decoy"]:
+        failures.append("treatment가 무관한 프로젝트 lesson을 읽었다")
+    if treatment["detail_reads"] > 5:
+        failures.append("treatment가 상세 자료를 5건보다 많이 읽었다")
+    if not cases["forced"]["followed_sentinel"]:
+        failures.append("forced에서도 실패했다. 저장·조회 메커니즘 자체를 점검하라")
+    return failures
+
+
+def build_evidence(runs, claude_code_version, usage_sha256, context):
+    consecutive_passes = 0
+    for run_result in runs:
+        consecutive_passes = consecutive_passes + 1 if run_result["passed"] else 0
+    models = sorted(
+        {
+            case.get("model")
+            for run_result in runs
+            for case in run_result["cases"].values()
+            if case.get("model")
+        }
+    )
+    runtimes = sorted(
+        {
+            case.get("runtime")
+            for run_result in runs
+            for case in run_result["cases"].values()
+            if case.get("runtime")
+        }
+    )
+    context_passed = context == {
+        "usage_only": True,
+        "embedded_index": False,
+        "embedded_body": False,
+    }
+    return {
+        "surface": "tools/didim-retrieval-ab",
+        "purpose": "짧은 조회 지침이 평소 요청에서 현재 project와 _global 지식을 제한적으로 찾는지 실제 Claude 세션으로 확인한다",
+        "claudeCodeVersion": claude_code_version,
+        "models": models,
+        "runtimes": runtimes,
+        "knowledgeUsageSha256": usage_sha256,
+        "contextContract": context,
+        "beforeFix": {
+            "observed": "treatment가 index를 검색하지 않고 control과 같은 위치에 보고서를 생성했다",
+            "diagnosis": "전달은 성공했지만 자율 조회가 발동하지 않았다",
+            "verdict": "FAIL",
+        },
+        "afterFix": {
+            "runs": runs,
+            "consecutivePasses": consecutive_passes,
+            "verdict": (
+                "PASS"
+                if consecutive_passes >= RUN_COUNT and context_passed
+                else "FAIL"
+            ),
+        },
+    }
+
+def run_trial(sandbox, claude, logs, number, oauth_token):
+    trial = sandbox / "runs" / str(number)
+    control_case = trial / "control"
+    treatment_case = trial / "treatment"
+    forced_case = trial / "forced"
+    control_project = control_case / "proj-alpha"
+    treatment_project = treatment_case / "proj-alpha"
+    forced_project = forced_case / "proj-alpha"
+
+    control_config, control_home = seed_case(control_case)
+    treatment_config, treatment_home, context, treatment_bin = install(
+        treatment_case,
+    )
+    forced_config, forced_home, forced_context, forced_bin = install(
+        forced_case,
+    )
+    if forced_context != context:
+        raise RuntimeError("case context contracts differ")
+
+    for path in (control_project, treatment_project, forced_project):
+        make_git_project(path)
+
+    cases = {
+        "control": judge(
+            session(
+                control_project,
+                control_home,
+                control_config,
+                claude,
+                PROMPT,
+                logs / "{}-control.jsonl".format(number),
+                oauth_token=oauth_token,
+            ),
+            control_project,
+            sandbox,
+        ),
+        "treatment": judge(
+            session(
+                treatment_project,
+                treatment_home,
+                treatment_config,
+                claude,
+                PROMPT,
+                logs / "{}-treatment.jsonl".format(number),
+                oauth_token=oauth_token,
+                path_prefix=treatment_bin,
+            ),
+            treatment_project,
+            sandbox,
+        ),
+        "forced": judge(
+            session(
+                forced_project,
+                forced_home,
+                forced_config,
+                claude,
+                FORCED_PROMPT,
+                logs / "{}-forced.jsonl".format(number),
+                oauth_token=oauth_token,
+                path_prefix=forced_bin,
+            ),
+            forced_project,
+            sandbox,
+        ),
+    }
+    failures = failure_reasons(cases)
+    return (
+        {
+            "run": number,
+            "prompt": PROMPT,
+            "forced_prompt": FORCED_PROMPT,
+            "cases": cases,
+            "failures": failures,
+            "passed": not failures,
+        },
+        context,
+    )
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Didimlog 조회 지침 자율 발동을 A/B로 검증한다"
+    )
+    parser.add_argument("--output", type=Path, help="판정 결과 JSON 경로")
+    parser.add_argument("--keep", action="store_true", help="샌드박스를 지우지 않는다")
+    args = parser.parse_args(argv)
+
+    for command in ("didim", "git", "security"):
+        if shutil.which(command) is None:
+            print("{} 명령을 찾을 수 없습니다".format(command), file=sys.stderr)
+            return 2
+    claude = claude_executable()
+    secret = read_active_secret()
+    if secret is None:
+        print("Claude 로그인 정보를 찾을 수 없습니다. 먼저 claude에 로그인하세요", file=sys.stderr)
+        return 2
+    oauth_token = oauth_access_token(secret)
+    del secret
+    if oauth_token is None:
+        print("Claude 로그인 정보에서 OAuth access token을 찾을 수 없습니다", file=sys.stderr)
+        return 2
+
+    sandbox = Path(tempfile.mkdtemp(prefix="didim-ab."))
+    try:
+        logs = sandbox / "logs"
+        logs.mkdir()
+        runs = []
+        context = None
+        for number in range(1, RUN_COUNT + 1):
+            run_result, trial_context = run_trial(
+                sandbox,
+                claude,
+                logs,
+                number,
+                oauth_token,
+            )
+            if context is None:
+                context = trial_context
+            elif trial_context != context:
+                raise RuntimeError("trial context contracts differ")
+            runs.append(run_result)
+        evidence = build_evidence(
+            runs,
+            run([claude, "--version"]).stdout.strip(),
+            hashlib.sha256(USAGE.read_bytes()).hexdigest(),
+            context,
+        )
+        rendered = json.dumps(evidence, ensure_ascii=False, indent=2) + "\n"
+        print(rendered, end="")
+        if evidence["afterFix"]["verdict"] != "PASS":
+            print("\nAB_FAILED", file=sys.stderr)
+            return 1
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(rendered, encoding="utf-8")
+        print("\nAB_PASSED", file=sys.stderr)
+        return 0
+    finally:
+        if args.keep:
+            print("sandbox={}".format(sandbox), file=sys.stderr)
+        else:
+            shutil.rmtree(sandbox, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

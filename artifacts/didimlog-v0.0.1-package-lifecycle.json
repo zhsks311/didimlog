@@ -1,0 +1,23 @@
+{
+  "artifact": "didimlog-package-lifecycle",
+  "package": "didimlog",
+  "schema_version": 1,
+  "stale_launcher_problem": "CLAUDE_LAUNCHER_INVALID",
+  "steps": [
+    "version",
+    "setup-dry-run",
+    "setup-apply",
+    "add-lesson",
+    "add-evidence",
+    "add-observation",
+    "add-experiment",
+    "index-check",
+    "status",
+    "doctor",
+    "uninstall",
+    "data-preserved",
+    "stale-launcher-diagnosed"
+  ],
+  "user_data_preserved": true,
+  "version": "0.0.1"
+}

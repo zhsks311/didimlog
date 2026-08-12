@@ -1,0 +1,210 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://didimlog.local/knowledge/schema/record.schema.json",
+  "title": "Knowledge Harness Stage-1 record frontmatter",
+  "description": "Stage-1 frontmatter object for observation/experiment/evidence records. This project copy is a review copy; records under knowledge/records/ are the only source of truth.",
+  "$comment": "draft-07. Validates the JSON object produced from restricted TOML frontmatter for OBS/EXP/EVD records only. It cannot express the cross-field invariant ID YYYYMMDD == created; the runtime parser enforces that linkage. It intentionally does NOT and cannot portably enforce: NFKC normalization; calendar validity of dates; created<=updated ordering; UTF-8 byte budgets; array UTF-8-byte sort order (only uniqueness is checked here); the full Unicode general-category (L*/N*) tag rule; symlink escape; path traversal beyond a literal '..' substring; existence/non-self-reference of sources and Contradicts IDs; body heading order and section content; and lifecycle edge legality. Those are enforced by the parser, kh-new, and kh-index policy, never by this schema. No future record types (finding/decision/playbook/failure_pattern/improvement_proposal) are permitted in v1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "type",
+    "title",
+    "status",
+    "scope",
+    "created",
+    "updated",
+    "version",
+    "tags",
+    "sources"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^(OBS|EXP|EVD)-[0-9]{8}-[0-9]{2}$",
+      "minLength": 15,
+      "maxLength": 15
+    },
+    "type": {
+      "type": "string",
+      "enum": ["observation", "experiment", "evidence"]
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120,
+      "pattern": "^[^\\r\\n\\u0000-\\u001F\\u007F]+$"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["draft", "running", "validated", "refuted", "superseded"]
+    },
+    "scope": {
+      "type": "string",
+      "pattern": "^(project|task:[A-Za-z0-9._-]{1,64})$",
+      "minLength": 6,
+      "maxLength": 69
+    },
+    "created": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "minLength": 10,
+      "maxLength": 10
+    },
+    "updated": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "minLength": 10,
+      "maxLength": 10
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+    },
+    "tags": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 20,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 32,
+        "pattern": "^([a-z0-9]|[^\\u0000-\\u007F])([a-z0-9._-]|[^\\u0000-\\u007F])*$",
+        "$comment": "Portable ASCII-vs-non-ASCII approximation of the tag policy: allow ASCII lowercase letters and digits, '.', '_', '-', and any non-ASCII character, including astral Unicode scalars; reject ASCII uppercase, whitespace, control chars, and other ASCII punctuation; the first character may not be '.', '_', or '-'. maxLength supplies the <=32 Unicode scalar cap. The stricter policy enforced by the parser (not here) adds NFKC normalization, a <=96 UTF-8 byte cap, exact Unicode L*/N* category checks (with '.', '_', and '-' allowed only after the first scalar), and UTF-8-byte ascending sort order within the array."
+      }
+    },
+    "sources": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 50,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^(EVD|EXP)-[0-9]{8}-[0-9]{2}$",
+        "minLength": 15,
+        "maxLength": 15
+      },
+      "$comment": "Only EVD or EXP IDs are legal sources (OBS is not a source). Each source ID must exist under the workspace record tree, match its filename and type prefix, and never equal the current record ID. Existence and non-self-reference are enforced by kh-new/kh-index (DANGLING_SOURCE, exit 3), not by this schema. References to refuted or superseded records stay legal so negative history is preserved."
+    },
+    "review_by": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "minLength": 10,
+      "maxLength": 10,
+      "$comment": "Optional review date. When present it must be a non-empty real calendar date. A record whose review_by is earlier than the current date is treated as stale by retrieval; staleness is a runtime comparison, not a stored flag."
+    },
+    "supersedes": {
+      "type": "string",
+      "pattern": "^$|^(OBS|EXP|EVD)-[0-9]{8}-[0-9]{2}$",
+      "maxLength": 15,
+      "$comment": "Optional. Empty or a non-empty OBS/EXP/EVD ID. Must not equal the current record ID; self-reference and cross-type mismatch are rejected by policy, not here."
+    },
+    "superseded_by": {
+      "type": "string",
+      "pattern": "^$|^(OBS|EXP|EVD)-[0-9]{8}-[0-9]{2}$",
+      "maxLength": 15,
+      "$comment": "Optional. Empty or a non-empty OBS/EXP/EVD ID. Paired with the successor's supersedes to form a bidirectional supersession link."
+    },
+    "artifact_path": {
+      "type": "string",
+      "minLength": 15,
+      "maxLength": 1024,
+      "pattern": "^knowledge/raw/(?:(?!\\.{1,2}(?:/|$))[^/\\u0000-\\u001F\\\\]+/)*(?!\\.{1,2}$)[^/\\u0000-\\u001F\\\\]+$",
+      "$comment": "Evidence only. Project-relative path below knowledge/raw/ to the bound artifact: it may not contain a backslash, control char, NUL, empty path segment, '.', or '..'. Every path component must be a regular directory or the final regular file; symlinks are rejected by didim add evidence and didim index (exit 3)."
+    },
+    "artifact_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "minLength": 64,
+      "maxLength": 64,
+      "$comment": "Evidence local / working-tree mode. Lowercase 64-hex SHA-256 of the artifact bytes. kh-index recomputes and compares it (ARTIFACT_DIGEST_MISMATCH, exit 3). Present only in local mode; absent in git mode."
+    },
+    "artifact_git": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+      "minLength": 40,
+      "maxLength": 64,
+      "$comment": "Evidence git mode. Full 40-hex (SHA-1) or 64-hex (SHA-256) git object ID; the commit plus artifact_path identifies content. Present only in git mode; absent in local mode."
+    }
+  },
+  "allOf": [
+    {
+      "$comment": "ID prefix must match type: observation -> OBS.",
+      "if": {
+        "properties": { "type": { "const": "observation" } },
+        "required": ["type"]
+      },
+      "then": {
+        "properties": { "id": { "pattern": "^OBS-" } }
+      }
+    },
+    {
+      "$comment": "experiment -> EXP.",
+      "if": {
+        "properties": { "type": { "const": "experiment" } },
+        "required": ["type"]
+      },
+      "then": {
+        "properties": { "id": { "pattern": "^EXP-" } }
+      }
+    },
+    {
+      "$comment": "evidence -> EVD.",
+      "if": {
+        "properties": { "type": { "const": "evidence" } },
+        "required": ["type"]
+      },
+      "then": {
+        "properties": { "id": { "pattern": "^EVD-" } }
+      }
+    },
+    {
+      "$comment": "Only experiments may use the 'running' status; observation and evidence use draft/validated/refuted/superseded.",
+      "if": {
+        "properties": { "type": { "enum": ["observation", "evidence"] } },
+        "required": ["type"]
+      },
+      "then": {
+        "properties": {
+          "status": { "enum": ["draft", "validated", "refuted", "superseded"] }
+        }
+      }
+    },
+    {
+      "$comment": "Evidence provenance is mandatory: exactly one of local mode (artifact_path + artifact_sha256) or git mode (artifact_path + artifact_git). Non-evidence records must not carry any artifact_* key.",
+      "if": {
+        "properties": { "type": { "const": "evidence" } },
+        "required": ["type"]
+      },
+      "then": {
+        "required": ["artifact_path"],
+        "oneOf": [
+          {
+            "required": ["artifact_sha256"],
+            "not": { "required": ["artifact_git"] }
+          },
+          {
+            "required": ["artifact_git"],
+            "not": { "required": ["artifact_sha256"] }
+          }
+        ]
+      },
+      "else": {
+        "not": {
+          "anyOf": [
+            { "required": ["artifact_path"] },
+            { "required": ["artifact_sha256"] },
+            { "required": ["artifact_git"] }
+          ]
+        }
+      }
+    }
+  ]
+}

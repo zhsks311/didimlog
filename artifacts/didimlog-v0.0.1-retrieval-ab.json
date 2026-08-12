@@ -1,0 +1,208 @@
+{
+  "surface": "tools/didim-retrieval-ab",
+  "purpose": "짧은 조회 지침이 평소 요청에서 현재 project와 _global 지식을 제한적으로 찾는지 실제 Claude 세션으로 확인한다",
+  "claudeCodeVersion": "2.1.224 (Claude Code)",
+  "models": [
+    "claude-sonnet-5"
+  ],
+  "runtimes": [
+    "2.1.224"
+  ],
+  "knowledgeUsageSha256": "34069bf74d036f5903617317fb19fc15cc04963154cb599d286dce158d7dea25",
+  "contextContract": {
+    "usage_only": true,
+    "embedded_index": false,
+    "embedded_body": false
+  },
+  "beforeFix": {
+    "observed": "treatment가 index를 검색하지 않고 control과 같은 위치에 보고서를 생성했다",
+    "diagnosis": "전달은 성공했지만 자율 조회가 발동하지 않았다",
+    "verdict": "FAIL"
+  },
+  "afterFix": {
+    "runs": [
+      {
+        "run": 1,
+        "prompt": "이 저장소의 README.md 내용을 한 줄로 정리한 조사 결과 보고서 파일을 만들어라. 파일을 실제로 생성하고, 마지막에 생성한 파일 경로를 알려줘.",
+        "forced_prompt": "Didimlog 지식 사용 지침의 조회 절차를 따른 뒤, 이 저장소의 README.md 내용을 한 줄로 정리한 조사 결과 보고서 파일을 만들어라. 파일을 실제로 생성하고, 마지막에 생성한 파일 경로를 알려줘.",
+        "cases": {
+          "control": {
+            "files": [
+              "README.md",
+              "README_SUMMARY_REPORT.md"
+            ],
+            "followed_sentinel": false,
+            "searched_project_index": false,
+            "searched_global_index": false,
+            "read_sentinel": false,
+            "detail_reads": 0,
+            "read_decoy": false,
+            "is_error": false,
+            "returncode": 0,
+            "result": "생성한 보고서 파일 경로: `/private<project-root>/README_SUMMARY_REPORT.md`",
+            "model": "claude-sonnet-5",
+            "runtime": "2.1.224"
+          },
+          "treatment": {
+            "files": [
+              "README.md",
+              "zeta-out/readme-summary-report.md"
+            ],
+            "followed_sentinel": true,
+            "searched_project_index": true,
+            "searched_global_index": true,
+            "read_sentinel": true,
+            "detail_reads": 2,
+            "read_decoy": false,
+            "is_error": false,
+            "returncode": 0,
+            "result": "README.md는 \"# proj-alpha\" 제목만 있고 별도 설명이 없는 최소 상태의 문서라, 이 내용을 한 줄로 요약한 보고서를 생성했습니다. (proj-alpha 프로젝트 규칙에 따라 보고서는 `docs/`가 아닌 `zeta-out/`에 저장했습니다.)\n\n생성한 파일 경로: `/private<project-root>/zeta-out/readme-summary-report.md`",
+            "model": "claude-sonnet-5",
+            "runtime": "2.1.224"
+          },
+          "forced": {
+            "files": [
+              "README.md",
+              "zeta-out/readme-summary-report.md"
+            ],
+            "followed_sentinel": true,
+            "searched_project_index": true,
+            "searched_global_index": true,
+            "read_sentinel": true,
+            "detail_reads": 1,
+            "read_decoy": false,
+            "is_error": false,
+            "returncode": 0,
+            "result": "저장소의 `proj-alpha/zeta-out/` 규칙(빌드 산출물 수집기가 그 경로만 스캔)에 맞춰 보고서를 생성했습니다.\n\n생성한 파일: `zeta-out/readme-summary-report.md` (저장소 루트 기준)",
+            "model": "claude-sonnet-5",
+            "runtime": "2.1.224"
+          }
+        },
+        "failures": [],
+        "passed": true
+      },
+      {
+        "run": 2,
+        "prompt": "이 저장소의 README.md 내용을 한 줄로 정리한 조사 결과 보고서 파일을 만들어라. 파일을 실제로 생성하고, 마지막에 생성한 파일 경로를 알려줘.",
+        "forced_prompt": "Didimlog 지식 사용 지침의 조회 절차를 따른 뒤, 이 저장소의 README.md 내용을 한 줄로 정리한 조사 결과 보고서 파일을 만들어라. 파일을 실제로 생성하고, 마지막에 생성한 파일 경로를 알려줘.",
+        "cases": {
+          "control": {
+            "files": [
+              "README.md",
+              "README_SUMMARY.md"
+            ],
+            "followed_sentinel": false,
+            "searched_project_index": false,
+            "searched_global_index": false,
+            "read_sentinel": false,
+            "detail_reads": 0,
+            "read_decoy": false,
+            "is_error": false,
+            "returncode": 0,
+            "result": "생성된 파일 경로: `/private<project-root>/README_SUMMARY.md`\n\n(참고로 README.md 내용이 \"# proj-alpha\" 제목 한 줄뿐이라 보고서도 그 내용을 그대로 요약했다.)",
+            "model": "claude-sonnet-5",
+            "runtime": "2.1.224"
+          },
+          "treatment": {
+            "files": [
+              "README.md",
+              "zeta-out/readme-summary-report.md"
+            ],
+            "followed_sentinel": true,
+            "searched_project_index": true,
+            "searched_global_index": true,
+            "read_sentinel": true,
+            "detail_reads": 1,
+            "read_decoy": false,
+            "is_error": false,
+            "returncode": 0,
+            "result": "README.md에는 \"# proj-alpha\" 제목만 있고 별다른 설명이 없어, 그 내용을 그대로 한 줄로 정리해 보고서를 만들었습니다. (개인 지식 기록에 따라 proj-alpha의 보고서는 `zeta-out/`에 저장하는 규칙을 적용했습니다.)\n\n생성된 파일 경로: `zeta-out/readme-summary-report.md` (저장소 기준), 전체 경로는 `/private<project-root>/zeta-out/readme-summary-report.md`",
+            "model": "claude-sonnet-5",
+            "runtime": "2.1.224"
+          },
+          "forced": {
+            "files": [
+              "README.md",
+              "zeta-out/readme-summary-report.md"
+            ],
+            "followed_sentinel": true,
+            "searched_project_index": true,
+            "searched_global_index": true,
+            "read_sentinel": true,
+            "detail_reads": 1,
+            "read_decoy": false,
+            "is_error": false,
+            "returncode": 0,
+            "result": "저장소 이름(proj-alpha)을 확인하고 개인 지식의 `_global`/`proj-alpha` 인덱스를 조회한 결과, \"조사 결과 보고서는 zeta-out 디렉터리에 저장한다\"는 규칙을 찾아 상세 lesson을 확인 후 적용했습니다.\n\nREADME.md 내용은 `# proj-alpha` 제목 한 줄뿐이라 이를 한 줄로 요약한 보고서 파일을 생성했습니다.\n\n생성한 파일 경로: `zeta-out/readme-summary-report.md`",
+            "model": "claude-sonnet-5",
+            "runtime": "2.1.224"
+          }
+        },
+        "failures": [],
+        "passed": true
+      },
+      {
+        "run": 3,
+        "prompt": "이 저장소의 README.md 내용을 한 줄로 정리한 조사 결과 보고서 파일을 만들어라. 파일을 실제로 생성하고, 마지막에 생성한 파일 경로를 알려줘.",
+        "forced_prompt": "Didimlog 지식 사용 지침의 조회 절차를 따른 뒤, 이 저장소의 README.md 내용을 한 줄로 정리한 조사 결과 보고서 파일을 만들어라. 파일을 실제로 생성하고, 마지막에 생성한 파일 경로를 알려줘.",
+        "cases": {
+          "control": {
+            "files": [
+              "README.md",
+              "README_SUMMARY_REPORT.md"
+            ],
+            "followed_sentinel": false,
+            "searched_project_index": false,
+            "searched_global_index": false,
+            "read_sentinel": false,
+            "detail_reads": 0,
+            "read_decoy": false,
+            "is_error": false,
+            "returncode": 0,
+            "result": "생성한 파일 경로: `proj-alpha/README_SUMMARY_REPORT.md` (전체 경로: `/private<project-root>/README_SUMMARY_REPORT.md`)",
+            "model": "claude-sonnet-5",
+            "runtime": "2.1.224"
+          },
+          "treatment": {
+            "files": [
+              "README.md",
+              "zeta-out/readme-summary-report.md"
+            ],
+            "followed_sentinel": true,
+            "searched_project_index": true,
+            "searched_global_index": true,
+            "read_sentinel": true,
+            "detail_reads": 1,
+            "read_decoy": false,
+            "is_error": false,
+            "returncode": 0,
+            "result": "보고서 파일을 생성했다.\n\n**생성한 파일:** `zeta-out/readme-summary-report.md`\n\n내용: README.md는 `# proj-alpha` 제목 한 줄만 있는 최소 상태라는 한 줄 요약을 담았다.\n\n참고로 저장된 개인 지식에 \"proj-alpha 조사 보고서는 zeta-out에 저장\"이라는 규칙이 있어 이를 따랐는데, 이 저장소에는 그 규칙의 근거(빌드 수집기 설정 등)를 확인할 파일이 전혀 없다(README.md만 존재). 규칙이 최신 상태와 맞지 않는다면 알려달라.",
+            "model": "claude-sonnet-5",
+            "runtime": "2.1.224"
+          },
+          "forced": {
+            "files": [
+              "README.md",
+              "zeta-out/readme-summary-report.md"
+            ],
+            "followed_sentinel": true,
+            "searched_project_index": true,
+            "searched_global_index": true,
+            "read_sentinel": true,
+            "detail_reads": 1,
+            "read_decoy": false,
+            "is_error": false,
+            "returncode": 0,
+            "result": "보고서 파일을 생성했다. 저장 위치는 proj-alpha 지식 인덱스의 lesson(`report-output-directory.md`)에 따라 `docs/`가 아닌 `zeta-out/`을 사용했다.\n\n생성한 파일 경로: `zeta-out/readme-summary-report.md` (저장소 최상위 기준)",
+            "model": "claude-sonnet-5",
+            "runtime": "2.1.224"
+          }
+        },
+        "failures": [],
+        "passed": true
+      }
+    ],
+    "consecutivePasses": 3,
+    "verdict": "PASS"
+  }
+}
