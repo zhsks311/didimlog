@@ -295,7 +295,9 @@ class ScaffoldTests(unittest.TestCase):
         readme.write_bytes(_legacy_readme(current))
         migration_plan = plan_scaffold(self.workspace)
 
-        original_acquire_directory_lock = scaffold_module.acquire_directory_lock
+        original_publish = (
+            scaffold_module.replace_regular_file_at_if_unchanged_with_ownership
+        )
         original_path_lock = indexing_module.path_lock
         writer_holds_lock = threading.Event()
         allow_writer = threading.Event()
@@ -305,22 +307,14 @@ class ScaffoldTests(unittest.TestCase):
         reader_errors = []
         prepared_results = []
 
-        def pause_after_knowledge_lock(
-            parent_descriptor,
-            *,
-            shared=False,
-            blocking=True,
-        ):
-            lock_descriptor = original_acquire_directory_lock(
-                parent_descriptor,
-                shared=shared,
-                blocking=blocking,
-            )
+        def pause_after_readme_update(*args, **kwargs):
+            publication = original_publish(*args, **kwargs)
             writer_holds_lock.set()
             if not allow_writer.wait(5):
-                os.close(lock_descriptor)
+                if publication is not None:
+                    os.close(publication[1])
                 raise AssertionError("scaffold update lock was not released")
-            return lock_descriptor
+            return publication
 
         def observe_reader_lock(*args, **kwargs):
             try:
@@ -352,8 +346,8 @@ class ScaffoldTests(unittest.TestCase):
         with (
             mock.patch.object(
                 scaffold_module,
-                "acquire_directory_lock",
-                side_effect=pause_after_knowledge_lock,
+                "replace_regular_file_at_if_unchanged_with_ownership",
+                side_effect=pause_after_readme_update,
             ),
             mock.patch.object(
                 indexing_module,
