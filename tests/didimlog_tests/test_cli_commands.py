@@ -732,7 +732,7 @@ class InstalledConsoleScriptTests(unittest.TestCase):
         )
 
         self.assertEqual(version.returncode, 0)
-        self.assertEqual(version.stdout, "Didimlog 0.0.1\n")
+        self.assertEqual(version.stdout, "Didimlog 0.0.2\n")
         self.assertEqual(help_result.returncode, 0)
         self.assertIn("didim setup", help_result.stdout)
 
