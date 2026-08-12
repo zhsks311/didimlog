@@ -147,6 +147,25 @@ class ConnectTests(unittest.TestCase):
                 expected_resources,
             )
 
+    def test_launcher_with_non_didim_basename_is_rejected_before_planning(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            home = root / "home"
+            config = home / ".claude"
+            config.mkdir(parents=True)
+            launcher = home / "bin" / "renamed-entrypoint"
+            launcher.parent.mkdir()
+            launcher.write_bytes(b"#!/bin/sh\n")
+            launcher.chmod(0o755)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "^launcher must be the didim executable$",
+            ):
+                plan_connect(config, launcher=launcher, environ={}, home=home)
+
+            self.assertEqual(tree_bytes(config), {})
+
     def test_repeated_connect_is_an_empty_plan_and_does_not_rewrite_files(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
