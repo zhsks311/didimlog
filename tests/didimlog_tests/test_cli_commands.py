@@ -428,6 +428,25 @@ class CliCommandSurfaceTests(unittest.TestCase):
         self.assertIn("SETUP_APPROVAL_REQUIRED", stderr)
         applied.assert_not_called()
 
+    def test_cli_launcher_discovery_resolves_a_tool_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            launcher = root / "tools" / "didimlog" / "bin" / "didim"
+            launcher.parent.mkdir(parents=True)
+            launcher.write_bytes(b"#!/bin/sh\n")
+            launcher.chmod(0o755)
+            launcher_link = root / "bin" / "didim"
+            launcher_link.parent.mkdir()
+            launcher_link.symlink_to(launcher)
+
+            with mock.patch(
+                "didimlog.cli.shutil.which",
+                return_value=str(launcher_link),
+            ):
+                discovered = cli._find_launcher()
+
+        self.assertEqual(discovered, launcher.resolve())
+
     def test_noninteractive_connect_without_yes_refuses_before_apply(self):
         plan = SimpleNamespace(changes=("connect change",), config_dir=Path("/safe"))
         with mock.patch(

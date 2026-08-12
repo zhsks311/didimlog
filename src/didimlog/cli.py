@@ -307,7 +307,7 @@ def _find_launcher() -> Path:
             exit_code=EXIT_POLICY,
             help_text="설치된 didim 명령을 확인한 뒤 다시 실행하세요.",
         )
-    return Path(executable)
+    return Path(executable).resolve(strict=True)
 
 
 def _apply_claude(plan, apply) -> None:

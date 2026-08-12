@@ -68,6 +68,8 @@ def _validate_launcher(launcher: Path) -> Path:
         or not os.access(candidate, os.X_OK)
     ):
         raise ValueError("launcher must be an executable regular file")
+    if candidate.name != "didim":
+        raise ValueError("launcher must be the didim executable")
     return candidate
 
 
