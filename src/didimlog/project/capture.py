@@ -82,6 +82,7 @@ class CaptureRequest:
 class _PinnedWorkspacePath:
     path: Path
     workspace_descriptor: int
+    knowledge_descriptor: int
 
     def __fspath__(self) -> str:
         return os.fspath(self.path)
@@ -454,6 +455,7 @@ def _candidate_record(
 def _validate_candidate(
     workspace: Path,
     workspace_descriptor: int,
+    knowledge_descriptor: int,
     candidate,
     records,
     contradicts: list[str],
@@ -481,6 +483,7 @@ def _validate_candidate(
                 candidate["artifact_sha256"],
                 candidate["id"],
                 workspace_descriptor=workspace_descriptor,
+                knowledge_descriptor=knowledge_descriptor,
             )
         else:
             verify_artifact_git(
@@ -699,7 +702,11 @@ def _capture_locked(
             )
         ) from error
 
-    pinned_workspace = _PinnedWorkspacePath(root, workspace_descriptor)
+    pinned_workspace = _PinnedWorkspacePath(
+        root,
+        workspace_descriptor,
+        knowledge_descriptor,
+    )
     try:
         for _ in range(max_id_retries):
             records = validate_record_tree(pinned_workspace)
@@ -719,6 +726,7 @@ def _capture_locked(
             _validate_candidate(
                 root,
                 workspace_descriptor,
+                knowledge_descriptor,
                 candidate,
                 records,
                 contradicts,

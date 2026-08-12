@@ -77,6 +77,7 @@ def check_artifact_path_policy(
     record_id,
     *,
     workspace_descriptor: int | None = None,
+    knowledge_descriptor: int | None = None,
 ):
     """Return a ``knowledge/raw/`` path that cannot escape through a symlink.
 
@@ -114,15 +115,25 @@ def check_artifact_path_policy(
         if os.path.commonpath((workspace_path, full_path)) != workspace_path:
             raise _artifact_path_escape(record_id, artifact_path)
 
-        if workspace_descriptor is not None:
+        descriptor: int | None = None
+        if knowledge_descriptor is not None:
+            descriptor = _duplicate_knowledge_directory(
+                knowledge_descriptor,
+                record_id,
+                artifact_path,
+            )
+            path_parts = parts[1:]
+        elif workspace_descriptor is not None:
             descriptor = _open_workspace(
                 workspace,
                 record_id,
                 artifact_path,
                 workspace_descriptor,
             )
+            path_parts = parts
+        if descriptor is not None:
             try:
-                for index, part in enumerate(parts):
+                for index, part in enumerate(path_parts):
                     try:
                         linked = os.stat(
                             part,
@@ -133,7 +144,7 @@ def check_artifact_path_policy(
                         break
                     if stat.S_ISLNK(linked.st_mode):
                         raise _artifact_path_escape(record_id, artifact_path)
-                    if index == len(parts) - 1:
+                    if index == len(path_parts) - 1:
                         break
                     child: int | None = None
                     try:
@@ -226,19 +237,49 @@ def _open_workspace(
     return descriptor
 
 
+def _duplicate_knowledge_directory(
+    knowledge_descriptor: int,
+    record_id: str,
+    artifact_path: str,
+) -> int:
+    descriptor: int | None = None
+    try:
+        descriptor = os.dup(knowledge_descriptor)
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise _artifact_path_escape(record_id, artifact_path)
+        return descriptor
+    except PolicyError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+    except (OSError, TypeError, ValueError) as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise _artifact_path_escape(record_id, artifact_path) from error
+
+
 def _open_artifact(
     workspace,
     artifact_path: str,
     record_id: str,
     workspace_descriptor: int | None = None,
+    knowledge_descriptor: int | None = None,
 ) -> int:
     parts = artifact_path.split("/")
-    descriptor = _open_workspace(
-        workspace,
-        record_id,
-        artifact_path,
-        workspace_descriptor,
-    )
+    if knowledge_descriptor is not None:
+        descriptor = _duplicate_knowledge_directory(
+            knowledge_descriptor,
+            record_id,
+            artifact_path,
+        )
+        parts = parts[1:]
+    else:
+        descriptor = _open_workspace(
+            workspace,
+            record_id,
+            artifact_path,
+            workspace_descriptor,
+        )
     try:
         for part in parts[:-1]:
             try:
@@ -312,6 +353,7 @@ def verify_artifact_local(
     record_id,
     *,
     workspace_descriptor: int | None = None,
+    knowledge_descriptor: int | None = None,
 ):
     """Verify the sole local-mode binding to a regular file and SHA-256.
 
@@ -319,7 +361,7 @@ def verify_artifact_local(
     ``artifact_sha256`` and no ``artifact_git``); ``record.validate_frontmatter``
     owns that schema invariant.
     """
-    if workspace_descriptor is None:
+    if workspace_descriptor is None and knowledge_descriptor is None:
         full_path = check_artifact_path_policy(
             workspace,
             artifact_path,
@@ -331,12 +373,14 @@ def verify_artifact_local(
             artifact_path,
             record_id,
             workspace_descriptor=workspace_descriptor,
+            knowledge_descriptor=knowledge_descriptor,
         )
     descriptor = _open_artifact(
         workspace,
         artifact_path,
         record_id,
         workspace_descriptor,
+        knowledge_descriptor,
     )
 
     digest = hashlib.sha256()
@@ -557,6 +601,28 @@ def _directory_revision(descriptor: int) -> tuple[int, ...]:
     )
 
 
+def _git_entry_revision(workspace_descriptor: int) -> tuple[int, ...]:
+    try:
+        current = os.stat(
+            b".git",
+            dir_fd=workspace_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as error:
+        raise _GitMetadataNotRepository from error
+    except (OSError, TypeError, ValueError) as error:
+        raise _GitMetadataUnverifiable from error
+    if not (stat.S_ISDIR(current.st_mode) or stat.S_ISREG(current.st_mode)):
+        raise _GitMetadataNotRepository
+    return (
+        current.st_dev,
+        current.st_ino,
+        current.st_mode,
+        current.st_size,
+        current.st_mtime_ns,
+        current.st_ctime_ns,
+    )
+
 def _reject_git_alternates_in_info(info_descriptor: int) -> None:
     for name in (b"alternates", b"http-alternates"):
         try:
@@ -576,16 +642,19 @@ def _reject_git_alternates_in_info(info_descriptor: int) -> None:
 class _PinnedGitObjectDatabase:
     descriptor: int
     watch_descriptor: int
+    workspace_descriptor: int
     object_database_revision: tuple[int, ...]
     info_exists: bool
     watch_revision: tuple[int, ...]
+    git_entry_revision: tuple[int, ...]
 
     def close(self) -> None:
         os.close(self.watch_descriptor)
         os.close(self.descriptor)
+        os.close(self.workspace_descriptor)
 
 
-def _validate_pinned_git_object_database(
+def _validate_pinned_git_object_database_state(
     object_database: _PinnedGitObjectDatabase,
 ) -> None:
     try:
@@ -632,15 +701,19 @@ def _validate_pinned_git_object_database(
 
 def _open_pinned_objects_directory(
     repository_descriptor: int,
+    workspace_descriptor: int,
+    git_entry_revision: tuple[int, ...],
 ) -> _PinnedGitObjectDatabase:
     object_database = _open_git_directory_component(
         repository_descriptor,
         b"objects",
     )
     watch_descriptor: int | None = None
+    workspace_copy: int | None = None
     try:
         try:
             object_database_revision = _directory_revision(object_database)
+            workspace_copy = os.dup(workspace_descriptor)
         except (OSError, TypeError, ValueError) as error:
             raise _GitMetadataUnverifiable from error
         try:
@@ -673,16 +746,24 @@ def _open_pinned_objects_directory(
         pinned = _PinnedGitObjectDatabase(
             descriptor=object_database,
             watch_descriptor=watch_descriptor,
+            workspace_descriptor=workspace_copy,
             info_exists=info_exists,
             watch_revision=watch_revision,
             object_database_revision=object_database_revision,
+            git_entry_revision=git_entry_revision,
         )
-        _validate_pinned_git_object_database(pinned)
+        _validate_pinned_git_object_database_state(pinned)
+        object_database = -1
+        watch_descriptor = None
+        workspace_copy = None
         return pinned
     except BaseException:
+        if workspace_copy is not None:
+            os.close(workspace_copy)
         if watch_descriptor is not None:
             os.close(watch_descriptor)
-        os.close(object_database)
+        if object_database >= 0:
+            os.close(object_database)
         raise
 
 
@@ -703,44 +784,97 @@ def _open_pinned_git_object_database(
             os.close(workspace)
         raise _GitMetadataUnverifiable from error
     try:
+        git_entry_revision = _git_entry_revision(workspace)
         repository_descriptor = _open_pinned_git_directory(workspace)
+        try:
+            try:
+                linked = os.stat(
+                    b"commondir",
+                    dir_fd=repository_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                linked = None
+            except (OSError, TypeError, ValueError) as error:
+                raise _GitMetadataUnverifiable from error
+
+            if linked is not None:
+                metadata = _open_stable_git_metadata_file(
+                    repository_descriptor,
+                    b"commondir",
+                    linked,
+                )
+                try:
+                    common_path = _single_git_metadata_line(
+                        _read_stable_git_metadata(metadata)
+                    )
+                finally:
+                    os.close(metadata)
+                common_directory = _open_git_directory_path(
+                    repository_descriptor,
+                    common_path,
+                )
+                os.close(repository_descriptor)
+                repository_descriptor = common_directory
+
+            pinned = _open_pinned_objects_directory(
+                repository_descriptor,
+                workspace,
+                git_entry_revision,
+            )
+            try:
+                if _git_entry_revision(workspace) != git_entry_revision:
+                    raise _GitMetadataUnverifiable
+            except _GitMetadataNotRepository as error:
+                pinned.close()
+                raise _GitMetadataUnverifiable from error
+            except BaseException:
+                pinned.close()
+                raise
+            return pinned
+        except _GitMetadataNotRepository as error:
+            raise _GitMetadataUnverifiable from error
+        finally:
+            os.close(repository_descriptor)
     finally:
         os.close(workspace)
 
+
+def _validate_pinned_git_object_database(
+    object_database: _PinnedGitObjectDatabase,
+) -> None:
+    current: _PinnedGitObjectDatabase | None = None
     try:
-        try:
-            linked = os.stat(
-                b"commondir",
-                dir_fd=repository_descriptor,
-                follow_symlinks=False,
+        _validate_pinned_git_object_database_state(object_database)
+        current = _open_pinned_git_object_database(
+            object_database.workspace_descriptor
+        )
+        _validate_pinned_git_object_database_state(current)
+        if (
+            object_database.git_entry_revision != current.git_entry_revision
+            or not _same_entry(
+                os.fstat(object_database.descriptor),
+                os.fstat(current.descriptor),
             )
-        except FileNotFoundError:
-            linked = None
-        except (OSError, TypeError, ValueError) as error:
-            raise _GitMetadataUnverifiable from error
-
-        if linked is not None:
-            metadata = _open_stable_git_metadata_file(
-                repository_descriptor,
-                b"commondir",
-                linked,
+            or object_database.info_exists != current.info_exists
+            or not _same_entry(
+                os.fstat(object_database.watch_descriptor),
+                os.fstat(current.watch_descriptor),
             )
-            try:
-                common_path = _single_git_metadata_line(
-                    _read_stable_git_metadata(metadata)
-                )
-            finally:
-                os.close(metadata)
-            common_directory = _open_git_directory_path(
-                repository_descriptor,
-                common_path,
-            )
-            os.close(repository_descriptor)
-            repository_descriptor = common_directory
-
-        return _open_pinned_objects_directory(repository_descriptor)
+        ):
+            raise _GitMetadataUnverifiable
+    except _GitMetadataUnverifiable:
+        raise
+    except (
+        _GitMetadataNotRepository,
+        OSError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise _GitMetadataUnverifiable from error
     finally:
-        os.close(repository_descriptor)
+        if current is not None:
+            current.close()
 
 
 def _pinned_git_environment() -> dict[str, str]:
