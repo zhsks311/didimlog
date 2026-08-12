@@ -209,6 +209,28 @@ class SetupPlanTests(unittest.TestCase):
             "프로젝트 지식을 이 컴퓨터에서만 사용",
             "\n".join(plan.project_changes),
         )
+    def test_discovered_launcher_symlink_uses_the_resolved_executable(self):
+        launcher_link = self.root / "user-bin" / "didim"
+        launcher_link.parent.mkdir()
+        launcher_link.symlink_to(self.launcher)
+
+        with mock.patch(
+            "didimlog.claude.setup.shutil.which",
+            return_value=str(launcher_link),
+        ):
+            plan = plan_setup(
+                home=self.home,
+                cwd=self.cwd,
+                config=self.config,
+                include_project=False,
+                skip_claude=False,
+            )
+
+        settings = next(
+            change for change in plan._claude._files if change.name == "settings"
+        )
+        self.assertIn(str(self.launcher.resolve()).encode(), settings.intended)
+        self.assertNotIn(str(launcher_link).encode(), settings.intended)
 
     def test_git_outside_is_an_explicit_non_error_project_summary(self):
         plan = self._plan()

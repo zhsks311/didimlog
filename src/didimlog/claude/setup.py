@@ -63,7 +63,8 @@ class SetupPlan:
 
 
 def _find_launcher() -> str | None:
-    return shutil.which("didim")
+    executable = shutil.which("didim")
+    return None if executable is None else str(Path(executable).resolve(strict=True))
 
 
 def _require_directory(path: Path, *, allow_missing: bool) -> bool:
