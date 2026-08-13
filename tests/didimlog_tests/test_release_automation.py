@@ -12,6 +12,8 @@ import yaml
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / ".github" / "scripts" / "release.py"
 
+RELEASE_PATHS = ("pyproject.toml", "uv.lock", "CHANGELOG.md")
+
 
 class ReleaseAutomationTests(unittest.TestCase):
     def run_script(self, *arguments, cwd=None):
@@ -31,18 +33,86 @@ class ReleaseAutomationTests(unittest.TestCase):
             text=True,
         ).stdout.strip()
 
+    def release_files(self, version, *, prepared):
+        files = {
+            "pyproject.toml": textwrap.dedent(
+                f"""\
+                [project]
+                name = "didimlog"
+                version = "{version}"
+                """
+            ),
+            "uv.lock": textwrap.dedent(
+                f"""\
+                version = 1
+
+                [[package]]
+                name = "didimlog"
+                version = "{version}"
+                source = {{ editable = "." }}
+                """
+            ),
+        }
+        if prepared:
+            files["CHANGELOG.md"] = textwrap.dedent(
+                f"""\
+                # 변경 이력
+
+                ## [Unreleased]
+
+                ## [{version}] - 2026-08-13
+
+                - 준비 중인 변경
+
+                ## [0.0.2] - 2026-08-12
+
+                - 이전 변경
+
+                [Unreleased]: https://github.com/zhsks311/didimlog/compare/v{version}...HEAD
+                [{version}]: https://github.com/zhsks311/didimlog/releases/tag/v{version}
+                [0.0.2]: https://github.com/zhsks311/didimlog/releases/tag/v0.0.2
+                """
+            )
+        else:
+            files["CHANGELOG.md"] = textwrap.dedent(
+                """\
+                # 변경 이력
+
+                ## [Unreleased]
+
+                - 준비 중인 변경
+
+                ## [0.0.2] - 2026-08-12
+
+                - 이전 변경
+
+                [Unreleased]: https://github.com/zhsks311/didimlog/compare/v0.0.2...HEAD
+                [0.0.2]: https://github.com/zhsks311/didimlog/releases/tag/v0.0.2
+                """
+            )
+        return files
+
     def initialize_git_repository(self, repository):
         repository.mkdir()
         self.git(repository, "init")
         self.git(repository, "config", "user.name", "Didimlog Test")
         self.git(repository, "config", "user.email", "didimlog@example.invalid")
         self.git(repository, "branch", "-M", "main")
-        (repository / "fixture.txt").write_text("base\n", encoding="utf-8")
-        self.git(repository, "add", "fixture.txt")
+        files = {"fixture.txt": "base\n", **self.release_files("0.0.2", prepared=False)}
+        for path, content in files.items():
+            (repository / path).write_text(content, encoding="utf-8")
+        self.git(repository, "add", ".")
         self.git(repository, "commit", "-m", "test: base")
         return self.git(repository, "rev-parse", "HEAD")
 
-    def commit(self, repository, message):
+    def commit(self, repository, message, *, files=None):
+        files = files or {}
+        for path, content in files.items():
+            destination = repository / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(content, encoding="utf-8")
+        if files:
+            self.git(repository, "add", "--", *files)
         self.git(repository, "commit", "--allow-empty", "-m", message)
         return self.git(repository, "rev-parse", "HEAD")
 
@@ -87,6 +157,40 @@ class ReleaseAutomationTests(unittest.TestCase):
             )
         )
 
+    def preparation_commit(
+        self,
+        repository,
+        base_sha,
+        *,
+        version="0.0.3",
+        bump="patch",
+        pr_number=42,
+        release_kind="develop",
+        files=None,
+    ):
+        return self.commit(
+            repository,
+            self.preparation_message(
+                base_sha,
+                version=version,
+                bump=bump,
+                pr_number=pr_number,
+                release_kind=release_kind,
+            ),
+            files=files or self.release_files(version, prepared=True),
+        )
+
+    def cancel_commit(self, repository, preparation_sha, *, files=None):
+        if files is None:
+            parent = self.git(repository, "rev-parse", f"{preparation_sha}^")
+            self.git(repository, "checkout", parent, "--", *RELEASE_PATHS)
+            files = {}
+        return self.commit(
+            repository,
+            f"Didimlog-Release-Cancel: {preparation_sha}",
+            files=files,
+        )
+
     def inspect_pr(
         self,
         repository,
@@ -122,18 +226,9 @@ class ReleaseAutomationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             repository = Path(temporary_directory) / "repository"
             base_sha = self.initialize_git_repository(repository)
-            first_preparation = self.commit(
-                repository,
-                self.preparation_message(base_sha),
-            )
-            self.commit(
-                repository,
-                f"Didimlog-Release-Cancel: {first_preparation}",
-            )
-            active_preparation = self.commit(
-                repository,
-                self.preparation_message(base_sha),
-            )
+            first_preparation = self.preparation_commit(repository, base_sha)
+            self.cancel_commit(repository, first_preparation)
+            active_preparation = self.preparation_commit(repository, base_sha)
 
             evidence = self.inspect_pr(
                 repository,
@@ -199,19 +294,20 @@ class ReleaseAutomationTests(unittest.TestCase):
                 repository,
                 self.preparation_message(base_sha, pr_number=7),
             )
-            self.checkout(repository, "main")
-            active_preparation = self.commit(
+            combined = self.merge_commit(
                 repository,
-                self.preparation_message(base_sha),
-            )
-            head_sha = self.merge_commit(
-                repository,
-                active_preparation,
+                base_sha,
                 foreign_preparation,
                 "test: combine PR histories",
             )
+            self.checkout(repository, combined)
+            active_preparation = self.preparation_commit(repository, base_sha)
 
-            evidence = self.inspect_pr(repository, base_sha, head_sha)
+            evidence = self.inspect_pr(
+                repository,
+                base_sha,
+                active_preparation,
+            )
 
             self.assertEqual(evidence["state"], "prepared")
             self.assertEqual(
@@ -221,7 +317,7 @@ class ReleaseAutomationTests(unittest.TestCase):
             self.assertEqual(evidence["base_sha"], base_sha)
             self.assertEqual(evidence["reason"], "active_preparation")
             self.assertEqual(
-                self.file_at_revision(repository, head_sha, "fixture.txt"),
+                self.file_at_revision(repository, active_preparation, "fixture.txt"),
                 "base",
             )
 
@@ -231,10 +327,7 @@ class ReleaseAutomationTests(unittest.TestCase):
             base_sha = self.initialize_git_repository(repository)
             self.create_branch(repository, "preparation", base_sha)
             self.checkout(repository, "preparation")
-            preparation = self.commit(
-                repository,
-                self.preparation_message(base_sha),
-            )
+            preparation = self.preparation_commit(repository, base_sha)
             self.checkout(repository, "main")
             sibling_cancel = self.commit(
                 repository,
@@ -308,6 +401,289 @@ class ReleaseAutomationTests(unittest.TestCase):
                         evidence["reason"],
                         "invalid_preparation_marker",
                     )
+
+    def test_inspect_pr_requires_exact_release_file_diff(self):
+        cases = (
+            ("valid", "prepared", "active_preparation"),
+            ("extra-path", "invalid", "preparation_changed_paths"),
+            ("multiple-parents", "invalid", "preparation_parent_count"),
+        )
+        for case, state, reason in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary_directory:
+                repository = Path(temporary_directory) / "repository"
+                base_sha = self.initialize_git_repository(repository)
+                files = self.release_files("0.0.3", prepared=True)
+                if case == "extra-path":
+                    files["fixture.txt"] = "unexpected preparation change\n"
+                preparation = self.preparation_commit(
+                    repository,
+                    base_sha,
+                    files=files,
+                )
+                head_sha = preparation
+                if case == "multiple-parents":
+                    head_sha = self.merge_commit(
+                        repository,
+                        preparation,
+                        base_sha,
+                        self.preparation_message(base_sha),
+                    )
+
+                evidence = self.inspect_pr(repository, base_sha, head_sha)
+
+                self.assertEqual(evidence["state"], state)
+                self.assertEqual(evidence["reason"], reason)
+                self.assertEqual(
+                    evidence["changed_paths"],
+                    sorted(RELEASE_PATHS) if case == "valid" else (
+                        sorted((*RELEASE_PATHS, "fixture.txt"))
+                        if case == "extra-path"
+                        else []
+                    ),
+                )
+                self.assertEqual(evidence["tree_valid"], case == "valid")
+                self.assertEqual(evidence["release_kind"], "develop")
+                self.assertTrue(evidence["head_is_preparation"])
+
+    def test_inspect_pr_rejects_inconsistent_release_files(self):
+        cases = (
+            ("bump", "preparation_version_bump_mismatch"),
+            ("project", "preparation_project_version_mismatch"),
+            ("lock", "preparation_lock_version_mismatch"),
+            ("changelog", "preparation_changelog_mismatch"),
+        )
+        for case, reason in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary_directory:
+                repository = Path(temporary_directory) / "repository"
+                base_sha = self.initialize_git_repository(repository)
+                marker_version = "0.0.4" if case == "bump" else "0.0.3"
+                files = self.release_files(marker_version, prepared=True)
+                if case == "project":
+                    files["pyproject.toml"] = self.release_files(
+                        "0.0.4",
+                        prepared=True,
+                    )["pyproject.toml"]
+                elif case == "lock":
+                    files["uv.lock"] = self.release_files(
+                        "0.0.4",
+                        prepared=True,
+                    )["uv.lock"]
+                elif case == "changelog":
+                    files["CHANGELOG.md"] = self.release_files(
+                        "0.0.4",
+                        prepared=True,
+                    )["CHANGELOG.md"]
+                preparation = self.preparation_commit(
+                    repository,
+                    base_sha,
+                    version=marker_version,
+                    files=files,
+                )
+
+                evidence = self.inspect_pr(
+                    repository,
+                    base_sha,
+                    preparation,
+                )
+
+                self.assertEqual(evidence["state"], "invalid")
+                self.assertEqual(evidence["reason"], reason)
+                self.assertEqual(evidence["changed_paths"], sorted(RELEASE_PATHS))
+                self.assertFalse(evidence["tree_valid"])
+
+    def test_inspect_pr_promotes_changelog_from_preparation_parent(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            base_sha = self.initialize_git_repository(repository)
+            extra_entry = "- develop에서 추가한 변경"
+            parent_changelog = self.release_files(
+                "0.0.2",
+                prepared=False,
+            )["CHANGELOG.md"].replace(
+                "- 준비 중인 변경",
+                f"- 준비 중인 변경\n{extra_entry}",
+            )
+            preparation_parent = self.commit(
+                repository,
+                "feat: add an unreleased develop change",
+                files={"CHANGELOG.md": parent_changelog},
+            )
+            preparation_files = self.release_files("0.0.3", prepared=True)
+            preparation_files["CHANGELOG.md"] = preparation_files[
+                "CHANGELOG.md"
+            ].replace(
+                "- 준비 중인 변경",
+                f"- 준비 중인 변경\n{extra_entry}",
+            )
+            preparation = self.preparation_commit(
+                repository,
+                base_sha,
+                files=preparation_files,
+            )
+
+            evidence = self.inspect_pr(
+                repository,
+                base_sha,
+                preparation,
+            )
+
+            self.assertNotEqual(
+                self.file_at_revision(
+                    repository,
+                    base_sha,
+                    "CHANGELOG.md",
+                ),
+                self.file_at_revision(
+                    repository,
+                    preparation_parent,
+                    "CHANGELOG.md",
+                ),
+            )
+            self.assertEqual(evidence["state"], "prepared")
+            self.assertEqual(evidence["active_preparation"], preparation)
+            self.assertEqual(evidence["reason"], "active_preparation")
+            self.assertTrue(evidence["tree_valid"])
+
+    def test_inspect_pr_validates_release_kind_against_head_ref(self):
+        cases = (
+            ("develop", "develop", "prepared", "active_preparation"),
+            ("hotfix/urgent", "hotfix", "prepared", "active_preparation"),
+            (
+                "develop",
+                "hotfix",
+                "invalid",
+                "preparation_release_kind_mismatch",
+            ),
+            (
+                "feature/example",
+                "develop",
+                "invalid",
+                "preparation_release_kind_mismatch",
+            ),
+        )
+        for head_ref, release_kind, state, reason in cases:
+            with self.subTest(
+                head_ref=head_ref,
+                release_kind=release_kind,
+            ), tempfile.TemporaryDirectory() as temporary_directory:
+                repository = Path(temporary_directory) / "repository"
+                base_sha = self.initialize_git_repository(repository)
+                preparation = self.preparation_commit(
+                    repository,
+                    base_sha,
+                    release_kind=release_kind,
+                )
+
+                evidence = self.inspect_pr(
+                    repository,
+                    base_sha,
+                    preparation,
+                    head_ref=head_ref,
+                )
+
+                self.assertEqual(evidence["state"], state)
+                self.assertEqual(evidence["reason"], reason)
+                self.assertEqual(evidence["release_kind"], release_kind)
+                self.assertTrue(evidence["tree_valid"])
+
+    def test_inspect_pr_marks_post_prepare_commit_stale(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            base_sha = self.initialize_git_repository(repository)
+            preparation = self.preparation_commit(repository, base_sha)
+            head_sha = self.commit(
+                repository,
+                "test: user change after preparation",
+                files={"fixture.txt": "user change\n"},
+            )
+
+            evidence = self.inspect_pr(repository, base_sha, head_sha)
+
+            self.assertEqual(evidence["state"], "stale")
+            self.assertEqual(evidence["active_preparation"], preparation)
+            self.assertEqual(evidence["reason"], "preparation_not_head")
+            self.assertEqual(evidence["changed_paths"], sorted(RELEASE_PATHS))
+            self.assertTrue(evidence["tree_valid"])
+            self.assertEqual(evidence["release_kind"], "develop")
+            self.assertFalse(evidence["head_is_preparation"])
+
+    def test_cancel_must_restore_only_the_validated_preparation_diff(self):
+        cases = (
+            ("valid", "none", "no_active_preparation"),
+            ("extra-path", "invalid", "cancel_changed_paths"),
+            ("tree-mismatch", "invalid", "cancel_tree_mismatch"),
+            ("multiple-parents", "invalid", "cancel_parent_count"),
+        )
+        for case, state, reason in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary_directory:
+                repository = Path(temporary_directory) / "repository"
+                base_sha = self.initialize_git_repository(repository)
+                preparation = self.preparation_commit(repository, base_sha)
+                if case == "valid":
+                    head_sha = self.cancel_commit(repository, preparation)
+                elif case == "extra-path":
+                    self.git(
+                        repository,
+                        "checkout",
+                        f"{preparation}^",
+                        "--",
+                        *RELEASE_PATHS,
+                    )
+                    head_sha = self.cancel_commit(
+                        repository,
+                        preparation,
+                        files={"fixture.txt": "unexpected cancel change\n"},
+                    )
+                elif case == "tree-mismatch":
+                    files = self.release_files("0.0.2", prepared=False)
+                    files["CHANGELOG.md"] += "\nnot the preparation parent\n"
+                    head_sha = self.cancel_commit(
+                        repository,
+                        preparation,
+                        files=files,
+                    )
+                else:
+                    tree = self.git(
+                        repository,
+                        "rev-parse",
+                        f"{base_sha}^{{tree}}",
+                    )
+                    head_sha = self.git(
+                        repository,
+                        "commit-tree",
+                        tree,
+                        "-p",
+                        preparation,
+                        "-p",
+                        base_sha,
+                        input_text=(
+                            f"Didimlog-Release-Cancel: {preparation}\n"
+                        ),
+                    )
+
+                evidence = self.inspect_pr(repository, base_sha, head_sha)
+
+                self.assertEqual(evidence["state"], state)
+                self.assertEqual(evidence["reason"], reason)
+                if case == "valid":
+                    preparation_parent = self.git(
+                        repository,
+                        "rev-parse",
+                        f"{preparation}^",
+                    )
+                    for path in RELEASE_PATHS:
+                        self.assertEqual(
+                            self.git(
+                                repository,
+                                "rev-parse",
+                                f"{head_sha}:{path}",
+                            ),
+                            self.git(
+                                repository,
+                                "rev-parse",
+                                f"{preparation_parent}:{path}",
+                            ),
+                        )
 
     def test_prepare_changelog_promotes_unreleased_and_updates_links(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
