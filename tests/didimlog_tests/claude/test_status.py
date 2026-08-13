@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from didimlog import version as didimlog_version
+
 from didimlog.claude.probe import _launcher_from_settings
 from didimlog.claude.setup import apply_setup, plan_setup
 from didimlog.claude.status import _safe_label, doctor_text, status_text
@@ -181,7 +183,7 @@ class StatusDoctorTests(unittest.TestCase):
 
         self.assertEqual(
             text,
-            "Didimlog 0.0.2\n"
+            f"Didimlog {didimlog_version()}\n"
             "개인 지식: 최신\n"
             "현재 프로젝트: demo-project\n"
             "프로젝트 근거: 최신\n"

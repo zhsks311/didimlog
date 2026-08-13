@@ -1,0 +1,230 @@
+name: Prepare release from pull request label
+
+on:
+  pull_request_target:
+    types: [labeled, unlabeled]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-preparation-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  bootstrap-labels:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Create release choice labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create "release:none" --repo "${GITHUB_REPOSITORY}" --color "D0D7DE" --description "Merge without publishing a release" --force
+          gh label create "release:patch" --repo "${GITHUB_REPOSITORY}" --color "0969DA" --description "Prepare the next patch release" --force
+          gh label create "release:minor" --repo "${GITHUB_REPOSITORY}" --color "1F883D" --description "Prepare the next minor release" --force
+          gh label create "release:major" --repo "${GITHUB_REPOSITORY}" --color "CF222E" --description "Prepare the next major release" --force
+          gh label create "release:ready" --repo "${GITHUB_REPOSITORY}" --color "8250DF" --description "Version and changelog prepared; merge publishes" --force
+
+  prepare:
+    if: >-
+      github.event.action == 'labeled' &&
+      (github.event.label.name == 'release:patch' ||
+       github.event.label.name == 'release:minor' ||
+       github.event.label.name == 'release:major') &&
+      github.event.pull_request.state == 'open' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.ref == 'develop' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Validate one unprepared release selection
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          test "$(gh pr view "${PR_NUMBER}" --json state --jq '.state')" = "OPEN"
+          test "$(git rev-parse HEAD)" = "${EXPECTED_HEAD}"
+          git fetch origin main develop --tags
+          selected_count="$(gh pr view "${PR_NUMBER}" --json labels --jq '[.labels[].name | select(test("^release:(none|patch|minor|major)$"))] | length')"
+          test "${selected_count}" -eq 1
+          if gh pr view "${PR_NUMBER}" --json labels --jq '.labels[].name' | grep -Fxq 'release:ready'; then
+            echo "A release is already prepared. Remove its release label before selecting another version." >&2
+            exit 1
+          fi
+          git show origin/main:pyproject.toml > "${RUNNER_TEMP}/main-pyproject.toml"
+          cmp --silent pyproject.toml "${RUNNER_TEMP}/main-pyproject.toml" || {
+            echo "develop already contains an unmerged project version change" >&2
+            exit 1
+          }
+      - name: Bump version and promote Unreleased changelog
+        id: version
+        env:
+          BUMP: ${{ github.event.label.name == 'release:major' && 'major' || github.event.label.name == 'release:minor' && 'minor' || 'patch' }}
+        run: |
+          set -euo pipefail
+          uv version --bump "${BUMP}"
+          version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          if git ls-remote --exit-code --tags origin "refs/tags/v${version}" >/dev/null 2>&1; then
+            echo "tag v${version} already exists" >&2
+            exit 1
+          fi
+          status="$(curl --silent --output /dev/null --write-out '%{http_code}' "https://pypi.org/pypi/didimlog/${version}/json")"
+          test "${status}" = "404" || {
+            echo "PyPI version ${version} already exists or could not be checked: HTTP ${status}" >&2
+            exit 1
+          }
+          python .github/scripts/release.py prepare-changelog \
+            --path CHANGELOG.md \
+            --version "${version}" \
+            --date "$(date -u +%F)"
+          uv lock --check
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+      - name: Test and build prepared release
+        run: |
+          uv sync --locked --python 3.13
+          uv run --project . python -m unittest discover -s tests -v
+          uv build --out-dir dist
+      - name: Commit prepared release without rewriting history
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RELEASE_LABEL: ${{ github.event.label.name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          live_pr="$(gh pr view "${PR_NUMBER}" --json state,labels)"
+          test "$(jq -r '.state' <<<"${live_pr}")" = "OPEN"
+          current_choice_count="$(jq '[.labels[].name | select(test("^release:(none|patch|minor|major)$"))] | length' <<<"${live_pr}")"
+          current_label_count="$(jq --arg label "${RELEASE_LABEL}" '[.labels[].name | select(. == $label)] | length' <<<"${live_pr}")"
+          if test "${current_choice_count}" -ne 1 || test "${current_label_count}" -ne 1; then
+            echo "Release selection changed while preparation was running; no commit was created." >&2
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml uv.lock CHANGELOG.md
+          gh auth setup-git
+          git commit -m "chore: prepare ${VERSION} release" -m "Didimlog-Release-Prep: v${VERSION}"
+          git push origin HEAD:develop
+      - name: Mark the pull request ready and rerun CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RELEASE_LABEL: ${{ github.event.label.name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if ! gh pr view "${PR_NUMBER}" --json labels --jq '.labels[].name' | grep -Fxq "${RELEASE_LABEL}"; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git revert --no-edit HEAD
+            gh auth setup-git
+            git push origin HEAD:develop
+            gh pr comment "${PR_NUMBER}" --body "Release v${VERSION} preparation was cancelled because ${RELEASE_LABEL} was removed while the workflow was running."
+            gh workflow run ci.yml --ref develop
+            exit 0
+          fi
+          gh label create "release:ready" --color "8250DF" --description "Version and changelog prepared; merging publishes the release" --force
+          gh pr edit "${PR_NUMBER}" --add-label "release:ready"
+          gh pr comment "${PR_NUMBER}" --body "Release v${VERSION} is prepared and verified. Merging this PR publishes the GitHub Release and PyPI package. Remove ${RELEASE_LABEL} before merge to cancel safely."
+          gh workflow run ci.yml --ref develop
+
+  cancel:
+    if: >-
+      ((github.event.action == 'unlabeled' &&
+        (github.event.label.name == 'release:patch' ||
+         github.event.label.name == 'release:minor' ||
+         github.event.label.name == 'release:major')) ||
+       (github.event.action == 'labeled' &&
+        github.event.label.name == 'release:none')) &&
+      github.event.pull_request.state == 'open' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.ref == 'develop' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Revert only the bot-owned preparation commit
+        id: revert
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          live_pr="$(gh pr view "${PR_NUMBER}" --json headRefOid,state)"
+          test "$(jq -r '.state' <<<"${live_pr}")" = "OPEN"
+          test "$(git rev-parse HEAD)" = "$(jq -r '.headRefOid' <<<"${live_pr}")"
+          git fetch origin main develop --tags
+          prepared="$(git log --format='%H' --grep='^Didimlog-Release-Prep: v' origin/main..HEAD | head -n 1)"
+          if test -z "${prepared}"; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          if git log --format='%B' "${prepared}..HEAD" | grep -Fq "This reverts commit ${prepared}."; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          version="$(git show -s --format='%B' "${prepared}" | sed -n 's/^Didimlog-Release-Prep: v//p')"
+          test -n "${version}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git revert --no-edit "${prepared}"
+          uv lock --check
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+      - name: Test the restored branch
+        if: steps.revert.outputs.changed == 'true'
+        run: |
+          uv sync --locked --python 3.13
+          uv run --project . python -m unittest discover -s tests -v
+      - name: Push restoration and clear ready state
+        env:
+          CHANGED: ${{ steps.revert.outputs.changed }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          VERSION: ${{ steps.revert.outputs.version }}
+        run: |
+          if test "${CHANGED}" = "true"; then
+            test "$(gh pr view "${PR_NUMBER}" --json state --jq '.state')" = "OPEN"
+            gh auth setup-git
+            git push origin HEAD:develop
+            gh pr comment "${PR_NUMBER}" --body "Release v${VERSION} preparation was reverted without rewriting branch history. This PR will not publish unless a release label is added again."
+            gh workflow run ci.yml --ref develop
+          fi
+          if gh pr view "${PR_NUMBER}" --json labels --jq '.labels[].name' | grep -Fxq 'release:ready'; then
+            gh pr edit "${PR_NUMBER}" --remove-label "release:ready"
+          fi

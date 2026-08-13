@@ -195,6 +195,25 @@ uv build
 uv run --project . python -m unittest tests.didimlog_tests.test_release -v
 ```
 
+### 릴리스
+
+한 번만 다음 저장소 설정을 마칩니다.
+
+- GitHub Actions의 `Workflow permissions`를 `Read and write permissions`로 설정합니다.
+- `pypi` environment(배포 환경)를 만들고, 완전 자동 배포를 원하면 필수 승인자를 두지 않습니다.
+- PyPI Trusted Publisher에 소유자 `zhsks311`, 저장소 `didimlog`, workflow `release.yml`, environment `pypi`를 등록합니다.
+- GitHub Release immutability(공개 후 수정 금지)를 켭니다.
+- `main`은 PR과 CI 통과를 필수로 하고, `develop`에는 GitHub Actions가 준비 커밋과 취소 커밋을 push할 수 있게 둡니다.
+
+자동화가 `main`에 처음 반영되면 릴리스 선택 label이 생성됩니다. 이후 `develop` → `main` PR에서 다음 label 중 하나만 선택합니다.
+
+- `release:none`: 배포 없이 병합
+- `release:patch`: 버그 수정 버전 준비
+- `release:minor`: 하위 호환 기능 버전 준비
+- `release:major`: 호환성이 깨지는 버전 준비
+
+버전 label을 붙이면 `pyproject.toml`, `uv.lock`, `CHANGELOG.md`가 자동으로 갱신되고 전체 테스트와 빌드가 실행됩니다. `release:ready`와 CI 통과를 확인한 뒤 PR을 병합하면 tag, 검증된 wheel·sdist·`SHA256SUMS`, 변경 이력, PyPI 배포가 차례로 생성됩니다. 병합 전에 버전 label을 제거하거나 `release:none`을 붙이면 준비 커밋을 revert하고 배포를 취소합니다. 강제 push는 사용하지 않습니다.
+
 기여 방법은 [`CONTRIBUTING.md`](CONTRIBUTING.md), 보안 제보 방법은 [`SECURITY.md`](SECURITY.md), 사용자-visible 변경은 [`CHANGELOG.md`](CHANGELOG.md)에서 확인할 수 있습니다.
 
 ## 라이선스
