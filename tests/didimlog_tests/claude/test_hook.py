@@ -175,6 +175,111 @@ SECRET-SENTINEL-BODY
         self.assertNotIn("reader@example.com", message)
         self.assertNotIn("SECRET-SENTINEL-BODY", message)
 
+    def test_shared_claude_md_link_names_the_profile_that_owns_the_file(self):
+        """A profile whose CLAUDE.md links elsewhere must get a runnable fix."""
+        other_profile = self.home / ".claude-main"
+        other_profile.mkdir()
+        owner = other_profile / "CLAUDE.md"
+        owner.write_bytes((self.config / "CLAUDE.md").read_bytes())
+        linked_config = self.home / ".claude-work"
+        linked_config.mkdir()
+        (linked_config / "CLAUDE.md").symlink_to(owner)
+
+        problems = inspect(home=self.home, cwd=self.project, config=linked_config)
+
+        tokens = {problem.token for problem in problems}
+        self.assertIn("CLAUDE_IMPORT_LINKED", tokens)
+        self.assertNotIn("CLAUDE_CONFIG_INVALID", tokens)
+        linked = next(
+            problem for problem in problems if problem.token == "CLAUDE_IMPORT_LINKED"
+        )
+        self.assertEqual(
+            linked.action,
+            "CLAUDE_CONFIG_DIR=~/.claude-main didim setup",
+        )
+
+    def test_linked_claude_md_outside_home_gets_a_generic_action(self):
+        outside = self.root / "outside-claude.md"
+        outside.write_bytes(b"# outside\n")
+        linked_config = self.home / ".claude-work"
+        linked_config.mkdir()
+        (linked_config / "CLAUDE.md").symlink_to(outside)
+
+        problems = inspect(home=self.home, cwd=self.project, config=linked_config)
+
+        linked = next(
+            problem for problem in problems if problem.token == "CLAUDE_IMPORT_LINKED"
+        )
+        self.assertNotIn(str(self.root), linked.action)
+        self.assertNotIn(str(self.root), linked.impact)
+
+    def test_profile_name_that_is_not_shell_safe_gets_a_generic_action(self):
+        other_profile = self.home / ".claude;echo-unsafe"
+        other_profile.mkdir()
+        owner = other_profile / "CLAUDE.md"
+        owner.write_bytes((self.config / "CLAUDE.md").read_bytes())
+        linked_config = self.home / ".claude-work"
+        linked_config.mkdir()
+        (linked_config / "CLAUDE.md").symlink_to(owner)
+
+        problems = inspect(home=self.home, cwd=self.project, config=linked_config)
+
+        linked = next(
+            problem for problem in problems if problem.token == "CLAUDE_IMPORT_LINKED"
+        )
+        self.assertEqual(linked.action, "didim setup")
+        self.assertNotIn("echo-unsafe", linked.action)
+
+    def test_refused_target_never_collapses_other_problems(self):
+        """One refused path must not hide the launcher or resource state."""
+        linked_config = self.home / ".claude-work"
+        linked_config.mkdir()
+        (linked_config / "CLAUDE.md").symlink_to(self.config / "CLAUDE.md")
+
+        problems = inspect(home=self.home, cwd=self.project, config=linked_config)
+
+        tokens = {problem.token for problem in problems}
+        self.assertIn("CLAUDE_IMPORT_LINKED", tokens)
+        self.assertIn("CLAUDE_RESOURCE_INVALID", tokens)
+        self.assertIn("CLAUDE_LAUNCHER_INVALID", tokens)
+
+    def test_directory_target_is_reported_separately_from_a_link(self):
+        broken_config = self.home / ".claude-broken"
+        broken_config.mkdir()
+        (broken_config / "CLAUDE.md").mkdir()
+
+        problems = inspect(home=self.home, cwd=self.project, config=broken_config)
+
+        tokens = {problem.token for problem in problems}
+        self.assertIn("CLAUDE_IMPORT_UNREADABLE", tokens)
+        self.assertNotIn("CLAUDE_IMPORT_LINKED", tokens)
+
+    def test_hook_keeps_a_profile_specific_repair_command(self):
+        """The hook must not flatten a runnable fix back into plain didim setup."""
+        other_profile = self.home / ".claude-main"
+        other_profile.mkdir()
+        owner = other_profile / "CLAUDE.md"
+        owner.write_bytes((self.config / "CLAUDE.md").read_bytes())
+        linked_config = self.home / ".claude-work"
+        linked_config.mkdir()
+        (linked_config / "CLAUDE.md").symlink_to(owner)
+
+        source = io.StringIO("{}")
+        output = io.StringIO()
+        with mock.patch(
+            "didimlog.claude.hook.inspect",
+            side_effect=lambda **_: inspect(
+                home=self.home,
+                cwd=self.project,
+                config=linked_config,
+            ),
+        ):
+            self.assertEqual(session_start(source, output), 0)
+
+        message = json.loads(output.getvalue())["systemMessage"]
+        self.assertIn("수정: CLAUDE_CONFIG_DIR=~/.claude-main didim setup", message)
+        self.assertNotIn(str(self.home), message)
+
     def test_unexpected_probe_exception_is_fail_open(self):
         source = io.StringIO("not-json-but-consumed")
         output = io.StringIO()

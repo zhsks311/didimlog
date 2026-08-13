@@ -13,6 +13,40 @@ _MANAGED_TARGET = re.compile(r"didimlog/[^/\\]+\.md\Z")
 _TOP_LEVEL_TARGETS = frozenset({"CLAUDE.md", "settings.json"})
 
 
+class ConfigPathError(ValueError):
+    """A refused Claude target, carrying why it was refused.
+
+    ``reason`` stays a stable machine token so callers can explain the
+    refusal. ``destination`` is the resolved link target only when it stays
+    inside the user home; it is never placed in the message text.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        name: str | None = None,
+        destination: Path | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.name = name
+        self.destination = destination
+
+
+def _link_destination_inside_home(target: Path, home: Path) -> Path | None:
+    """Resolve a link target and keep it only when it stays inside the home."""
+
+    try:
+        resolved = target.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if resolved != home and not resolved.is_relative_to(home):
+        return None
+    return resolved
+
+
 def _home_directories(
     home: str | os.PathLike[str] | None,
 ) -> tuple[Path, Path]:
@@ -117,7 +151,10 @@ def config_target(
     if not isinstance(name, str) or (
         name not in _TOP_LEVEL_TARGETS and _MANAGED_TARGET.fullmatch(name) is None
     ):
-        raise ValueError("Claude config target is not managed by Didimlog")
+        raise ConfigPathError(
+            "Claude config target is not managed by Didimlog",
+            reason="unmanaged-target",
+        )
 
     target = config / name
     if name.startswith("didimlog/"):
@@ -127,17 +164,46 @@ def config_target(
         except FileNotFoundError:
             pass
         except OSError as exc:
-            raise ValueError("Claude config target parent is unsafe") from exc
+            raise ConfigPathError(
+                "Claude config target parent is unsafe",
+                reason="parent-unreadable",
+                name=name,
+            ) from exc
         else:
             if stat.S_ISLNK(parent_entry.st_mode) or not stat.S_ISDIR(parent_entry.st_mode):
-                raise ValueError("Claude config target parent must be a regular directory")
+                raise ConfigPathError(
+                    "Claude config target parent must be a regular directory",
+                    reason="parent-not-regular",
+                    name=name,
+                    destination=_link_destination_inside_home(
+                        managed_directory,
+                        resolved_home,
+                    )
+                    if stat.S_ISLNK(parent_entry.st_mode)
+                    else None,
+                )
 
     try:
         target_entry = target.lstat()
     except FileNotFoundError:
         return target
     except OSError as exc:
-        raise ValueError("Claude config target is unsafe") from exc
-    if stat.S_ISLNK(target_entry.st_mode) or not stat.S_ISREG(target_entry.st_mode):
-        raise ValueError("Claude config target must be a regular file")
+        raise ConfigPathError(
+            "Claude config target is unsafe",
+            reason="target-unreadable",
+            name=name,
+        ) from exc
+    if stat.S_ISLNK(target_entry.st_mode):
+        raise ConfigPathError(
+            "Claude config target must be a regular file",
+            reason="target-symlink",
+            name=name,
+            destination=_link_destination_inside_home(target, resolved_home),
+        )
+    if not stat.S_ISREG(target_entry.st_mode):
+        raise ConfigPathError(
+            "Claude config target must be a regular file",
+            reason="target-not-regular",
+            name=name,
+        )
     return target

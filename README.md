@@ -149,7 +149,15 @@ didim status
 didim doctor
 ```
 
-`status`는 버전, 개인 index, 현재 프로젝트, Claude 연결을 한 화면에 요약합니다. `doctor`는 문제가 미치는 영향과 다음 실행 명령을 함께 보여 줍니다.
+`status`는 버전, 개인 index, 현재 프로젝트, 사용 중인 Claude 프로필, Claude 연결을 한 화면에 요약합니다. `doctor`는 먼저 고쳐야 하는 원인, 그 원인을 고치면 함께 해결되는 증상, 별도로 확인할 문제를 순서대로 보여 줍니다. 각 독립 문제에는 영향과 다음 실행 명령이 함께 표시됩니다.
+
+아직 Didimlog를 설정하지 않은 Git 프로젝트에서 `doctor`를 실행하면 실패로 처리하지 않고 `PROJECT_NOT_CONFIGURED` 안내와 `didim setup` 명령을 보여 줍니다. 현재 프로젝트에 근거를 저장할 필요가 없다면 아무 작업도 하지 않아도 됩니다.
+
+Claude 프로필을 여러 개 쓰면 `CLAUDE_CONFIG_DIR`이 가리키는 프로필에 연결됩니다. 어떤 파일이 다른 프로필을 가리키는 링크라서 Didimlog가 고칠 수 없을 때는, 실제로 그 파일을 가진 프로필에 연결하도록 `doctor`가 명령을 그대로 알려 줍니다.
+
+```sh
+CLAUDE_CONFIG_DIR=~/.claude didim setup
+```
 
 오류 첫 줄의 영문 token과 exit code는 자동화 계약입니다. 실제 TTY에서는 다음 줄에 한국어 `도움말:`이 표시됩니다. non-TTY 로그에서도 설명이 필요하면 전역 옵션을 사용합니다.
 

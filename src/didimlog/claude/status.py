@@ -16,6 +16,7 @@ from didimlog.indexing import (
 from didimlog.project.git_exclude import discover_project_for_setup
 from didimlog.personal.paths import data_home
 
+from .paths import config_dir
 from .probe import Problem, inspect
 
 
@@ -40,6 +41,22 @@ def _safe_label(value: str) -> str:
         "?" if unicodedata.category(character).startswith("C") else character
         for character in value
     )
+
+
+def _profile_label(home: Path, config) -> str:
+    """Name the selected Claude profile without exposing the home path."""
+
+    try:
+        selected = config_dir(config, home=home)
+    except (OSError, ValueError):
+        return "확인 실패"
+    try:
+        relative = selected.relative_to(home.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return "확인 실패"
+    if len(relative.parts) != 1:
+        return "확인 실패"
+    return _safe_label(relative.parts[0])
 
 
 def _project_discovery_problem(error: DidimError) -> Problem | None:
@@ -82,6 +99,7 @@ def _diagnostic_problems(
                 token="CLAUDE_CONFIG_INVALID",
                 impact="Claude 설정을 안전하게 읽을 수 없어 연결 상태를 확인하지 못합니다.",
                 action="didim setup",
+                blocks_repair=True,
             ),
         )
 
@@ -126,7 +144,37 @@ def status_text(*, home=None, cwd=None, config=None) -> str:
             "개인 지식: {}".format(personal_label),
             "현재 프로젝트: {}".format(project_name),
             "프로젝트 근거: {}".format(project_label),
+            "Claude 프로필: {}".format(_profile_label(selected_home, config)),
             "Claude 연결: {}".format(claude_label),
+            "",
+        )
+    )
+
+
+def _problem_lines(problem: Problem) -> tuple[str, ...]:
+    return (
+        "무엇: {}".format(problem.token),
+        "영향: {}".format(problem.impact),
+        "수정: {}".format(problem.action),
+        "",
+    )
+
+
+def _healthy_doctor_text(project_root: Path | None) -> str:
+    """Report a healthy run, and name a Git project that stores no evidence yet.
+
+    An unprepared project is a choice, not a fault, so the exit stays ``0``.
+    """
+
+    if project_root is None or _prepared_project(project_root):
+        return "DOCTOR_OK\n문제 없음\n"
+    return "\n".join(
+        (
+            "DOCTOR_OK",
+            "문제 없음",
+            "안내: PROJECT_NOT_CONFIGURED",
+            "이 Git 프로젝트는 아직 근거를 저장하지 않습니다.",
+            "여기에도 근거를 남기려면: didim setup",
             "",
         )
     )
@@ -148,16 +196,44 @@ def doctor_text(*, home=None, cwd=None, config=None) -> tuple[int, str]:
     if project_problem is not None:
         problems.append(project_problem)
     if not problems:
-        return 0, "DOCTOR_OK\n문제 없음\n"
+        return 0, _healthy_doctor_text(project_root)
 
-    lines = ["DOCTOR_PROBLEMS"]
-    for problem in problems:
-        lines.extend(
-            (
-                "무엇: {}".format(problem.token),
-                "영향: {}".format(problem.impact),
-                "수정: {}".format(problem.action),
-                "",
+    blocking = [problem for problem in problems if problem.blocks_repair]
+    if not blocking:
+        lines = ["DOCTOR_PROBLEMS"]
+        for problem in problems:
+            lines.extend(_problem_lines(problem))
+        return EXIT_POLICY, "\n".join(lines)
+
+    blocking_tokens = {problem.token for problem in blocking}
+    symptoms_by_cause = {
+        problem.token: [
+            candidate
+            for candidate in problems
+            if candidate.caused_by == problem.token
+        ]
+        for problem in blocking
+    }
+    independent = [
+        problem
+        for problem in problems
+        if problem.token not in blocking_tokens
+        and problem.caused_by not in blocking_tokens
+    ]
+
+    lines = ["DOCTOR_PROBLEMS", "먼저 할 일"]
+    for problem in blocking:
+        lines.extend(_problem_lines(problem))
+        symptoms = symptoms_by_cause[problem.token]
+        if symptoms:
+            lines.append("위를 고치면 함께 해결되는 증상")
+            lines.extend(
+                "- {}: {}".format(symptom.token, symptom.impact)
+                for symptom in symptoms
             )
-        )
+            lines.append("")
+    if independent:
+        lines.append("별도로 확인할 문제")
+        for problem in independent:
+            lines.extend(_problem_lines(problem))
     return EXIT_POLICY, "\n".join(lines)
