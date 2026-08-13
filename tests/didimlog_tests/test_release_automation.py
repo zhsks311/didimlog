@@ -222,6 +222,39 @@ class ReleaseAutomationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
+    def pr_policy(
+        self,
+        command,
+        repository,
+        base_sha,
+        head_sha,
+        *,
+        labels=(),
+        pr_number=42,
+        base_ref="main",
+        head_ref="develop",
+    ):
+        arguments = [
+            command,
+            "--repo",
+            str(repository),
+            "--base-sha",
+            base_sha,
+            "--head-sha",
+            head_sha,
+            "--pr-number",
+            str(pr_number),
+            "--base-ref",
+            base_ref,
+            "--head-ref",
+            head_ref,
+        ]
+        for label in labels:
+            arguments.extend(("--label", label))
+        result = self.run_script(*arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
     def test_inspect_pr_tracks_prepare_cancel_and_reprepare(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             repository = Path(temporary_directory) / "repository"
@@ -684,6 +717,460 @@ class ReleaseAutomationTests(unittest.TestCase):
                                 f"{preparation_parent}:{path}",
                             ),
                         )
+
+    def test_check_pr_treats_missing_label_as_none(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            base_sha = self.initialize_git_repository(repository)
+            head_sha = self.commit(
+                repository,
+                "test: ordinary PR change",
+                files={"fixture.txt": "ordinary change\n"},
+            )
+
+            missing = self.pr_policy(
+                "check-pr",
+                repository,
+                base_sha,
+                head_sha,
+            )
+            explicit_none = self.pr_policy(
+                "check-pr",
+                repository,
+                base_sha,
+                head_sha,
+                labels=("release:none",),
+            )
+
+            self.assertEqual(missing["selection"], "none")
+            self.assertEqual(missing["verdict"], "PASS")
+            self.assertEqual(missing["reason"], "none_valid")
+            self.assertFalse(missing["desired_ready"])
+            self.assertEqual(
+                (
+                    missing["verdict"],
+                    missing["reason"],
+                    missing["action_message"],
+                ),
+                (
+                    explicit_none["verdict"],
+                    explicit_none["reason"],
+                    explicit_none["action_message"],
+                ),
+            )
+
+    def test_check_pr_rejects_none_with_manual_version_change(self):
+        cases = (
+            (
+                "version",
+                self.release_files("0.0.3", prepared=False),
+                "none_version_changed",
+            ),
+            (
+                "lock-version",
+                {
+                    "uv.lock": self.release_files(
+                        "0.0.3",
+                        prepared=False,
+                    )["uv.lock"],
+                },
+                "none_version_mismatch",
+            ),
+            (
+                "public-changelog",
+                {
+                    "CHANGELOG.md": self.release_files(
+                        "0.0.3",
+                        prepared=True,
+                    )["CHANGELOG.md"],
+                },
+                "none_public_changelog_added",
+            ),
+        )
+        for case, files, reason in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary_directory:
+                repository = Path(temporary_directory) / "repository"
+                base_sha = self.initialize_git_repository(repository)
+                head_sha = self.commit(
+                    repository,
+                    f"test: manual {case} change",
+                    files=files,
+                )
+
+                result = self.pr_policy(
+                    "check-pr",
+                    repository,
+                    base_sha,
+                    head_sha,
+                    labels=("release:none",),
+                )
+
+                self.assertEqual(result["verdict"], "FAIL")
+                self.assertEqual(result["reason"], reason)
+                self.assertFalse(result["desired_ready"])
+
+    def test_check_pr_rejects_conflicting_labels_and_invalid_branch_bumps(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            base_sha = self.initialize_git_repository(repository)
+            for labels in (
+                ("release:none", "release:patch"),
+                ("release:patch", "release:minor"),
+            ):
+                with self.subTest(labels=labels):
+                    result = self.pr_policy(
+                        "check-pr",
+                        repository,
+                        base_sha,
+                        base_sha,
+                        labels=labels,
+                    )
+                    self.assertIsNone(result["selection"])
+                    self.assertEqual(result["verdict"], "FAIL")
+                    self.assertEqual(result["reason"], "selection_conflict")
+                    plan = self.pr_policy(
+                        "plan-reconcile",
+                        repository,
+                        base_sha,
+                        base_sha,
+                        labels=labels,
+                    )
+                    self.assertEqual(plan["action"], "ERROR")
+                    self.assertEqual(plan["reason"], "selection_conflict")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            base_sha = self.initialize_git_repository(repository)
+            head_sha = self.preparation_commit(
+                repository,
+                base_sha,
+                release_kind="hotfix",
+            )
+
+            check = self.pr_policy(
+                "check-pr",
+                repository,
+                base_sha,
+                head_sha,
+                labels=("release:patch",),
+                base_ref="develop",
+                head_ref="hotfix/urgent",
+            )
+            plan = self.pr_policy(
+                "plan-reconcile",
+                repository,
+                base_sha,
+                head_sha,
+                labels=("release:patch",),
+                base_ref="develop",
+                head_ref="hotfix/urgent",
+            )
+
+            self.assertEqual(check["verdict"], "FAIL")
+            self.assertEqual(check["reason"], "base_ref_invalid")
+            self.assertEqual(plan["action"], "ERROR")
+            self.assertEqual(plan["reason"], "base_ref_invalid")
+
+        allowed = (
+            ("develop", "patch", "0.0.3", "develop"),
+            ("develop", "minor", "0.1.0", "develop"),
+            ("develop", "major", "1.0.0", "develop"),
+            ("hotfix/urgent", "patch", "0.0.3", "hotfix"),
+        )
+        for head_ref, bump, version, release_kind in allowed:
+            with self.subTest(head_ref=head_ref, bump=bump), tempfile.TemporaryDirectory() as temporary_directory:
+                repository = Path(temporary_directory) / "repository"
+                base_sha = self.initialize_git_repository(repository)
+                head_sha = self.preparation_commit(
+                    repository,
+                    base_sha,
+                    version=version,
+                    bump=bump,
+                    release_kind=release_kind,
+                )
+
+                result = self.pr_policy(
+                    "check-pr",
+                    repository,
+                    base_sha,
+                    head_sha,
+                    labels=(f"release:{bump}",),
+                    head_ref=head_ref,
+                )
+
+                self.assertEqual(result["verdict"], "PASS")
+                self.assertEqual(result["reason"], "preparation_valid")
+
+        for head_ref, bump in (
+            ("hotfix/urgent", "minor"),
+            ("hotfix/urgent", "major"),
+            ("feature/not-releasable", "patch"),
+        ):
+            with self.subTest(head_ref=head_ref, bump=bump), tempfile.TemporaryDirectory() as temporary_directory:
+                repository = Path(temporary_directory) / "repository"
+                base_sha = self.initialize_git_repository(repository)
+
+                result = self.pr_policy(
+                    "check-pr",
+                    repository,
+                    base_sha,
+                    base_sha,
+                    labels=(f"release:{bump}",),
+                    head_ref=head_ref,
+                )
+
+                self.assertEqual(result["verdict"], "FAIL")
+                self.assertEqual(result["reason"], "branch_selection_invalid")
+
+    def test_check_pr_requires_current_main_and_current_head_preparation(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            main_sha = self.initialize_git_repository(repository)
+            current_head = self.preparation_commit(repository, main_sha)
+
+            result = self.pr_policy(
+                "check-pr",
+                repository,
+                main_sha,
+                current_head,
+                labels=("release:patch",),
+            )
+
+            self.assertEqual(result["verdict"], "PASS")
+            self.assertEqual(result["reason"], "preparation_valid")
+            self.assertTrue(result["desired_ready"])
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            old_main = self.initialize_git_repository(repository)
+            current_main = self.commit(
+                repository,
+                "test: main advances",
+                files={"fixture.txt": "current main\n"},
+            )
+            stale_base_marker = self.preparation_commit(
+                repository,
+                old_main,
+            )
+
+            result = self.pr_policy(
+                "check-pr",
+                repository,
+                current_main,
+                stale_base_marker,
+                labels=("release:patch",),
+            )
+
+            self.assertEqual(result["verdict"], "FAIL")
+            self.assertEqual(result["reason"], "preparation_base_not_current")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            old_main = self.initialize_git_repository(repository)
+            self.create_branch(repository, "develop", old_main)
+            self.checkout(repository, "develop")
+            preparation = self.preparation_commit(repository, old_main)
+            self.checkout(repository, "main")
+            current_main = self.commit(
+                repository,
+                "test: newer main",
+                files={"fixture.txt": "newer main\n"},
+            )
+
+            result = self.pr_policy(
+                "check-pr",
+                repository,
+                current_main,
+                preparation,
+                labels=("release:patch",),
+            )
+
+            self.assertEqual(result["verdict"], "FAIL")
+            self.assertEqual(result["reason"], "head_missing_current_main")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            main_sha = self.initialize_git_repository(repository)
+            self.preparation_commit(repository, main_sha)
+            post_preparation_head = self.commit(
+                repository,
+                "test: commit after preparation",
+                files={"fixture.txt": "later change\n"},
+            )
+
+            result = self.pr_policy(
+                "check-pr",
+                repository,
+                main_sha,
+                post_preparation_head,
+                labels=("release:patch",),
+            )
+
+            self.assertEqual(result["verdict"], "FAIL")
+            self.assertEqual(result["reason"], "preparation_not_current_head")
+
+    def test_plan_reconcile_cancels_and_reprepares_stale_current_head(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            main_sha = self.initialize_git_repository(repository)
+            preparation = self.preparation_commit(repository, main_sha)
+            head_sha = self.commit(
+                repository,
+                "test: user commit after preparation",
+                files={"fixture.txt": "current user change\n"},
+            )
+
+            plan = self.pr_policy(
+                "plan-reconcile",
+                repository,
+                main_sha,
+                head_sha,
+                labels=("release:patch",),
+            )
+
+            self.assertEqual(plan["action"], "CANCEL_AND_PREPARE")
+            self.assertEqual(plan["reason"], "stale_preparation")
+            self.assertEqual(plan["cancel_preparation"], preparation)
+            self.assertEqual(plan["prepare_selection"], "patch")
+            self.assertTrue(plan["desired_ready"])
+
+            changed_selection = self.pr_policy(
+                "plan-reconcile",
+                repository,
+                main_sha,
+                preparation,
+                labels=("release:minor",),
+            )
+            self.assertEqual(
+                changed_selection["action"],
+                "CANCEL_AND_PREPARE",
+            )
+            self.assertEqual(changed_selection["reason"], "selection_changed")
+            self.assertEqual(
+                changed_selection["cancel_preparation"],
+                preparation,
+            )
+            self.assertEqual(
+                changed_selection["prepare_selection"],
+                "minor",
+            )
+
+    def test_plan_reconcile_waits_when_head_lacks_current_main(self):
+        for state in ("none", "stale"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as temporary_directory:
+                repository = Path(temporary_directory) / "repository"
+                old_main = self.initialize_git_repository(repository)
+                self.create_branch(repository, "develop", old_main)
+                self.checkout(repository, "develop")
+                preparation = None
+                if state == "stale":
+                    preparation = self.preparation_commit(repository, old_main)
+                head_sha = self.commit(
+                    repository,
+                    "test: develop change",
+                    files={"fixture.txt": f"{state} develop\n"},
+                )
+                self.checkout(repository, "main")
+                current_main = self.commit(
+                    repository,
+                    "test: main advances independently",
+                    files={"fixture.txt": "current main\n"},
+                )
+
+                plan = self.pr_policy(
+                    "plan-reconcile",
+                    repository,
+                    current_main,
+                    head_sha,
+                    labels=("release:patch",),
+                )
+
+                self.assertEqual(plan["action"], "WAIT_FOR_MAIN")
+                self.assertEqual(plan["reason"], "head_missing_current_main")
+                self.assertEqual(plan["cancel_preparation"], preparation)
+                self.assertIsNone(plan["prepare_selection"])
+                self.assertFalse(plan["desired_ready"])
+
+    def test_plan_reconcile_repairs_ready_projection_without_new_commit(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            main_sha = self.initialize_git_repository(repository)
+            head_sha = self.preparation_commit(repository, main_sha)
+
+            without_ready = self.pr_policy(
+                "plan-reconcile",
+                repository,
+                main_sha,
+                head_sha,
+                labels=("release:patch",),
+            )
+            with_ready = self.pr_policy(
+                "plan-reconcile",
+                repository,
+                main_sha,
+                head_sha,
+                labels=("release:patch", "release:ready"),
+            )
+
+            self.assertEqual(without_ready["action"], "NOOP")
+            self.assertEqual(without_ready["reason"], "preparation_current")
+            self.assertTrue(without_ready["desired_ready"])
+            self.assertIsNone(without_ready["cancel_preparation"])
+            self.assertIsNone(without_ready["prepare_selection"])
+            self.assertEqual(with_ready, without_ready)
+
+            check_without_ready = self.pr_policy(
+                "check-pr",
+                repository,
+                main_sha,
+                head_sha,
+                labels=("release:patch",),
+            )
+            check_with_ready = self.pr_policy(
+                "check-pr",
+                repository,
+                main_sha,
+                head_sha,
+                labels=("release:patch", "release:ready"),
+            )
+            self.assertEqual(check_with_ready, check_without_ready)
+
+            cancel = self.pr_policy(
+                "plan-reconcile",
+                repository,
+                main_sha,
+                head_sha,
+                labels=("release:none", "release:ready"),
+            )
+            self.assertEqual(cancel["action"], "CANCEL")
+            self.assertEqual(cancel["reason"], "cancel_preparation")
+            self.assertEqual(cancel["cancel_preparation"], head_sha)
+            self.assertFalse(cancel["desired_ready"])
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            main_sha = self.initialize_git_repository(repository)
+            none = self.pr_policy(
+                "plan-reconcile",
+                repository,
+                main_sha,
+                main_sha,
+            )
+            prepare = self.pr_policy(
+                "plan-reconcile",
+                repository,
+                main_sha,
+                main_sha,
+                labels=("release:minor",),
+            )
+
+            self.assertEqual(none["action"], "NOOP")
+            self.assertEqual(none["reason"], "already_none")
+            self.assertFalse(none["desired_ready"])
+            self.assertEqual(prepare["action"], "PREPARE")
+            self.assertEqual(prepare["reason"], "prepare_selection")
+            self.assertEqual(prepare["prepare_selection"], "minor")
+            self.assertTrue(prepare["desired_ready"])
 
     def test_prepare_changelog_promotes_unreleased_and_updates_links(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

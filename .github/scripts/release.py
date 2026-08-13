@@ -29,6 +29,64 @@ _PREPARATION_FIELDS = (
 )
 _SHA_PATTERN = re.compile(r"[0-9a-fA-F]{40,64}")
 _RELEASE_PATHS = ("pyproject.toml", "uv.lock", "CHANGELOG.md")
+_ACTION_MESSAGES = {
+    "selection_conflict": (
+        "Choose at most one of release:patch, release:minor, or "
+        "release:major, and do not combine release:none with a bump."
+    ),
+    "base_ref_invalid": "Target main for release reconciliation.",
+    "branch_selection_invalid": (
+        "Use patch, minor, or major on develop, and patch only on hotfix/*."
+    ),
+    "head_missing_current_main": "Merge the latest main into the PR branch.",
+    "invalid_release_evidence": (
+        "Repair the release preparation history, then rerun reconciliation."
+    ),
+    "preparation_missing": (
+        "Rerun release reconciliation to prepare the selected bump."
+    ),
+    "unexpected_preparation": (
+        "Rerun release reconciliation to cancel the release preparation."
+    ),
+    "none_version_invalid": (
+        "Restore valid matching project and lock versions."
+    ),
+    "none_version_mismatch": (
+        "Make the project and lock versions identical before merging."
+    ),
+    "none_version_changed": (
+        "Revert manual version changes or choose a release bump label."
+    ),
+    "none_changelog_invalid": "Restore a readable changelog before merging.",
+    "none_public_changelog_added": (
+        "Revert the public changelog section or choose a release bump label."
+    ),
+    "none_valid": "No release preparation is required.",
+    "preparation_base_not_current": (
+        "Rerun release reconciliation against the latest main."
+    ),
+    "preparation_selection_mismatch": (
+        "Rerun release reconciliation for the selected bump."
+    ),
+    "preparation_not_current_head": (
+        "Rerun release reconciliation for the current PR head."
+    ),
+    "preparation_valid": (
+        "The release preparation matches the current PR head and main."
+    ),
+    "already_none": "No release commit change is required.",
+    "cancel_preparation": "Cancel the active release preparation.",
+    "prepare_selection": "Prepare the selected release bump.",
+    "preparation_current": (
+        "Keep the current release preparation and restore release:ready."
+    ),
+    "selection_changed": (
+        "Cancel the active preparation and prepare the newly selected bump."
+    ),
+    "stale_preparation": (
+        "Cancel the stale preparation and prepare the current PR head."
+    ),
+}
 
 
 class ReleaseError(ValueError):
@@ -552,6 +610,455 @@ def _inspect_pr(
     )
 
 
+def _normalize_selection(labels: list[str]) -> str | None:
+    selections = {
+        label.removeprefix("release:")
+        for label in labels
+        if label in {
+            "release:none",
+            "release:patch",
+            "release:minor",
+            "release:major",
+        }
+    }
+    bumps = selections & {"patch", "minor", "major"}
+    if len(bumps) > 1 or ("none" in selections and bumps):
+        return None
+    if bumps:
+        return next(iter(bumps))
+    return "none"
+
+
+def _branch_allows_selection(head_ref: str, selection: str) -> bool:
+    if selection == "none":
+        return True
+    if head_ref == "develop":
+        return True
+    return (
+        head_ref.startswith("hotfix/")
+        and head_ref != "hotfix/"
+        and selection == "patch"
+    )
+
+
+def _is_ancestor(repo: Path, ancestor_sha: str, descendant_sha: str) -> bool:
+    try:
+        _git(
+            repo,
+            "merge-base",
+            "--is-ancestor",
+            ancestor_sha,
+            descendant_sha,
+        )
+    except ReleaseError:
+        return False
+    return True
+
+
+def _active_preparation(
+    repo: Path,
+    evidence: ReleaseEvidence,
+) -> PreparationMarker | None:
+    if evidence.active_preparation is None:
+        return None
+    message = _git(
+        repo,
+        "show",
+        "-s",
+        "--format=%B",
+        evidence.active_preparation,
+    )
+    preparation = _parse_preparation_message(
+        message,
+        evidence.active_preparation,
+    )
+    if preparation is None:
+        raise ReleaseError("active_preparation_marker_missing")
+    return preparation
+
+
+def _new_public_changelog_section(
+    base_changelog: str,
+    head_changelog: str,
+) -> bool:
+    base_headings = _VERSION_HEADING_PATTERN.findall(base_changelog)
+    head_headings = _VERSION_HEADING_PATTERN.findall(head_changelog)
+    return any(
+        head_headings.count(heading) > base_headings.count(heading)
+        for heading in set(head_headings)
+    )
+
+
+def _none_state_reason(
+    repo: Path,
+    base_sha: str,
+    head_sha: str,
+) -> str | None:
+    try:
+        base_project = _project_version_text(
+            _revision_file(repo, base_sha, "pyproject.toml")
+        )
+        base_lock = _locked_project_version_text(
+            _revision_file(repo, base_sha, "uv.lock")
+        )
+        head_project = _project_version_text(
+            _revision_file(repo, head_sha, "pyproject.toml")
+        )
+        head_lock = _locked_project_version_text(
+            _revision_file(repo, head_sha, "uv.lock")
+        )
+    except (ReleaseError, tomllib.TOMLDecodeError):
+        return "none_version_invalid"
+    if base_project != base_lock or head_project != head_lock:
+        return "none_version_mismatch"
+    if head_project != base_project or head_lock != base_lock:
+        return "none_version_changed"
+
+    try:
+        base_changelog = _revision_file(
+            repo,
+            base_sha,
+            "CHANGELOG.md",
+        )
+        head_changelog = _revision_file(
+            repo,
+            head_sha,
+            "CHANGELOG.md",
+        )
+    except ReleaseError:
+        return "none_changelog_invalid"
+    if _new_public_changelog_section(base_changelog, head_changelog):
+        return "none_public_changelog_added"
+    return None
+
+
+def _policy_result(
+    *,
+    verdict: str | None,
+    action: str | None,
+    selection: str | None,
+    reason: str,
+    message_reason: str | None = None,
+    desired_ready: bool,
+    evidence: ReleaseEvidence | None,
+    cancel_preparation: str | None = None,
+    prepare_selection: str | None = None,
+) -> dict[str, object]:
+    return {
+        "verdict": verdict,
+        "action": action,
+        "selection": selection,
+        "reason": reason,
+        "action_message": _ACTION_MESSAGES[
+            message_reason if message_reason is not None else reason
+        ],
+        "desired_ready": desired_ready,
+        "cancel_preparation": cancel_preparation,
+        "prepare_selection": prepare_selection,
+        "evidence": asdict(evidence) if evidence is not None else None,
+    }
+
+
+def _check_pr(
+    repo: Path,
+    base_sha: str,
+    head_sha: str,
+    pr_number: int,
+    base_ref: str,
+    head_ref: str,
+    labels: list[str],
+) -> dict[str, object]:
+    selection = _normalize_selection(labels)
+    if selection is None:
+        return _policy_result(
+            verdict="FAIL",
+            action=None,
+            selection=None,
+            reason="selection_conflict",
+            desired_ready=False,
+            evidence=None,
+        )
+    if base_ref != "main":
+        return _policy_result(
+            verdict="FAIL",
+            action=None,
+            selection=selection,
+            reason="base_ref_invalid",
+            desired_ready=False,
+            evidence=None,
+        )
+    if not _branch_allows_selection(head_ref, selection):
+        return _policy_result(
+            verdict="FAIL",
+            action=None,
+            selection=selection,
+            reason="branch_selection_invalid",
+            desired_ready=False,
+            evidence=None,
+        )
+
+    evidence = _inspect_pr(
+        repo,
+        base_sha,
+        head_sha,
+        pr_number,
+        base_ref,
+        head_ref,
+        selection,
+    )
+    if evidence.state == "invalid":
+        return _policy_result(
+            verdict="FAIL",
+            action=None,
+            selection=selection,
+            reason=evidence.reason,
+            message_reason="invalid_release_evidence",
+            desired_ready=False,
+            evidence=evidence,
+        )
+    if not _is_ancestor(repo, base_sha, head_sha):
+        return _policy_result(
+            verdict="FAIL",
+            action=None,
+            selection=selection,
+            reason="head_missing_current_main",
+            desired_ready=False,
+            evidence=evidence,
+        )
+
+    if selection == "none":
+        if evidence.state != "none":
+            return _policy_result(
+                verdict="FAIL",
+                action=None,
+                selection=selection,
+                reason="unexpected_preparation",
+                desired_ready=False,
+                evidence=evidence,
+            )
+        reason = _none_state_reason(repo, base_sha, head_sha)
+        if reason is not None:
+            return _policy_result(
+                verdict="FAIL",
+                action=None,
+                selection=selection,
+                reason=reason,
+                desired_ready=False,
+                evidence=evidence,
+            )
+        return _policy_result(
+            verdict="PASS",
+            action=None,
+            selection=selection,
+            reason="none_valid",
+            desired_ready=False,
+            evidence=evidence,
+        )
+
+    if evidence.state == "none":
+        return _policy_result(
+            verdict="FAIL",
+            action=None,
+            selection=selection,
+            reason="preparation_missing",
+            desired_ready=False,
+            evidence=evidence,
+        )
+    if evidence.state == "stale":
+        return _policy_result(
+            verdict="FAIL",
+            action=None,
+            selection=selection,
+            reason="preparation_not_current_head",
+            desired_ready=False,
+            evidence=evidence,
+        )
+
+    preparation = _active_preparation(repo, evidence)
+    if preparation is None:
+        raise ReleaseError("active_preparation_marker_missing")
+    if preparation.base_sha != base_sha.lower():
+        return _policy_result(
+            verdict="FAIL",
+            action=None,
+            selection=selection,
+            reason="preparation_base_not_current",
+            desired_ready=False,
+            evidence=evidence,
+        )
+    if preparation.bump != selection:
+        return _policy_result(
+            verdict="FAIL",
+            action=None,
+            selection=selection,
+            reason="preparation_selection_mismatch",
+            desired_ready=False,
+            evidence=evidence,
+        )
+    return _policy_result(
+        verdict="PASS",
+        action=None,
+        selection=selection,
+        reason="preparation_valid",
+        desired_ready=True,
+        evidence=evidence,
+    )
+
+
+def _plan_reconcile(
+    repo: Path,
+    base_sha: str,
+    head_sha: str,
+    pr_number: int,
+    base_ref: str,
+    head_ref: str,
+    labels: list[str],
+) -> dict[str, object]:
+    selection = _normalize_selection(labels)
+    if selection is None:
+        return _policy_result(
+            verdict=None,
+            action="ERROR",
+            selection=None,
+            reason="selection_conflict",
+            desired_ready=False,
+            evidence=None,
+        )
+    if base_ref != "main":
+        return _policy_result(
+            verdict=None,
+            action="ERROR",
+            selection=selection,
+            reason="base_ref_invalid",
+            desired_ready=False,
+            evidence=None,
+        )
+    if not _branch_allows_selection(head_ref, selection):
+        return _policy_result(
+            verdict=None,
+            action="ERROR",
+            selection=selection,
+            reason="branch_selection_invalid",
+            desired_ready=False,
+            evidence=None,
+        )
+
+    evidence = _inspect_pr(
+        repo,
+        base_sha,
+        head_sha,
+        pr_number,
+        base_ref,
+        head_ref,
+        selection,
+    )
+    if evidence.state == "invalid":
+        return _policy_result(
+            verdict=None,
+            action="ERROR",
+            selection=selection,
+            reason=evidence.reason,
+            message_reason="invalid_release_evidence",
+            desired_ready=False,
+            evidence=evidence,
+        )
+
+    preparation = _active_preparation(repo, evidence)
+    contains_main = _is_ancestor(repo, base_sha, head_sha)
+    stale = evidence.state == "stale" or (
+        evidence.state == "prepared"
+        and (
+            preparation is None
+            or preparation.base_sha != base_sha.lower()
+            or not contains_main
+        )
+    )
+
+    if selection == "none":
+        if evidence.state in {"prepared", "stale"}:
+            return _policy_result(
+                verdict=None,
+                action="CANCEL",
+                selection=selection,
+                reason="cancel_preparation",
+                desired_ready=False,
+                evidence=evidence,
+                cancel_preparation=evidence.active_preparation,
+            )
+        if not contains_main:
+            return _policy_result(
+                verdict=None,
+                action="WAIT_FOR_MAIN",
+                selection=selection,
+                reason="head_missing_current_main",
+                desired_ready=False,
+                evidence=evidence,
+            )
+        return _policy_result(
+            verdict=None,
+            action="NOOP",
+            selection=selection,
+            reason="already_none",
+            desired_ready=False,
+            evidence=evidence,
+        )
+
+    if not contains_main:
+        return _policy_result(
+            verdict=None,
+            action="WAIT_FOR_MAIN",
+            selection=selection,
+            reason="head_missing_current_main",
+            desired_ready=False,
+            evidence=evidence,
+            cancel_preparation=(
+                evidence.active_preparation if stale else None
+            ),
+        )
+    if evidence.state == "none":
+        return _policy_result(
+            verdict=None,
+            action="PREPARE",
+            selection=selection,
+            reason="prepare_selection",
+            desired_ready=True,
+            evidence=evidence,
+            prepare_selection=selection,
+        )
+    if stale:
+        return _policy_result(
+            verdict=None,
+            action="CANCEL_AND_PREPARE",
+            selection=selection,
+            reason="stale_preparation",
+            desired_ready=True,
+            evidence=evidence,
+            cancel_preparation=evidence.active_preparation,
+            prepare_selection=selection,
+        )
+    if preparation is None:
+        raise ReleaseError("active_preparation_marker_missing")
+    if preparation.bump == selection:
+        return _policy_result(
+            verdict=None,
+            action="NOOP",
+            selection=selection,
+            reason="preparation_current",
+            desired_ready=True,
+            evidence=evidence,
+        )
+    return _policy_result(
+        verdict=None,
+        action="CANCEL_AND_PREPARE",
+        selection=selection,
+        reason="selection_changed",
+        desired_ready=True,
+        evidence=evidence,
+        cancel_preparation=evidence.active_preparation,
+        prepare_selection=selection,
+    )
+
+
 def _version(value: str) -> tuple[int, int, int]:
     if _VERSION_PATTERN.fullmatch(value) is None:
         raise ReleaseError(f"invalid release version: {value}")
@@ -693,6 +1200,16 @@ def _parser() -> argparse.ArgumentParser:
     inspect_pr.add_argument("--base-ref", required=True)
     inspect_pr.add_argument("--head-ref", required=True)
     inspect_pr.add_argument("--selection", required=True)
+
+    for command in ("check-pr", "plan-reconcile"):
+        policy = commands.add_parser(command)
+        policy.add_argument("--repo", type=Path, required=True)
+        policy.add_argument("--base-sha", required=True)
+        policy.add_argument("--head-sha", required=True)
+        policy.add_argument("--pr-number", type=int, required=True)
+        policy.add_argument("--base-ref", required=True)
+        policy.add_argument("--head-ref", required=True)
+        policy.add_argument("--label", action="append", default=[])
     return parser
 
 
@@ -710,7 +1227,7 @@ def main(argv: list[str] | None = None) -> int:
                     arguments.lock,
                 )
             )
-        else:
+        elif arguments.command == "inspect-pr":
             evidence = _inspect_pr(
                 arguments.repo,
                 arguments.base_sha,
@@ -721,6 +1238,28 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.selection,
             )
             print(json.dumps(asdict(evidence), sort_keys=True))
+        elif arguments.command == "check-pr":
+            result = _check_pr(
+                arguments.repo,
+                arguments.base_sha,
+                arguments.head_sha,
+                arguments.pr_number,
+                arguments.base_ref,
+                arguments.head_ref,
+                arguments.label,
+            )
+            print(json.dumps(result, sort_keys=True))
+        else:
+            result = _plan_reconcile(
+                arguments.repo,
+                arguments.base_sha,
+                arguments.head_sha,
+                arguments.pr_number,
+                arguments.base_ref,
+                arguments.head_ref,
+                arguments.label,
+            )
+            print(json.dumps(result, sort_keys=True))
     except (OSError, ReleaseError, tomllib.TOMLDecodeError) as error:
         print(f"release.py: {error}", file=sys.stderr)
         return 2
