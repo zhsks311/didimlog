@@ -2301,7 +2301,8 @@ class ReleaseAutomationTests(unittest.TestCase):
         self.assertEqual(triggers, {"push": {"branches": ["main"]}})
         self.assertEqual(workflow["permissions"], {"contents": "read"})
         self.assertEqual(
-            set(workflow["jobs"]), {"detect", "publish", "reconcile-open-prs"}
+            set(workflow["jobs"]),
+            {"detect", "publish", "sync-hotfix-to-develop", "reconcile-open-prs"},
         )
         self.assertEqual(
             fanout["permissions"],
@@ -2360,6 +2361,194 @@ class ReleaseAutomationTests(unittest.TestCase):
         self.assertEqual(reconcile.count(" -f "), 1)
         self.assertNotIn('--ref "${head_ref}"', reconcile)
         self.assertNotIn("|| true", reconcile)
+
+    def test_hotfix_sync_runs_only_for_published_hotfix_kind(self):
+        workflow = self.release_workflow()
+        sync = workflow["jobs"]["sync-hotfix-to-develop"]
+        checkout = sync["steps"][0]
+        condition = sync["if"]
+        normalized_condition = " ".join(condition.split())
+
+        self.assertEqual(sync["needs"], ["detect", "publish"])
+        self.assertIn("needs.publish.result == 'success'", condition)
+        self.assertIn("needs.detect.outputs.kind == 'hotfix'", condition)
+        self.assertNotIn("always()", condition)
+        self.assertEqual(
+            normalized_condition,
+            "${{ needs.publish.result == 'success' && "
+            "needs.detect.outputs.kind == 'hotfix' }}",
+        )
+        self.assertEqual(
+            sync["permissions"],
+            {"contents": "write", "pull-requests": "write"},
+        )
+        self.assertEqual(checkout["uses"], "actions/checkout@v4")
+        self.assertEqual(
+            checkout["with"], {"fetch-depth": 0, "persist-credentials": False}
+        )
+
+    def test_hotfix_sync_pushes_a_main_to_develop_merge_commit(self):
+        workflow = self.release_workflow()
+        run = self.release_step(
+            workflow, "sync-hotfix-to-develop", "Sync published hotfix to develop"
+        )["run"]
+
+        main_refspec = '"+refs/heads/main:refs/remotes/origin/main"'
+        develop_refspec = '"+refs/heads/develop:refs/remotes/origin/develop"'
+        push = "git push origin HEAD:refs/heads/develop"
+
+        self.assertEqual(run.count("git fetch --no-tags origin"), 3)
+        self.assertEqual(run.count(main_refspec), 2)
+        self.assertEqual(run.count(develop_refspec), 3)
+        initial_fetch = run.index("git fetch --no-tags origin")
+        pre_push_fetch = run.index(
+            "git fetch --no-tags origin", initial_fetch + 1
+        )
+        fallback_fetch = run.index(
+            "git fetch --no-tags origin", pre_push_fetch + 1
+        )
+        self.assertIn(
+            'git merge-base --is-ancestor "${GITHUB_SHA}" origin/main', run
+        )
+        self.assertIn(
+            "git merge-base --is-ancestor origin/main origin/develop", run
+        )
+        self.assertIn("git switch -C hotfix-sync origin/develop", run)
+        self.assertIn("if git merge --no-ff --no-edit origin/main; then", run)
+        self.assertIn("git merge --abort", run)
+        self.assertIn('git config core.hooksPath "/dev/null"', run)
+        self.assertIn('git config user.name "github-actions[bot]"', run)
+        self.assertIn(
+            'git config user.email '
+            '"41898282+github-actions[bot]@users.noreply.github.com"',
+            run,
+        )
+        self.assertEqual(run.count(push), 1)
+        self.assertIn(
+            "if git push origin HEAD:refs/heads/develop; then", run
+        )
+        self.assertIn(
+            'if test "${remote_develop_oid}" = "${develop_base_oid}"; then\n'
+            "    if git push origin HEAD:refs/heads/develop; then",
+            run,
+        )
+        self.assertNotIn("git push --force", run)
+        self.assertNotIn("git push -f", run)
+        develop_base = run.index(
+            'develop_base_oid="$(git rev-parse origin/develop)"'
+        )
+        merge = run.index("git merge --no-ff")
+        remote_develop = run.index(
+            'remote_develop_oid="$(git rev-parse origin/develop)"'
+        )
+        unchanged_guard = run.index(
+            'test "${remote_develop_oid}" = "${develop_base_oid}"'
+        )
+        direct_push = run.index(push)
+
+        self.assertLess(initial_fetch, develop_base)
+        self.assertLess(develop_base, merge)
+        self.assertLess(merge, pre_push_fetch)
+        self.assertLess(pre_push_fetch, remote_develop)
+        self.assertLess(remote_develop, unchanged_guard)
+        self.assertLess(unchanged_guard, direct_push)
+        self.assertLess(direct_push, fallback_fetch)
+        self.assertLess(
+            fallback_fetch,
+            run.index('main_oid="$(git rev-parse origin/main)"'),
+        )
+
+    def test_hotfix_sync_falls_back_to_one_exact_repository_pr(self):
+        workflow = self.release_workflow()
+        run = self.release_step(
+            workflow, "sync-hotfix-to-develop", "Sync published hotfix to develop"
+        )["run"]
+
+        self.assertIn(
+            'repository_id="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .id)"',
+            run,
+        )
+        self.assertIn(
+            "pulls?state=open&base=develop&"
+            "head=${GITHUB_REPOSITORY_OWNER}%3Amain&per_page=100",
+            run,
+        )
+        self.assertIn(".base.repo.id == $repo_id", run)
+        self.assertIn(".head.repo.id == $repo_id", run)
+        self.assertIn('.base.ref == "develop"', run)
+        self.assertIn('.head.ref == "main"', run)
+        self.assertIn(".head.sha == $main_oid", run)
+        self.assertLess(
+            run.index(
+                'git merge-base --is-ancestor "${GITHUB_SHA}" "${main_oid}"'
+            ),
+            run.index(
+                'repository_id="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .id)"'
+            ),
+        )
+        self.assertIn('case "${candidate_count}" in', run)
+        self.assertIn(
+            'gh api --method POST "repos/${GITHUB_REPOSITORY}/pulls"', run
+        )
+        self.assertIn('-f "base=develop"', run)
+        self.assertIn('-f "head=main"', run)
+        self.assertIn("gh api --method PATCH", run)
+        self.assertIn(
+            '"repos/${GITHUB_REPOSITORY}/pulls/${pr_number}"', run
+        )
+
+    def test_hotfix_sync_reuses_open_pr_after_a_second_hotfix(self):
+        workflow = self.release_workflow()
+        run = self.release_step(
+            workflow, "sync-hotfix-to-develop", "Sync published hotfix to develop"
+        )["run"]
+
+        query = (
+            "pulls?state=open&base=develop&"
+            "head=${GITHUB_REPOSITORY_OWNER}%3Amain&per_page=100"
+        )
+
+        self.assertEqual(run.count(query), 1)
+        self.assertNotIn("head=hotfix/", run)
+        self.assertNotIn("pulls?state=open&base=develop&head=${VERSION}", run)
+        self.assertIn('main_oid="$(git rev-parse origin/main)"', run)
+        self.assertIn(".head.sha == $main_oid", run)
+        self.assertIn('0)', run)
+        self.assertIn('1)', run)
+        self.assertIn(
+            'pr_number="$(jq -er \'.[][] | .number\' <<<"${pull_requests}")"',
+            run,
+        )
+        self.assertIn('-f "title=${title}"', run)
+        self.assertIn('-f "body=${body}"', run)
+        self.assertIn("${VERSION}", run)
+        self.assertIn("${GITHUB_SHA}", run)
+
+    def test_hotfix_sync_rejects_fork_wrong_ref_oid_and_multiple_candidates(self):
+        workflow = self.release_workflow()
+        run = self.release_step(
+            workflow, "sync-hotfix-to-develop", "Sync published hotfix to develop"
+        )["run"]
+
+        self.assertIn("all(.[][];", run)
+        for invariant in (
+            '.state == "open"',
+            ".base.repo.id == $repo_id",
+            ".head.repo.id == $repo_id",
+            '.base.ref == "develop"',
+            '.head.ref == "main"',
+            ".head.sha == $main_oid",
+        ):
+            self.assertIn(invariant, run)
+        self.assertIn(
+            'git merge-base --is-ancestor "${GITHUB_SHA}" "${main_oid}"', run
+        )
+        self.assertIn('echo "Refusing ambiguous hotfix sync PR candidates"', run)
+        self.assertRegex(
+            run,
+            r"\*\)\n\s+echo "
+            r'"Refusing ambiguous hotfix sync PR candidates" >&2\n\s+exit 1',
+        )
 
     def test_ci_can_be_redispatched_after_the_bot_updates_develop(self):
         workflow = yaml.safe_load(
