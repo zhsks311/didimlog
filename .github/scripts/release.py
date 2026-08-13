@@ -732,6 +732,290 @@ def _none_state_reason(
     return None
 
 
+def _merge_result(
+    *,
+    verdict: str,
+    version: str | None,
+    kind: str | None,
+    merge_sha: str,
+    base_sha: str | None,
+    head_sha: str | None,
+    reason: str,
+) -> dict[str, object]:
+    return {
+        "verdict": verdict,
+        "version": version,
+        "kind": kind,
+        "merge_sha": merge_sha,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "reason": reason,
+    }
+
+
+def _merge_preparation_history(
+    repo: Path,
+    base_sha: str,
+    head_sha: str,
+    *,
+    target_pr: int | None,
+) -> tuple[list[PreparationMarker], str | None]:
+    preparations: dict[str, PreparationMarker] = {}
+    cancellations: list[CancelMarker] = []
+    try:
+        for commit_sha, message in _commit_messages(repo, base_sha, head_sha):
+            preparation = _parse_preparation_message(message, commit_sha)
+            if preparation is not None:
+                preparations[commit_sha] = preparation
+            cancellation = _parse_cancel_message(message, commit_sha)
+            if cancellation is not None:
+                cancellations.append(cancellation)
+    except ReleaseError as error:
+        return [], str(error)
+
+    relevant_preparations = {
+        commit_sha: preparation
+        for commit_sha, preparation in preparations.items()
+        if target_pr is None or preparation.pr_number == target_pr
+    }
+    for preparation in relevant_preparations.values():
+        _, _, reason = _validate_preparation_tree(repo, preparation)
+        if reason is not None:
+            return [], reason
+
+    cancelled: set[str] = set()
+    for cancellation in cancellations:
+        preparation = preparations.get(cancellation.preparation_sha)
+        if preparation is None:
+            return [], "cancel_target_missing"
+        if (
+            target_pr is not None
+            and preparation.pr_number != target_pr
+        ):
+            continue
+        if cancellation.preparation_sha in cancelled:
+            return [], "cancel_target_duplicate"
+        if not _is_ancestor(
+            repo,
+            cancellation.preparation_sha,
+            cancellation.commit_sha,
+        ):
+            return [], "cancel_target_not_ancestor"
+        reason = _validate_cancel_tree(repo, cancellation, preparation)
+        if reason is not None:
+            return [], reason
+        cancelled.add(cancellation.preparation_sha)
+
+    return [
+        preparation
+        for preparation in relevant_preparations.values()
+        if preparation.commit_sha not in cancelled
+    ], None
+
+
+def _release_file_blobs_match(
+    repo: Path,
+    left_sha: str,
+    right_sha: str,
+) -> bool:
+    try:
+        return all(
+            _git(repo, "rev-parse", f"{left_sha}:{path}")
+            == _git(repo, "rev-parse", f"{right_sha}:{path}")
+            for path in _RELEASE_PATHS
+        )
+    except ReleaseError:
+        return False
+
+
+def classify_merge(repo: Path, merge_sha: str) -> dict[str, object]:
+    base_sha: str | None = None
+    head_sha: str | None = None
+    version: str | None = None
+
+    def result(
+        verdict: str,
+        reason: str,
+        *,
+        kind: str | None = None,
+    ) -> dict[str, object]:
+        return _merge_result(
+            verdict=verdict,
+            version=version,
+            kind=kind,
+            merge_sha=merge_sha,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            reason=reason,
+        )
+
+    try:
+        merge_sha = _git(
+            repo,
+            "rev-parse",
+            "--verify",
+            f"{merge_sha}^{{commit}}",
+        )
+        parents = _commit_parents(repo, merge_sha)
+    except ReleaseError:
+        return result("ERROR", "merge_commit_invalid")
+
+    if parents:
+        base_sha = parents[0]
+    if len(parents) == 2:
+        head_sha = parents[1]
+    if len(parents) != 2:
+        try:
+            version = _project_version_text(
+                _revision_file(repo, merge_sha, "pyproject.toml")
+            )
+        except (ReleaseError, tomllib.TOMLDecodeError):
+            pass
+        return result("ERROR", "merge_parent_count")
+
+    try:
+        merge_base = _git(repo, "merge-base", base_sha, head_sha)
+    except ReleaseError:
+        return result("ERROR", "merge_ancestry_invalid")
+    if merge_base != base_sha:
+        return result("ERROR", "second_parent_not_based_on_first")
+
+    try:
+        base_project = _project_version_text(
+            _revision_file(repo, base_sha, "pyproject.toml")
+        )
+        base_lock = _locked_project_version_text(
+            _revision_file(repo, base_sha, "uv.lock")
+        )
+    except (ReleaseError, tomllib.TOMLDecodeError):
+        return result("ERROR", "base_version_invalid")
+    if base_project != base_lock:
+        return result("ERROR", "base_version_mismatch")
+
+    try:
+        merge_project = _project_version_text(
+            _revision_file(repo, merge_sha, "pyproject.toml")
+        )
+        merge_lock = _locked_project_version_text(
+            _revision_file(repo, merge_sha, "uv.lock")
+        )
+    except (ReleaseError, tomllib.TOMLDecodeError):
+        return result("ERROR", "merge_version_invalid")
+    version = merge_project
+    if merge_project != merge_lock:
+        return result("ERROR", "merge_version_mismatch")
+
+    if _version(merge_project) < _version(base_project):
+        return result("ERROR", "version_regressed")
+
+    if merge_project == base_project:
+        active_preparations, history_reason = _merge_preparation_history(
+            repo,
+            base_sha,
+            head_sha,
+            target_pr=None,
+        )
+        if history_reason is not None:
+            return result("ERROR", history_reason)
+
+    if merge_project == base_project:
+        if active_preparations:
+            return result(
+                "ERROR",
+                "active_preparation_without_version_increase",
+            )
+        try:
+            base_project_blob = _git(
+                repo,
+                "rev-parse",
+                f"{base_sha}:pyproject.toml",
+            )
+            merge_project_blob = _git(
+                repo,
+                "rev-parse",
+                f"{merge_sha}:pyproject.toml",
+            )
+            base_lock_blob = _git(repo, "rev-parse", f"{base_sha}:uv.lock")
+            merge_lock_blob = _git(
+                repo,
+                "rev-parse",
+                f"{merge_sha}:uv.lock",
+            )
+        except ReleaseError:
+            return result("ERROR", "no_release_files_invalid")
+        if merge_project_blob != base_project_blob:
+            return result(
+                "ERROR",
+                "project_file_changed_without_release",
+            )
+        if merge_lock_blob != base_lock_blob:
+            return result("ERROR", "lock_file_changed_without_release")
+        try:
+            base_changelog = _revision_file(
+                repo,
+                base_sha,
+                "CHANGELOG.md",
+            )
+            merge_changelog = _revision_file(
+                repo,
+                merge_sha,
+                "CHANGELOG.md",
+            )
+        except ReleaseError:
+            return result("ERROR", "no_release_changelog_invalid")
+        if _new_public_changelog_section(base_changelog, merge_changelog):
+            return result("ERROR", "public_changelog_without_release")
+        return result("NO_RELEASE", "no_release_changes")
+
+    try:
+        head_message = _git(
+            repo,
+            "show",
+            "-s",
+            "--format=%B",
+            head_sha,
+        )
+        head_preparation = _parse_preparation_message(
+            head_message,
+            head_sha,
+        )
+    except ReleaseError as error:
+        return result("ERROR", str(error))
+    active_preparations, history_reason = _merge_preparation_history(
+        repo,
+        base_sha,
+        head_sha,
+        target_pr=(
+            head_preparation.pr_number
+            if head_preparation is not None
+            else None
+        ),
+    )
+    if history_reason is not None:
+        return result("ERROR", history_reason)
+    if head_preparation is None:
+        return result("ERROR", "preparation_marker_missing")
+
+    if not active_preparations:
+        return result("ERROR", "preparation_marker_missing")
+    if len(active_preparations) != 1:
+        return result("ERROR", "multiple_active_preparations")
+    preparation = active_preparations[0]
+    if preparation.commit_sha != head_sha:
+        return result("ERROR", "preparation_not_merge_head")
+    if preparation.base_sha != base_sha:
+        return result("ERROR", "preparation_base_mismatch")
+    if preparation.version != merge_project:
+        return result("ERROR", "preparation_version_mismatch")
+    if not _release_file_blobs_match(repo, merge_sha, head_sha):
+        return result("ERROR", "merge_release_files_mismatch")
+    return result(
+        "PUBLISH",
+        "validated_preparation",
+        kind=preparation.release_kind,
+    )
+
+
 def _policy_result(
     *,
     verdict: str | None,
@@ -1065,31 +1349,6 @@ def _version(value: str) -> tuple[int, int, int]:
     return tuple(int(component) for component in value.split("."))
 
 
-def _project_version(path: Path) -> str:
-    with path.open("rb") as stream:
-        project = tomllib.load(stream).get("project")
-    if not isinstance(project, dict) or not isinstance(project.get("version"), str):
-        raise ReleaseError(f"project version is missing: {path}")
-    value = project["version"]
-    _version(value)
-    return value
-
-
-def _locked_project_version(path: Path) -> str:
-    with path.open("rb") as stream:
-        packages = tomllib.load(stream).get("package", [])
-    matches = [
-        package.get("version")
-        for package in packages
-        if package.get("name") == "didimlog"
-        and package.get("source") == {"editable": "."}
-    ]
-    if len(matches) != 1 or not isinstance(matches[0], str):
-        raise ReleaseError("uv.lock must contain one editable didimlog package")
-    _version(matches[0])
-    return matches[0]
-
-
 def _prepared_changelog_text(
     original: str,
     version: str,
@@ -1163,21 +1422,6 @@ def prepare_changelog(path: Path, version: str, release_date: str) -> None:
     )
 
 
-def check_release(previous_pyproject: Path, current_pyproject: Path, lock: Path) -> str:
-    previous = _project_version(previous_pyproject)
-    current = _project_version(current_pyproject)
-    if _version(current) <= _version(previous):
-        raise ReleaseError(
-            f"release version must increase: previous={previous}, current={current}"
-        )
-    locked = _locked_project_version(lock)
-    if locked != current:
-        raise ReleaseError(
-            f"uv.lock version {locked} does not match project version {current}"
-        )
-    return current
-
-
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1187,10 +1431,9 @@ def _parser() -> argparse.ArgumentParser:
     changelog.add_argument("--version", required=True)
     changelog.add_argument("--date", required=True)
 
-    release = commands.add_parser("check-release")
-    release.add_argument("--previous-pyproject", type=Path, required=True)
-    release.add_argument("--current-pyproject", type=Path, required=True)
-    release.add_argument("--lock", type=Path, required=True)
+    classify = commands.add_parser("classify-merge")
+    classify.add_argument("--repo", type=Path, required=True)
+    classify.add_argument("--merge-sha", required=True)
 
     inspect_pr = commands.add_parser("inspect-pr")
     inspect_pr.add_argument("--repo", type=Path, required=True)
@@ -1219,12 +1462,14 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.command == "prepare-changelog":
             prepare_changelog(arguments.path, arguments.version, arguments.date)
             print(arguments.version)
-        elif arguments.command == "check-release":
+        elif arguments.command == "classify-merge":
             print(
-                check_release(
-                    arguments.previous_pyproject,
-                    arguments.current_pyproject,
-                    arguments.lock,
+                json.dumps(
+                    classify_merge(
+                        arguments.repo,
+                        arguments.merge_sha,
+                    ),
+                    sort_keys=True,
                 )
             )
         elif arguments.command == "inspect-pr":

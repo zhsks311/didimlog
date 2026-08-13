@@ -122,8 +122,20 @@ class ReleaseAutomationTests(unittest.TestCase):
     def checkout(self, repository, revision):
         self.git(repository, "checkout", revision)
 
-    def merge_commit(self, repository, first_parent, second_parent, message):
-        tree = self.git(repository, "rev-parse", f"{first_parent}^{{tree}}")
+    def merge_commit(
+        self,
+        repository,
+        first_parent,
+        second_parent,
+        message,
+        *,
+        tree_revision=None,
+    ):
+        tree = self.git(
+            repository,
+            "rev-parse",
+            f"{tree_revision or first_parent}^{{tree}}",
+        )
         return self.git(
             repository,
             "commit-tree",
@@ -252,6 +264,17 @@ class ReleaseAutomationTests(unittest.TestCase):
         for label in labels:
             arguments.extend(("--label", label))
         result = self.run_script(*arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def classify_merge(self, repository, merge_sha):
+        result = self.run_script(
+            "classify-merge",
+            "--repo",
+            str(repository),
+            "--merge-sha",
+            merge_sha,
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
@@ -1172,6 +1195,505 @@ class ReleaseAutomationTests(unittest.TestCase):
             self.assertEqual(prepare["prepare_selection"], "minor")
             self.assertTrue(prepare["desired_ready"])
 
+    def test_classify_merge_publishes_valid_second_parent_preparation(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            base_sha = self.initialize_git_repository(repository)
+            self.create_branch(repository, "release", base_sha)
+            self.checkout(repository, "release")
+            head_sha = self.preparation_commit(repository, base_sha)
+            merge_sha = self.merge_commit(
+                repository,
+                base_sha,
+                head_sha,
+                "test: merge prepared release",
+                tree_revision=head_sha,
+            )
+
+            self.assertEqual(
+                self.git(repository, "merge-base", base_sha, head_sha),
+                base_sha,
+            )
+            self.assertEqual(
+                self.git(repository, "merge-base", merge_sha, head_sha),
+                head_sha,
+            )
+            self.assertEqual(
+                self.classify_merge(repository, merge_sha),
+                {
+                    "verdict": "PUBLISH",
+                    "version": "0.0.3",
+                    "kind": "develop",
+                    "merge_sha": merge_sha,
+                    "base_sha": base_sha,
+                    "head_sha": head_sha,
+                    "reason": "validated_preparation",
+                },
+            )
+            for path in RELEASE_PATHS:
+                self.assertEqual(
+                    self.git(repository, "rev-parse", f"{merge_sha}:{path}"),
+                    self.git(repository, "rev-parse", f"{head_sha}:{path}"),
+                )
+
+            changed_changelog = (
+                self.file_at_revision(repository, head_sha, "CHANGELOG.md")
+                + "\nmerge-only change\n"
+            )
+            changed_tree = self.commit(
+                repository,
+                "test: alter merge result",
+                files={"CHANGELOG.md": changed_changelog},
+            )
+            mismatched_merge = self.merge_commit(
+                repository,
+                base_sha,
+                head_sha,
+                "test: merge mismatched release files",
+                tree_revision=changed_tree,
+            )
+            mismatch = self.classify_merge(repository, mismatched_merge)
+            self.assertEqual(mismatch["verdict"], "ERROR")
+            self.assertEqual(
+                mismatch["reason"],
+                "merge_release_files_mismatch",
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            old_base = self.initialize_git_repository(repository)
+            self.create_branch(repository, "history", old_base)
+            self.checkout(repository, "history")
+            old_preparation = self.preparation_commit(
+                repository,
+                old_base,
+            )
+            cancellation = self.cancel_commit(
+                repository,
+                old_preparation,
+            )
+
+            self.checkout(repository, "main")
+            base_sha = self.commit(
+                repository,
+                "test: advance main before repeated preparation",
+                files={"fixture.txt": "current main\n"},
+            )
+            combined_history = self.merge_commit(
+                repository,
+                base_sha,
+                cancellation,
+                "test: carry cancelled old-base preparation",
+                tree_revision=base_sha,
+            )
+            self.checkout(repository, combined_history)
+            head_sha = self.preparation_commit(repository, base_sha)
+            merge_sha = self.merge_commit(
+                repository,
+                base_sha,
+                head_sha,
+                "test: merge repeated preparation",
+                tree_revision=head_sha,
+            )
+
+            repeated = self.classify_merge(repository, merge_sha)
+            self.assertEqual(repeated["verdict"], "PUBLISH")
+            self.assertEqual(repeated["head_sha"], head_sha)
+            self.assertEqual(repeated["reason"], "validated_preparation")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            base_sha = self.initialize_git_repository(repository)
+            self.create_branch(repository, "foreign", base_sha)
+            self.checkout(repository, "foreign")
+            foreign_preparation = self.preparation_commit(
+                repository,
+                base_sha,
+                pr_number=7,
+            )
+            combined_history = self.merge_commit(
+                repository,
+                base_sha,
+                foreign_preparation,
+                "test: carry valid foreign preparation",
+                tree_revision=base_sha,
+            )
+            self.checkout(repository, combined_history)
+            head_sha = self.preparation_commit(
+                repository,
+                base_sha,
+                pr_number=42,
+            )
+            merge_sha = self.merge_commit(
+                repository,
+                base_sha,
+                head_sha,
+                "test: merge target preparation",
+                tree_revision=head_sha,
+            )
+
+            foreign = self.classify_merge(repository, merge_sha)
+            self.assertEqual(foreign["verdict"], "PUBLISH")
+            self.assertEqual(foreign["head_sha"], head_sha)
+            self.assertEqual(foreign["reason"], "validated_preparation")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            base_sha = self.initialize_git_repository(repository)
+            malformed_foreign = self.commit(
+                repository,
+                "\n".join(
+                    self.preparation_message(
+                        base_sha,
+                        pr_number=7,
+                    ).splitlines()[:-1]
+                ),
+                files=self.release_files("0.0.3", prepared=True),
+            )
+            combined_history = self.merge_commit(
+                repository,
+                base_sha,
+                malformed_foreign,
+                "test: carry malformed foreign marker",
+                tree_revision=base_sha,
+            )
+            self.checkout(repository, combined_history)
+            head_sha = self.preparation_commit(repository, base_sha)
+            merge_sha = self.merge_commit(
+                repository,
+                base_sha,
+                head_sha,
+                "test: merge after malformed foreign marker",
+                tree_revision=head_sha,
+            )
+
+            malformed = self.classify_merge(repository, merge_sha)
+            self.assertEqual(malformed["verdict"], "ERROR")
+            self.assertEqual(
+                malformed["reason"],
+                "invalid_preparation_marker",
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            base_sha = self.initialize_git_repository(repository)
+            self.commit(
+                repository,
+                f"Didimlog-Release-Cancel: {'0' * 40}",
+            )
+            head_sha = self.preparation_commit(repository, base_sha)
+            merge_sha = self.merge_commit(
+                repository,
+                base_sha,
+                head_sha,
+                "test: merge after dangling cancellation",
+                tree_revision=head_sha,
+            )
+
+            dangling = self.classify_merge(repository, merge_sha)
+            self.assertEqual(dangling["verdict"], "ERROR")
+            self.assertEqual(
+                dangling["reason"],
+                "cancel_target_missing",
+            )
+
+    def test_classify_merge_is_unchanged_by_late_cancel_and_label_changes(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            base_sha = self.initialize_git_repository(repository)
+            self.create_branch(repository, "release", base_sha)
+            self.checkout(repository, "release")
+            head_sha = self.preparation_commit(repository, base_sha)
+            merge_sha = self.merge_commit(
+                repository,
+                base_sha,
+                head_sha,
+                "test: merge before late cancellation",
+                tree_revision=head_sha,
+            )
+            before = self.classify_merge(repository, merge_sha)
+
+            self.checkout(repository, head_sha)
+            self.cancel_commit(repository, head_sha)
+
+            self.assertEqual(self.classify_merge(repository, merge_sha), before)
+            label_input = self.run_script(
+                "classify-merge",
+                "--repo",
+                str(repository),
+                "--merge-sha",
+                merge_sha,
+                "--label",
+                "release:none",
+            )
+            self.assertNotEqual(label_input.returncode, 0)
+            self.assertIn("unrecognized arguments: --label", label_input.stderr)
+
+    def test_classify_merge_returns_no_release_when_cancel_wins(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            base_sha = self.initialize_git_repository(repository)
+            self.create_branch(repository, "release", base_sha)
+            self.checkout(repository, "release")
+            preparation_sha = self.preparation_commit(repository, base_sha)
+            head_sha = self.cancel_commit(repository, preparation_sha)
+            merge_sha = self.merge_commit(
+                repository,
+                base_sha,
+                head_sha,
+                "test: merge cancellation",
+                tree_revision=head_sha,
+            )
+
+            self.assertEqual(
+                self.classify_merge(repository, merge_sha),
+                {
+                    "verdict": "NO_RELEASE",
+                    "version": "0.0.2",
+                    "kind": None,
+                    "merge_sha": merge_sha,
+                    "base_sha": base_sha,
+                    "head_sha": head_sha,
+                    "reason": "no_release_changes",
+                },
+            )
+
+            no_release_cases = {
+                "pyproject.toml": (
+                    self.file_at_revision(
+                        repository,
+                        head_sha,
+                        "pyproject.toml",
+                    )
+                    + '\ndescription = "merge-only"\n',
+                    "project_file_changed_without_release",
+                ),
+                "uv.lock": (
+                    self.file_at_revision(repository, head_sha, "uv.lock")
+                    + "\n# merge-only\n",
+                    "lock_file_changed_without_release",
+                ),
+                "CHANGELOG.md": (
+                    self.file_at_revision(
+                        repository,
+                        head_sha,
+                        "CHANGELOG.md",
+                    ).replace(
+                        "## [Unreleased]\n",
+                        (
+                            "## [Unreleased]\n\n"
+                            "## [9.9.9] - 2026-08-13\n"
+                        ),
+                        1,
+                    ),
+                    "public_changelog_without_release",
+                ),
+            }
+            for path, (content, reason) in no_release_cases.items():
+                with self.subTest(path=path):
+                    self.checkout(repository, head_sha)
+                    changed_tree = self.commit(
+                        repository,
+                        f"test: invalid no-release {path}",
+                        files={path: content},
+                    )
+                    invalid_merge = self.merge_commit(
+                        repository,
+                        base_sha,
+                        head_sha,
+                        f"test: merge invalid no-release {path}",
+                        tree_revision=changed_tree,
+                    )
+                    result = self.classify_merge(
+                        repository,
+                        invalid_merge,
+                    )
+                    self.assertEqual(result["verdict"], "ERROR")
+                    self.assertEqual(result["reason"], reason)
+
+    def test_classify_merge_rejects_wrong_second_parent_or_base(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            old_base = self.initialize_git_repository(repository)
+            base_sha = self.commit(
+                repository,
+                "test: advance current base",
+                files={"fixture.txt": "current base\n"},
+            )
+            self.create_branch(repository, "release", base_sha)
+            self.checkout(repository, "release")
+            head_sha = self.preparation_commit(repository, base_sha)
+            reversed_merge = self.merge_commit(
+                repository,
+                head_sha,
+                base_sha,
+                "test: reverse merge parents",
+                tree_revision=head_sha,
+            )
+
+            reversed_result = self.classify_merge(
+                repository,
+                reversed_merge,
+            )
+            self.assertEqual(reversed_result["verdict"], "ERROR")
+            self.assertEqual(
+                reversed_result["reason"],
+                "second_parent_not_based_on_first",
+            )
+
+            self.checkout(repository, base_sha)
+            wrong_base_head = self.preparation_commit(
+                repository,
+                old_base,
+            )
+            wrong_base_merge = self.merge_commit(
+                repository,
+                base_sha,
+                wrong_base_head,
+                "test: merge preparation for wrong base",
+                tree_revision=wrong_base_head,
+            )
+            wrong_base_result = self.classify_merge(
+                repository,
+                wrong_base_merge,
+            )
+            self.assertEqual(wrong_base_result["verdict"], "ERROR")
+            self.assertEqual(
+                wrong_base_result["reason"],
+                "preparation_base_mismatch",
+            )
+
+    def test_classify_merge_rejects_markerless_version_increase(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            base_sha = self.initialize_git_repository(repository)
+            head_sha = self.commit(
+                repository,
+                "test: bump without release marker",
+                files=self.release_files("0.0.3", prepared=True),
+            )
+            merge_sha = self.merge_commit(
+                repository,
+                base_sha,
+                head_sha,
+                "test: merge markerless bump",
+                tree_revision=head_sha,
+            )
+
+            result = self.classify_merge(repository, merge_sha)
+            self.assertEqual(result["verdict"], "ERROR")
+            self.assertEqual(result["version"], "0.0.3")
+            self.assertEqual(result["reason"], "preparation_marker_missing")
+
+    def test_classify_merge_rejects_unchanged_version_with_active_preparation(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            base_sha = self.initialize_git_repository(repository)
+            self.create_branch(repository, "release", base_sha)
+            self.checkout(repository, "release")
+            head_sha = self.preparation_commit(repository, base_sha)
+            merge_sha = self.merge_commit(
+                repository,
+                base_sha,
+                head_sha,
+                "test: drop prepared release from merge tree",
+                tree_revision=base_sha,
+            )
+
+            result = self.classify_merge(repository, merge_sha)
+            self.assertEqual(result["verdict"], "ERROR")
+            self.assertEqual(result["version"], "0.0.2")
+            self.assertEqual(
+                result["reason"],
+                "active_preparation_without_version_increase",
+            )
+
+    def test_classify_merge_rejects_squash_rebase_and_direct_version_push(self):
+        cases = ("squash", "rebase", "direct")
+        for case in cases:
+            with (
+                self.subTest(case=case),
+                tempfile.TemporaryDirectory() as temporary_directory,
+            ):
+                repository = Path(temporary_directory) / "repository"
+                base_sha = self.initialize_git_repository(repository)
+                if case == "direct":
+                    pushed_sha = self.commit(
+                        repository,
+                        "test: direct version push",
+                        files=self.release_files("0.0.3", prepared=True),
+                    )
+                elif case == "squash":
+                    pushed_sha = self.commit(
+                        repository,
+                        (
+                            "test: squashed release\n\n"
+                            + self.preparation_message(base_sha)
+                        ),
+                        files=self.release_files("0.0.3", prepared=True),
+                    )
+                else:
+                    pushed_sha = self.preparation_commit(
+                        repository,
+                        base_sha,
+                    )
+
+                result = self.classify_merge(repository, pushed_sha)
+                self.assertEqual(result["verdict"], "ERROR")
+                self.assertEqual(result["merge_sha"], pushed_sha)
+                self.assertEqual(result["base_sha"], base_sha)
+                self.assertIsNone(result["head_sha"])
+                self.assertEqual(result["reason"], "merge_parent_count")
+
+    def test_classify_merge_returns_hotfix_kind_only_from_validated_marker(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            base_sha = self.initialize_git_repository(repository)
+            self.create_branch(repository, "hotfix", base_sha)
+            self.checkout(repository, "hotfix")
+            head_sha = self.preparation_commit(
+                repository,
+                base_sha,
+                release_kind="hotfix",
+            )
+            merge_sha = self.merge_commit(
+                repository,
+                base_sha,
+                head_sha,
+                "test: merge hotfix",
+                tree_revision=head_sha,
+            )
+
+            result = self.classify_merge(repository, merge_sha)
+            self.assertEqual(result["verdict"], "PUBLISH")
+            self.assertEqual(result["version"], "0.0.3")
+            self.assertEqual(result["kind"], "hotfix")
+            self.assertEqual(result["reason"], "validated_preparation")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            base_sha = self.initialize_git_repository(repository)
+            invalid_head = self.commit(
+                repository,
+                self.preparation_message(
+                    base_sha,
+                    release_kind="emergency",
+                ),
+                files=self.release_files("0.0.3", prepared=True),
+            )
+            invalid_merge = self.merge_commit(
+                repository,
+                base_sha,
+                invalid_head,
+                "test: merge invalid release kind",
+                tree_revision=invalid_head,
+            )
+
+            result = self.classify_merge(repository, invalid_merge)
+            self.assertEqual(result["verdict"], "ERROR")
+            self.assertIsNone(result["kind"])
+            self.assertEqual(result["reason"], "invalid_preparation_marker")
+
     def test_prepare_changelog_promotes_unreleased_and_updates_links(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             changelog = Path(temporary_directory) / "CHANGELOG.md"
@@ -1267,74 +1789,6 @@ class ReleaseAutomationTests(unittest.TestCase):
             self.assertIn("Unreleased section is empty", result.stderr)
             self.assertEqual(changelog.read_text(encoding="utf-8"), original)
 
-    def test_check_release_accepts_one_increased_locked_version(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
-            previous = root / "previous.toml"
-            current = root / "current.toml"
-            lock = root / "uv.lock"
-            previous.write_text('[project]\nname = "didimlog"\nversion = "0.0.2"\n', encoding="utf-8")
-            current.write_text('[project]\nname = "didimlog"\nversion = "0.1.0"\n', encoding="utf-8")
-            lock.write_text(
-                'version = 1\n\n[[package]]\nname = "didimlog"\nversion = "0.1.0"\nsource = { editable = "." }\n',
-                encoding="utf-8",
-            )
-
-            result = self.run_script(
-                "check-release",
-                "--previous-pyproject",
-                str(previous),
-                "--current-pyproject",
-                str(current),
-                "--lock",
-                str(lock),
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, "0.1.0\n")
-
-    def test_check_release_rejects_unchanged_downgraded_and_unlocked_versions(self):
-        cases = (
-            ("0.0.2", "0.0.2", "0.0.2", "must increase"),
-            ("0.1.0", "0.0.9", "0.0.9", "must increase"),
-            ("0.0.2", "0.0.3", "0.0.2", "uv.lock version"),
-        )
-        for previous_version, current_version, lock_version, message in cases:
-            with self.subTest(
-                previous=previous_version,
-                current=current_version,
-                lock=lock_version,
-            ), tempfile.TemporaryDirectory() as temporary_directory:
-                root = Path(temporary_directory)
-                previous = root / "previous.toml"
-                current = root / "current.toml"
-                lock = root / "uv.lock"
-                previous.write_text(
-                    f'[project]\nname = "didimlog"\nversion = "{previous_version}"\n',
-                    encoding="utf-8",
-                )
-                current.write_text(
-                    f'[project]\nname = "didimlog"\nversion = "{current_version}"\n',
-                    encoding="utf-8",
-                )
-                lock.write_text(
-                    'version = 1\n\n[[package]]\nname = "didimlog"\n'
-                    f'version = "{lock_version}"\nsource = {{ editable = "." }}\n',
-                    encoding="utf-8",
-                )
-
-                result = self.run_script(
-                    "check-release",
-                    "--previous-pyproject",
-                    str(previous),
-                    "--current-pyproject",
-                    str(current),
-                    "--lock",
-                    str(lock),
-                )
-
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn(message, result.stderr)
 
     def test_release_label_workflow_prepares_and_reverts_one_release_commit(self):
         workflow_path = REPO / ".github" / "workflows" / "prepare-release.yml"
@@ -1429,7 +1883,6 @@ class ReleaseAutomationTests(unittest.TestCase):
             workflow["jobs"]["publish"]["concurrency"]["group"],
             "publish-release-${{ needs.detect.outputs.version }}",
         )
-        self.assertIn("check-release", workflow_text)
         self.assertIn("python -m unittest discover -s tests -v", workflow_text)
         self.assertIn("pulls/${release_pr_number}/commits", workflow_text)
         self.assertIn('release:(patch|minor|major)', workflow_text)
