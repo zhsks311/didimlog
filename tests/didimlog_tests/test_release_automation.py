@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -741,7 +742,32 @@ class ReleaseAutomationTests(unittest.TestCase):
                             ),
                         )
 
-    def test_check_pr_treats_missing_label_as_none(self):
+    def test_documented_release_labels_match_runtime_selection_policy(self):
+        readme = (REPO / "README.md").read_text(encoding="utf-8")
+        release_guide = readme.split("### 릴리스", 1)[1].split("\n## ", 1)[0]
+        documented_labels = set(
+            re.findall(r"`(release:[a-z]+)`", release_guide)
+        )
+        self.assertEqual(
+            documented_labels,
+            {
+                "release:none",
+                "release:patch",
+                "release:minor",
+                "release:major",
+                "release:ready",
+            },
+        )
+        self.assertIn(
+            "선택 레이블이 없거나 `release:none`이면 배포하지 않습니다",
+            release_guide,
+        )
+        self.assertIn("다음 버전 레이블 중 하나만 붙입니다", release_guide)
+        self.assertIn(
+            "`release:ready`를 붙이지만, 이 레이블은 현재 상태를 보여 주는 표시",
+            release_guide,
+        )
+
         with tempfile.TemporaryDirectory() as temporary_directory:
             repository = Path(temporary_directory) / "repository"
             base_sha = self.initialize_git_repository(repository)
@@ -764,23 +790,52 @@ class ReleaseAutomationTests(unittest.TestCase):
                 head_sha,
                 labels=("release:none",),
             )
+            ready_only = self.pr_policy(
+                "check-pr",
+                repository,
+                base_sha,
+                head_sha,
+                labels=("release:ready",),
+            )
 
             self.assertEqual(missing["selection"], "none")
             self.assertEqual(missing["verdict"], "PASS")
             self.assertEqual(missing["reason"], "none_valid")
             self.assertFalse(missing["desired_ready"])
-            self.assertEqual(
-                (
-                    missing["verdict"],
-                    missing["reason"],
-                    missing["action_message"],
-                ),
-                (
-                    explicit_none["verdict"],
-                    explicit_none["reason"],
-                    explicit_none["action_message"],
-                ),
-            )
+            for equivalent in (explicit_none, ready_only):
+                self.assertEqual(
+                    (
+                        equivalent["selection"],
+                        equivalent["verdict"],
+                        equivalent["reason"],
+                        equivalent["desired_ready"],
+                    ),
+                    ("none", "PASS", "none_valid", False),
+                )
+
+        for bump in ("patch", "minor", "major"):
+            with (
+                self.subTest(bump=bump),
+                tempfile.TemporaryDirectory() as temporary_directory,
+            ):
+                repository = Path(temporary_directory) / "repository"
+                base_sha = self.initialize_git_repository(repository)
+                head_sha = self.commit(
+                    repository,
+                    f"test: {bump} PR change",
+                    files={"fixture.txt": f"{bump} change\n"},
+                )
+                plan = self.pr_policy(
+                    "plan-reconcile",
+                    repository,
+                    base_sha,
+                    head_sha,
+                    labels=(f"release:{bump}",),
+                )
+
+                self.assertEqual(plan["selection"], bump)
+                self.assertEqual(plan["action"], "PREPARE")
+                self.assertTrue(plan["desired_ready"])
 
     def test_check_pr_rejects_none_with_manual_version_change(self):
         cases = (

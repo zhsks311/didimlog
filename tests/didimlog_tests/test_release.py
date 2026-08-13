@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -96,6 +97,98 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIn("gh release create", workflow_text)
         self.assertIn("pypa/gh-action-pypi-publish@release/v1", workflow_text)
         self.assertNotIn("PYPI_API_TOKEN", workflow_text)
+
+    def test_release_guide_matches_reconciliation_and_delivery_workflows(self):
+        readme = (REPO / "README.md").read_text(encoding="utf-8")
+        release_guide = readme.split("### 릴리스", 1)[1].split("\n## ", 1)[0]
+        changelog = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
+        unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
+        reconcile = yaml.safe_load(
+            (REPO / ".github/workflows/prepare-release.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        delivery = yaml.safe_load(
+            (REPO / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        )
+        reconcile_triggers = reconcile.get("on", reconcile.get(True))
+        delivery_triggers = delivery.get("on", delivery.get(True))
+
+        self.assertEqual(
+            reconcile_triggers["pull_request_target"]["types"],
+            ["opened", "reopened", "synchronize", "labeled", "unlabeled"],
+        )
+        self.assertEqual(delivery_triggers, {"push": {"branches": ["main"]}})
+        self.assertIn("직접 적용해야 합니다", release_guide)
+        self.assertIn(
+            "workflow 파일만 병합해도 이 설정은 생기지 않습니다.",
+            release_guide,
+        )
+
+        final_check = next(
+            step["run"]
+            for step in reconcile["jobs"]["check-final"]["steps"]
+            if step.get("id") == "final-check"
+        )
+        check_name_match = re.search(r'"name": "([^"]+)"', final_check)
+        self.assertIsNotNone(check_name_match)
+        check_name = check_name_match.group(1)
+        self.assertEqual(check_name, "release-state")
+        self.assertIn('--head-sha "${FINAL_HEAD_SHA}"', final_check)
+        self.assertIn('"head_sha": $head_sha', final_check)
+        self.assertIn(f"`{check_name}` 통과를 필수", release_guide)
+        self.assertIn("현재 PR 커밋의 Git 이력", release_guide)
+        self.assertIn("바로 그 커밋", release_guide)
+
+        classify = next(
+            step["run"]
+            for step in delivery["jobs"]["detect"]["steps"]
+            if step.get("name") == "Classify the immutable merge evidence"
+        )
+        self.assertIn("classify-merge", classify)
+        self.assertIn("두 부모를 가진 merge commit만", release_guide)
+        for unsupported_merge in ("squash", "rebase", "direct push"):
+            self.assertIn(unsupported_merge, release_guide)
+
+        reconcile_open_prs = delivery["jobs"]["reconcile-open-prs"]
+        self.assertEqual(reconcile_open_prs["needs"], ["detect", "publish"])
+        self.assertIn("준비 뒤 PR에 커밋을 추가하면", release_guide)
+        self.assertIn(
+            "이전 준비를 취소하고 새 커밋 기준으로 다시 준비",
+            release_guide,
+        )
+        self.assertIn("`main`이 전진", release_guide)
+        self.assertIn("최신 `main`을 반영할 때까지 기다립니다", release_guide)
+
+        hotfix_sync = delivery["jobs"]["sync-hotfix-to-develop"]
+        self.assertEqual(hotfix_sync["needs"], ["detect", "publish"])
+        self.assertIn("needs.publish.result == 'success'", hotfix_sync["if"])
+        self.assertIn("needs.detect.outputs.kind == 'hotfix'", hotfix_sync["if"])
+        sync_run = next(
+            step["run"]
+            for step in hotfix_sync["steps"]
+            if step.get("name") == "Sync published hotfix to develop"
+        )
+        self.assertIn('-f "base=develop"', sync_run)
+        self.assertIn('-f "head=main"', sync_run)
+        self.assertIn("patch 배포에 성공하면", release_guide)
+        self.assertIn(
+            "`hotfix/*` → `main` PR은 `release:patch`만 지원",
+            release_guide,
+        )
+        self.assertIn("`main` → `develop` 동기화 PR", release_guide)
+
+        unreleased_items = [
+            line for line in unreleased.splitlines() if line.startswith("- ")
+        ]
+        self.assertEqual(len(unreleased_items), 1)
+        for documented_outcome in (
+            "PR별로 준비·취소 기록",
+            "취소가 먼저 오든 병합이 먼저 오든",
+            "여러 릴리스 PR을 최신 기준으로 다시 계산",
+            "`main` → `develop` 동기화 PR",
+        ):
+            self.assertIn(documented_outcome, unreleased_items[0])
 
     def test_release_generates_a_verified_manifest_for_exactly_wheel_and_sdist(self):
         workflow = yaml.safe_load(
