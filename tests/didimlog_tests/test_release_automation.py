@@ -2098,55 +2098,268 @@ class ReleaseAutomationTests(unittest.TestCase):
         self.assertIn("needs.mutate.outputs.final_head", dispatch_ci)
         self.assertIn('gh workflow run ci.yml --ref "${HEAD_REF}"', dispatch_ci)
 
-    def test_main_push_release_workflow_builds_once_and_publishes_verified_files(self):
+    def release_workflow(self):
         workflow_path = REPO / ".github" / "workflows" / "release.yml"
-        workflow_text = workflow_path.read_text(encoding="utf-8")
-        workflow = yaml.safe_load(workflow_text)
-        triggers = workflow.get("on", workflow.get(True))
+        self.assertTrue(workflow_path.is_file())
+        return yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(triggers, {"push": {"branches": ["main"]}})
-        self.assertEqual(workflow["permissions"], {"contents": "read"})
-        self.assertEqual(set(workflow["jobs"]), {"detect", "publish"})
-        self.assertNotIn("concurrency", workflow)
+    def release_step(self, workflow, job_name, step_name):
+        return next(
+            step
+            for step in workflow["jobs"][job_name]["steps"]
+            if step.get("name") == step_name
+        )
+
+    def test_release_workflow_classifies_the_merge_without_live_pr_metadata(self):
+        workflow = self.release_workflow()
+        detect = workflow["jobs"]["detect"]
+        checkout = detect["steps"][0]
+        classify = self.release_step(
+            workflow, "detect", "Classify the immutable merge evidence"
+        )["run"]
+        detect_text = str(detect)
+
+
+        self.assertEqual(detect["permissions"], {"contents": "read"})
         self.assertEqual(
-            workflow["jobs"]["publish"]["environment"],
-            {"name": "pypi", "url": "https://pypi.org/p/didimlog"},
+            detect["outputs"],
+            {
+                "verdict": "${{ steps.classify.outputs.verdict }}",
+                "version": "${{ steps.classify.outputs.version }}",
+                "kind": "${{ steps.classify.outputs.kind }}",
+                "reason": "${{ steps.classify.outputs.reason }}",
+            },
+        )
+        self.assertEqual(checkout["uses"], "actions/checkout@v4")
+        self.assertEqual(
+            checkout["with"], {"fetch-depth": 0, "persist-credentials": False}
+        )
+        self.assertEqual(len(detect["steps"]), 2)
+
+        self.assertIn(
+            '.github/scripts/release.py classify-merge --repo . --merge-sha "${GITHUB_SHA}"',
+            classify,
+        )
+        self.assertIn("PUBLISH)", classify)
+        self.assertIn("NO_RELEASE)", classify)
+        self.assertIn("ERROR)", classify)
+        self.assertIn('echo "verdict=${verdict}"', classify)
+        self.assertIn('echo "version=${version}"', classify)
+        self.assertIn('echo "kind=${kind}"', classify)
+        self.assertIn('echo "reason=${reason}"', classify)
+        self.assertEqual(classify.count('>> "${GITHUB_OUTPUT}"'), 1)
+
+        self.assertIn("exit 1", classify)
+        for forbidden in (
+            "gh api",
+            "commits/",
+            "/pulls",
+            "labels",
+            "release:ready",
+            "check-release",
+            "github.event.before",
+        ):
+            self.assertNotIn(forbidden, detect_text)
+
+    def test_release_workflow_preserves_version_publish_concurrency_and_identity_checks(
+        self,
+    ):
+        workflow = self.release_workflow()
+        publish = workflow["jobs"]["publish"]
+        test_step = self.release_step(
+            workflow, "publish", "Test the exact release commit"
+        )["run"]
+        build_step = self.release_step(
+            workflow, "publish", "Build wheel and source distribution once"
+        )["run"]
+        digest_step = self.release_step(
+            workflow, "publish", "Verify tag, filenames, and checksums"
+        )["run"]
+        pypi_step = self.release_step(
+            workflow, "publish", "Check whether PyPI already has the exact files"
+        )["run"]
+        tag_step = self.release_step(
+            workflow, "publish", "Create or verify the release tag"
+        )["run"]
+        release_step = self.release_step(
+            workflow, "publish", "Create or verify immutable GitHub Release"
+        )["run"]
+        publish_step = self.release_step(
+            workflow, "publish", "Publish with PyPI Trusted Publishing"
+        )
+        step_names = [
+            step.get("name")
+            for step in publish["steps"]
+            if step.get("name") is not None
+        ]
+        publish_runs = "\n".join(
+            step["run"] for step in publish["steps"] if "run" in step
+        )
+
+
+        self.assertEqual(publish["needs"], "detect")
+        self.assertEqual(
+            publish["if"], "needs.detect.outputs.verdict == 'PUBLISH'"
+        )
+        self.assertNotIn("concurrency", workflow)
+
+        self.assertEqual(
+            publish["concurrency"],
+            {
+                "group": "publish-release-${{ needs.detect.outputs.version }}",
+                "cancel-in-progress": False,
+            },
         )
         self.assertEqual(
-            workflow["jobs"]["publish"]["permissions"],
+            publish["permissions"],
             {
                 "attestations": "write",
                 "contents": "write",
                 "id-token": "write",
             },
         )
-        self.assertIn("needs.detect.outputs.release == 'true'", workflow["jobs"]["publish"]["if"])
         self.assertEqual(
-            workflow["jobs"]["publish"]["concurrency"]["group"],
-            "publish-release-${{ needs.detect.outputs.version }}",
+            publish["environment"],
+            {"name": "pypi", "url": "https://pypi.org/p/didimlog"},
         )
-        self.assertIn("python -m unittest discover -s tests -v", workflow_text)
-        self.assertIn("pulls/${release_pr_number}/commits", workflow_text)
-        self.assertIn('release:(patch|minor|major)', workflow_text)
-        self.assertIn('"release:none"', workflow_text)
-        self.assertIn('"release:ready"', workflow_text)
-        self.assertIn("persist-credentials: false", workflow_text)
-        self.assertEqual(workflow_text.count("uv build --out-dir dist/packages"), 1)
-        self.assertIn("sha256sum --strict --check", workflow_text)
-        self.assertIn("gh release create", workflow_text)
-        self.assertIn("--draft", workflow_text)
-        self.assertIn("gh release edit", workflow_text)
-        self.assertIn("[.assets[].name] | sort", workflow_text)
-        self.assertIn("--draft=false", workflow_text)
-        self.assertIn(".immutable", workflow_text)
+        self.assertEqual(test_step.count("python -m unittest discover -s tests -v"), 1)
+        self.assertEqual(
+            publish_runs.count("python -m unittest discover -s tests -v"), 1
+        )
+        self.assertEqual(
+            publish_runs.count("uv build --out-dir dist/packages"), 1
+        )
+
+        self.assertEqual(build_step, "uv build --out-dir dist/packages")
+        self.assertIn('wheel="didimlog-${VERSION}-py3-none-any.whl"', digest_step)
+        self.assertIn('sdist="didimlog-${VERSION}.tar.gz"', digest_step)
+        self.assertIn('test "$(find dist/packages -type f | wc -l)" -eq 2', digest_step)
+        self.assertIn('sha256sum "${wheel}" "${sdist}" > ../SHA256SUMS', digest_step)
+        self.assertIn("sha256sum --strict --check ../SHA256SUMS", digest_step)
+        self.assertIn(
+            'test "$(git rev-list -n 1 "${TAG}")" = "${GITHUB_SHA}"', tag_step
+        )
+        self.assertIn('git tag "${TAG}" "${GITHUB_SHA}"', tag_step)
+        self.assertIn(
+            'expected_assets="$(printf \'%s\\n\' "${wheel}" "${sdist}" SHA256SUMS | sort)"',
+            release_step,
+        )
+        self.assertIn("--draft", release_step)
+        self.assertIn("--verify-tag", release_step)
+        self.assertIn("--draft=false", release_step)
         self.assertLess(
-            workflow_text.index("draft_assets="),
-            workflow_text.index("gh release edit"),
+            release_step.index("draft_assets="),
+            release_step.index("gh release edit"),
         )
-        self.assertIn("packages-dir: dist/packages/", workflow_text)
-        self.assertIn("pypa/gh-action-pypi-publish@release/v1", workflow_text)
-        self.assertNotIn("PYPI_API_TOKEN", workflow_text)
-        self.assertIn("[.urls[].filename] | sort", workflow_text)
+
+        self.assertIn("cmp \"dist/packages/${wheel}\"", release_step)
+        self.assertIn("cmp \"dist/packages/${sdist}\"", release_step)
+        self.assertIn('cmp "dist/SHA256SUMS"', release_step)
+        self.assertIn('test "${immutable}" = "true"', release_step)
+        self.assertIn("[.assets[].name] | sort", release_step)
+        self.assertIn('wheel="didimlog-${VERSION}-py3-none-any.whl"', pypi_step)
+        self.assertIn('sdist="didimlog-${VERSION}.tar.gz"', pypi_step)
+        self.assertIn(
+            'expected_files="$(printf \'%s\\n\' "${wheel}" "${sdist}" | sort)"',
+            pypi_step,
+        )
+
+        self.assertIn("[.urls[].filename] | sort", pypi_step)
+        self.assertIn(".digests.sha256", pypi_step)
+        self.assertIn('test "${wheel_local}" = "${wheel_remote}"', pypi_step)
+        self.assertIn('test "${sdist_local}" = "${sdist_remote}"', pypi_step)
+        self.assertEqual(
+            publish_step["uses"], "pypa/gh-action-pypi-publish@release/v1"
+        )
+        self.assertEqual(publish_step["with"]["packages-dir"], "dist/packages/")
+        self.assertNotIn("PYPI_API_TOKEN", str(publish))
+        self.assertLess(
+            step_names.index("Build wheel and source distribution once"),
+            step_names.index("Verify tag, filenames, and checksums"),
+        )
+        self.assertLess(
+            step_names.index("Verify tag, filenames, and checksums"),
+            step_names.index("Create or verify the release tag"),
+        )
+        self.assertLess(
+            step_names.index("Create or verify the release tag"),
+            step_names.index("Create or verify immutable GitHub Release"),
+        )
+        self.assertLess(
+            step_names.index("Create or verify immutable GitHub Release"),
+            step_names.index("Publish with PyPI Trusted Publishing"),
+        )
+
+    def test_release_workflow_fans_out_after_every_main_push(self):
+        workflow = self.release_workflow()
+        triggers = workflow.get("on", workflow.get(True))
+        fanout = workflow["jobs"]["reconcile-open-prs"]
+        reconcile = self.release_step(
+            workflow, "reconcile-open-prs", "Reconcile every eligible open pull request"
+        )["run"]
+
+        self.assertEqual(triggers, {"push": {"branches": ["main"]}})
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        self.assertEqual(
+            set(workflow["jobs"]), {"detect", "publish", "reconcile-open-prs"}
+        )
+        self.assertEqual(
+            fanout["permissions"],
+            {
+                "actions": "write",
+                "contents": "read",
+                "pull-requests": "read",
+            },
+        )
+        self.assertIn(
+            'pulls?state=open&base=main&per_page=100',
+            reconcile,
+        )
+        self.assertIn('.state == "open"', reconcile)
+        self.assertIn('.base.ref == "main"', reconcile)
+        self.assertIn(
+            'repository_id="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .id)"',
+            reconcile,
+        )
+        self.assertIn('--argjson repo_id "${repository_id}"', reconcile)
+        self.assertIn(".base.repo.id == $repo_id", reconcile)
+        self.assertIn(".head.repo.id == $repo_id", reconcile)
+        self.assertIn('.head.ref == "develop"', reconcile)
+        self.assertIn('.head.ref | startswith("hotfix/")', reconcile)
+
+    def test_release_workflow_fans_out_when_publish_is_skipped_or_failed(self):
+        workflow = self.release_workflow()
+        fanout = workflow["jobs"]["reconcile-open-prs"]
+        condition = fanout["if"]
+
+        self.assertEqual(fanout["needs"], ["detect", "publish"])
+        self.assertIn("always()", condition)
+        self.assertIn("needs.detect.result == 'success'", condition)
+        self.assertIn("needs.detect.result == 'failure'", condition)
+        self.assertIn("needs.publish.result == 'success'", condition)
+        self.assertIn("needs.publish.result == 'skipped'", condition)
+        self.assertIn("needs.publish.result == 'failure'", condition)
+        self.assertNotIn("needs.detect.outputs.verdict", condition)
+
+    def test_release_workflow_dispatches_trusted_ref_and_pr_number(self):
+        workflow = self.release_workflow()
+        reconcile = self.release_step(
+            workflow, "reconcile-open-prs", "Reconcile every eligible open pull request"
+        )["run"]
+
+        self.assertIn(
+            'default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch)"',
+            reconcile,
+        )
+        self.assertIn(
+            'gh workflow run prepare-release.yml --repo "${GITHUB_REPOSITORY}"',
+            reconcile,
+        )
+        self.assertIn('--ref "${default_branch}"', reconcile)
+        self.assertIn('-f "pr_number=${pr_number}"', reconcile)
+        self.assertEqual(reconcile.count(" -f "), 1)
+        self.assertNotIn('--ref "${head_ref}"', reconcile)
+        self.assertNotIn("|| true", reconcile)
 
     def test_ci_can_be_redispatched_after_the_bot_updates_develop(self):
         workflow = yaml.safe_load(
