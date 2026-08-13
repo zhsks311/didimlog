@@ -15,17 +15,27 @@ def _write_json(stdout, payload: dict[str, object]) -> None:
         stdout.write(text.encode("utf-8"))
 
 
+def _repair_command(problems) -> str:
+    """Pick the single most specific repair, so one command fixes the most."""
+    setup_actions = [
+        problem.action
+        for problem in problems
+        if problem.action.endswith("didim setup")
+    ]
+    if not setup_actions:
+        return "didim index"
+    for action in setup_actions:
+        if action != "didim setup":
+            return action
+    return "didim setup"
+
+
 def _message(problems) -> str:
     lines = ["Didimlog 상태 확인에서 문제가 발견됐습니다."]
     lines.extend(
         "- {}: {}".format(problem.token, problem.impact) for problem in problems
     )
-    command = (
-        "didim setup"
-        if any(problem.action == "didim setup" for problem in problems)
-        else "didim index"
-    )
-    lines.append("수정: {}".format(command))
+    lines.append("수정: {}".format(_repair_command(problems)))
     return "\n".join(lines)
 
 

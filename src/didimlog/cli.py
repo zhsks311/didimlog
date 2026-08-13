@@ -447,12 +447,12 @@ def _index(args) -> int:
 
 
 def _status(args) -> int:
-    print(status_text(config=args.config_dir), end="")
+    print(status_text(cwd=Path.cwd(), config=args.config_dir), end="")
     return 0
 
 
 def _doctor(args) -> int:
-    code, text = doctor_text(config=args.config_dir)
+    code, text = doctor_text(cwd=Path.cwd(), config=args.config_dir)
     print(text, end="")
     return code
 
