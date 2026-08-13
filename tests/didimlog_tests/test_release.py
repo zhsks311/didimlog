@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -11,7 +12,9 @@ import yaml
 
 
 REPO = Path(__file__).resolve().parents[2]
-VERSION = "0.0.2"
+VERSION = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))[
+    "project"
+]["version"]
 DIST_ROOT = f"didimlog-{VERSION}"
 PUBLIC_SOURCE_FILES = {
     "CHANGELOG.md",
@@ -71,28 +74,129 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIn("didim --version", workflow)
         self.assertIn("permissions:\n  contents: read", workflow)
 
-    def test_release_uses_published_immutable_release_oidc_and_protected_environment(self):
+    def test_release_uses_main_push_oidc_and_protected_environment(self):
         workflow_text = (REPO / ".github/workflows/release.yml").read_text(
             encoding="utf-8"
         )
         workflow = yaml.safe_load(workflow_text)
         triggers = workflow.get("on", workflow.get(True))
 
-        self.assertEqual(triggers, {"release": {"types": ["published"]}})
+        self.assertEqual(triggers, {"push": {"branches": ["main"]}})
         self.assertEqual(workflow["permissions"], {"contents": "read"})
         for job in workflow["jobs"].values():
-            self.assertEqual(job.get("permissions", {}).get("contents", "read"), "read")
             self.assertFalse(self._contains_key(job, "password"))
+        self.assertEqual(
+            workflow["jobs"]["detect"].get("permissions", {}).get("contents", "read"),
+            "read",
+        )
 
         publish = workflow["jobs"]["publish"]
         self.assertEqual(publish["environment"]["name"], "pypi")
         self.assertEqual(publish["permissions"]["id-token"], "write")
         self.assertIn(".immutable", workflow_text)
-        self.assertIn("gh release download", workflow_text)
+        self.assertIn("gh release create", workflow_text)
         self.assertIn("pypa/gh-action-pypi-publish@release/v1", workflow_text)
         self.assertNotIn("PYPI_API_TOKEN", workflow_text)
 
-    def test_release_checksum_manifest_exactly_covers_wheel_and_sdist(self):
+    def test_release_guide_matches_reconciliation_and_delivery_workflows(self):
+        readme = (REPO / "README.md").read_text(encoding="utf-8")
+        release_guide = readme.split("### 릴리스", 1)[1].split("\n## ", 1)[0]
+        changelog = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
+        unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
+        reconcile = yaml.safe_load(
+            (REPO / ".github/workflows/prepare-release.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        delivery = yaml.safe_load(
+            (REPO / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        )
+        reconcile_triggers = reconcile.get("on", reconcile.get(True))
+        delivery_triggers = delivery.get("on", delivery.get(True))
+
+        self.assertEqual(
+            reconcile_triggers["pull_request_target"]["types"],
+            ["opened", "reopened", "synchronize", "labeled", "unlabeled"],
+        )
+        self.assertEqual(delivery_triggers, {"push": {"branches": ["main"]}})
+        self.assertIn("직접 적용해야 합니다", release_guide)
+        self.assertIn(
+            "workflow 파일만 병합해도 이 설정은 생기지 않습니다.",
+            release_guide,
+        )
+
+        final_check = next(
+            step["run"]
+            for step in reconcile["jobs"]["check-final"]["steps"]
+            if step.get("id") == "final-check"
+        )
+        check_name_match = re.search(r'"name": "([^"]+)"', final_check)
+        self.assertIsNotNone(check_name_match)
+        check_name = check_name_match.group(1)
+        self.assertEqual(check_name, "release-state")
+        self.assertIn('--head-sha "${FINAL_HEAD_SHA}"', final_check)
+        self.assertIn('"head_sha": $head_sha', final_check)
+        self.assertIn(f"`{check_name}` 통과를 필수", release_guide)
+        self.assertIn("현재 PR 커밋의 Git 이력", release_guide)
+        self.assertIn("바로 그 커밋", release_guide)
+        self.assertIn(
+            "최신 `main`을 반영해야 병합할 수 있도록",
+            release_guide,
+        )
+
+        classify = next(
+            step["run"]
+            for step in delivery["jobs"]["detect"]["steps"]
+            if step.get("name") == "Classify the immutable merge evidence"
+        )
+        self.assertIn("classify-merge", classify)
+        self.assertIn("두 부모를 가진 merge commit만", release_guide)
+        for unsupported_merge in ("squash", "rebase", "direct push"):
+            self.assertIn(unsupported_merge, release_guide)
+
+        reconcile_open_prs = delivery["jobs"]["reconcile-open-prs"]
+        self.assertEqual(reconcile_open_prs["needs"], ["detect", "publish"])
+        self.assertIn("준비 뒤 PR에 커밋을 추가하면", release_guide)
+        self.assertIn(
+            "이전 준비를 취소하고 새 커밋 기준으로 다시 준비",
+            release_guide,
+        )
+        self.assertIn("`main`이 전진", release_guide)
+        self.assertIn("최신 `main`을 반영할 때까지 기다립니다", release_guide)
+
+        hotfix_sync = delivery["jobs"]["sync-hotfix-to-develop"]
+        self.assertEqual(hotfix_sync["needs"], ["detect", "publish"])
+        self.assertIn("needs.publish.result == 'success'", hotfix_sync["if"])
+        self.assertIn("needs.detect.outputs.kind == 'hotfix'", hotfix_sync["if"])
+        sync_run = next(
+            step["run"]
+            for step in hotfix_sync["steps"]
+            if step.get("name") == "Sync published hotfix to develop"
+        )
+        self.assertIn('-f "base=develop"', sync_run)
+        self.assertIn('-f "head=main"', sync_run)
+        self.assertIn("patch 배포에 성공하면", release_guide)
+        self.assertIn(
+            "`hotfix/*` → `main` PR은 `release:patch`만 지원",
+            release_guide,
+        )
+        self.assertIn("`main` → `develop` 동기화 PR", release_guide)
+
+        unreleased_items = [
+            line for line in unreleased.splitlines() if line.startswith("- ")
+        ]
+        self.assertEqual(len(unreleased_items), 1)
+        for documented_outcome in (
+            "PR별로 준비·취소 기록",
+            "취소가 먼저 오든 병합이 먼저 오든",
+            "여러 릴리스 PR을 최신 기준으로 다시 계산",
+            "`main` → `develop` 동기화 PR",
+            "취소 과정은 후속 변경을 보존",
+            "hotfix 동기화는 한 번에 하나씩",
+        ):
+            self.assertIn(documented_outcome, unreleased_items[0])
+
+    def test_release_generates_a_verified_manifest_for_exactly_wheel_and_sdist(self):
         workflow = yaml.safe_load(
             (REPO / ".github/workflows/release.yml").read_text(encoding="utf-8")
         )
@@ -103,112 +207,46 @@ class ReleaseContractTests(unittest.TestCase):
         )
         wheel = f"didimlog-{VERSION}-py3-none-any.whl"
         sdist = f"didimlog-{VERSION}.tar.gz"
-        checksum = "0" * 64
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            packages = root / "packages"
-            verify = root / "verify"
-            binaries = root / "bin"
-            packages.mkdir()
-            verify.mkdir()
-            binaries.mkdir()
-            (packages / wheel).touch()
-            (packages / sdist).touch()
-
-            checksum_marker = root / "sha256sum-called"
-            fake_sha256sum = binaries / "sha256sum"
-            fake_sha256sum.write_text(
-                '#!/bin/sh\n'
-                'touch "$SHA256SUM_MARKER"\n'
-                "exit 0\n",
-                encoding="utf-8",
-            )
-            fake_sha256sum.chmod(0o755)
+            packages = root / "dist" / "packages"
+            packages.mkdir(parents=True)
+            (packages / wheel).write_bytes(b"wheel")
+            (packages / sdist).write_bytes(b"sdist")
             environment = os.environ.copy()
-            environment.update(
-                {
-                    "TAG": f"v{VERSION}",
-                    "PATH": f"{binaries}{os.pathsep}{environment['PATH']}",
-                    "SHA256SUM_MARKER": str(checksum_marker),
-                }
+            environment["VERSION"] = VERSION
+
+            complete = subprocess.run(
+                ["bash", "-c", verification_script],
+                cwd=root,
+                env=environment,
+                capture_output=True,
+                text=True,
             )
 
-            def run_verification(manifest: str):
-                (verify / "SHA256SUMS").write_text(
-                    manifest,
-                    encoding="utf-8",
-                )
-                checksum_marker.unlink(missing_ok=True)
-                result = subprocess.run(
-                    ["bash", "-e", "-c", verification_script],
-                    cwd=root,
-                    env=environment,
-                    capture_output=True,
-                    text=True,
-                )
-                return result, checksum_marker.exists()
-
-            complete, checked_complete = run_verification(
-                f"{checksum}  {wheel}\n{checksum}  {sdist}\n"
-            )
             self.assertEqual(complete.returncode, 0, complete.stderr)
-            self.assertTrue(checked_complete)
-
-            incomplete, checked_incomplete = run_verification(
-                f"{checksum}  {wheel}\n"
-            )
-            self.assertNotEqual(
-                incomplete.returncode,
-                0,
-                "verification accepted SHA256SUMS without the sdist",
-            )
-            self.assertFalse(
-                checked_incomplete,
-                "sha256sum --check ran before manifest coverage was rejected",
+            manifest = (root / "dist" / "SHA256SUMS").read_text(
+                encoding="ascii"
+            ).splitlines()
+            self.assertEqual(len(manifest), 2)
+            self.assertEqual(
+                {line.split("  ", 1)[1] for line in manifest},
+                {wheel, sdist},
             )
 
-            extra, checked_extra = run_verification(
-                f"{checksum}  {wheel}\n"
-                f"{checksum}  {sdist}\n"
-                f"{checksum}  unexpected-package.whl\n"
+            (packages / "unexpected-package.whl").touch()
+            extra = subprocess.run(
+                ["bash", "-c", verification_script],
+                cwd=root,
+                env=environment,
+                capture_output=True,
+                text=True,
             )
             self.assertNotEqual(
                 extra.returncode,
                 0,
-                "verification accepted an extra manifest entry",
-            )
-            self.assertFalse(
-                checked_extra,
-                "sha256sum --check ran before extra manifest data was rejected",
-            )
-
-            bsd_tagged, checked_bsd_tagged = run_verification(
-                f"{checksum}  {wheel}\n"
-                f"{checksum}  {sdist}\n"
-                f"SHA256 ({wheel}) = {checksum}\n"
-            )
-            self.assertNotEqual(
-                bsd_tagged.returncode,
-                0,
-                "verification accepted a BSD-style tagged duplicate checksum entry",
-            )
-            self.assertFalse(
-                checked_bsd_tagged,
-                "sha256sum --check ran before BSD-style manifest data was rejected",
-            )
-
-            malformed, checked_malformed = run_verification(
-                f"{checksum}  {wheel}\n{sdist}\n"
-            )
-            self.assertNotEqual(
-                malformed.returncode,
-                0,
-                "verification accepted a filename without a checksum",
-            )
-            self.assertFalse(
-                checked_malformed,
-                "sha256sum --check ran before malformed manifest data was rejected",
+                "verification accepted an unexpected package file",
             )
 
     @classmethod

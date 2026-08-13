@@ -1,0 +1,808 @@
+name: Reconcile release state
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Open pull request number to reconcile
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-reconcile-${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    if: github.event_name == 'pull_request_target' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      pr_number: ${{ steps.live-snapshot.outputs.pr_number }}
+      state: ${{ steps.live-snapshot.outputs.state }}
+      base_repo_id: ${{ steps.live-snapshot.outputs.base_repo_id }}
+      head_repo_id: ${{ steps.live-snapshot.outputs.head_repo_id }}
+      base_ref: ${{ steps.live-snapshot.outputs.base_ref }}
+      head_ref: ${{ steps.live-snapshot.outputs.head_ref }}
+      head_sha: ${{ steps.live-snapshot.outputs.head_sha }}
+      main_sha: ${{ steps.live-snapshot.outputs.main_sha }}
+      selection: ${{ steps.live-snapshot.outputs.selection }}
+      labels: ${{ steps.live-snapshot.outputs.labels }}
+      head_repo: ${{ steps.live-snapshot.outputs.head_repo }}
+      mutation_allowed: ${{ steps.live-snapshot.outputs.mutation_allowed }}
+      snapshot: ${{ steps.live-snapshot.outputs.snapshot }}
+    steps:
+      - name: Read and normalize the live pull request
+        id: live-snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+          DISPATCH_PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          if test "${EVENT_NAME}" = "workflow_dispatch"; then
+            pr_number="${DISPATCH_PR_NUMBER}"
+          else
+            pr_number="${EVENT_PR_NUMBER}"
+          fi
+          [[ "${pr_number}" =~ ^[1-9][0-9]*$ ]]
+
+          live_pr="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}")"
+          main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          snapshot="$(
+            jq -c --arg main_sha "${main_sha}" --arg repository "${GITHUB_REPOSITORY}" '
+              def normalized_selection:
+                [.labels[].name | select(test("^release:(none|patch|minor|major)$"))] as $choices
+                | [$choices[] | select(. != "release:none") | sub("^release:"; "")] as $bumps
+                | if ($bumps | length) > 1
+                    or (($choices | index("release:none")) != null and ($bumps | length) > 0)
+                  then "invalid"
+                  elif ($bumps | length) == 1 then $bumps[0]
+                  else "none"
+                  end;
+              {
+                pr_number: .number,
+                state: .state,
+                base_repo_id: .base.repo.id,
+                head_repo_id: .head.repo.id,
+                base_ref: .base.ref,
+                head_ref: .head.ref,
+                head_sha: .head.sha,
+                main_sha: $main_sha,
+                selection: normalized_selection,
+                labels: ([.labels[].name] | sort | unique),
+                head_repo: .head.repo.full_name,
+                mutation_allowed: (
+                  .state == "open"
+                  and .base.ref == "main"
+                  and .base.repo.full_name == $repository
+                  and .base.repo.id == .head.repo.id
+                  and (
+                    .head.ref == "develop"
+                    or (.head.ref | test("^hotfix/.+"))
+                  )
+                )
+              }
+            ' <<<"${live_pr}"
+          )"
+          snapshot="$(jq -Sc . <<<"${snapshot}")"
+
+          {
+            echo "pr_number=$(jq -r '.pr_number' <<<"${snapshot}")"
+            echo "state=$(jq -r '.state' <<<"${snapshot}")"
+            echo "base_repo_id=$(jq -r '.base_repo_id' <<<"${snapshot}")"
+            echo "head_repo_id=$(jq -r '.head_repo_id' <<<"${snapshot}")"
+            echo "base_ref=$(jq -r '.base_ref' <<<"${snapshot}")"
+            echo "head_ref=$(jq -r '.head_ref' <<<"${snapshot}")"
+            echo "head_sha=$(jq -r '.head_sha' <<<"${snapshot}")"
+            echo "main_sha=$(jq -r '.main_sha' <<<"${snapshot}")"
+            echo "selection=$(jq -r '.selection' <<<"${snapshot}")"
+            echo "labels=$(jq -c '.labels' <<<"${snapshot}")"
+            echo "head_repo=$(jq -r '.head_repo' <<<"${snapshot}")"
+            echo "mutation_allowed=$(jq -r '.mutation_allowed' <<<"${snapshot}")"
+            echo "snapshot=${snapshot}"
+          } >> "${GITHUB_OUTPUT}"
+
+  check-start:
+    needs: [snapshot]
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
+    outputs:
+      check_id: ${{ steps.start-check.outputs.check_id }}
+      head_sha: ${{ steps.start-check.outputs.head_sha }}
+    steps:
+      - name: Start release-state on the observed head
+        id: start-check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ needs.snapshot.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          payload="$(jq -n --arg head_sha "${HEAD_SHA}" '{
+            "name": "release-state",
+            "head_sha": $head_sha,
+            "status": "in_progress",
+            "output": {
+              "title": "Reconciling release state",
+              "summary": "The trusted workflow is reconciling labels and release files."
+            }
+          }')"
+          check_id="$(
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/check-runs" \
+              --input - --jq '.id' <<<"${payload}"
+          )"
+          echo "check_id=${check_id}" >> "${GITHUB_OUTPUT}"
+          echo "head_sha=${HEAD_SHA}" >> "${GITHUB_OUTPUT}"
+
+  compute:
+    needs: [snapshot, check-start]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      action: ${{ steps.compute-plan.outputs.action }}
+      changed: ${{ steps.compute-plan.outputs.changed }}
+      desired_ready: ${{ steps.compute-plan.outputs.desired_ready }}
+      artifact_name: ${{ steps.compute-plan.outputs.artifact_name }}
+      manifest_digest: ${{ steps.compute-plan.outputs.manifest_digest }}
+    steps:
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Compute trusted cancel and preparation patches
+        id: compute-plan
+        env:
+          TRUSTED_REF: ${{ github.event.repository.default_branch }}
+          PR_NUMBER: ${{ needs.snapshot.outputs.pr_number }}
+          BASE_REF: ${{ needs.snapshot.outputs.base_ref }}
+          HEAD_REF: ${{ needs.snapshot.outputs.head_ref }}
+          HEAD_SHA: ${{ needs.snapshot.outputs.head_sha }}
+          MAIN_SHA: ${{ needs.snapshot.outputs.main_sha }}
+          LABELS: ${{ needs.snapshot.outputs.labels }}
+          SNAPSHOT: ${{ needs.snapshot.outputs.snapshot }}
+        run: |
+          set -euo pipefail
+          readonly release_paths=(CHANGELOG.md pyproject.toml uv.lock)
+          rm -rf trusted pr-data artifact
+          mkdir trusted pr-data artifact
+
+          git -C trusted init
+          git -C trusted remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C trusted fetch --no-tags origin "+refs/heads/${TRUSTED_REF}:refs/remotes/origin/${TRUSTED_REF}"
+          git -C trusted cat-file -e "${GITHUB_WORKFLOW_SHA}^{commit}"
+          git -C trusted checkout --detach "${GITHUB_WORKFLOW_SHA}"
+          test -f trusted/.github/scripts/release.py
+
+          git -C pr-data init
+          git -C pr-data remote add base "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C pr-data fetch --no-tags base "+refs/heads/main:refs/remotes/base/main"
+          git -C pr-data fetch --no-tags base "+refs/pull/${PR_NUMBER}/head:refs/remotes/base/pr-head"
+          test "$(git -C pr-data rev-parse refs/remotes/base/main)" = "${MAIN_SHA}"
+          test "$(git -C pr-data rev-parse refs/remotes/base/pr-head)" = "${HEAD_SHA}"
+          git -C pr-data checkout --detach "${HEAD_SHA}"
+          git -C pr-data config core.hooksPath /dev/null
+
+          mapfile -t label_args < <(jq -r '.[] | "--label", .' <<<"${LABELS}")
+          python trusted/.github/scripts/release.py plan-reconcile \
+            --repo pr-data \
+            --base-sha "${MAIN_SHA}" \
+            --head-sha "${HEAD_SHA}" \
+            --pr-number "${PR_NUMBER}" \
+            --base-ref "${BASE_REF}" \
+            --head-ref "${HEAD_REF}" \
+            "${label_args[@]}" > artifact/plan.json
+
+          action="$(jq -r '.action' artifact/plan.json)"
+          desired_ready="$(jq -r '.desired_ready' artifact/plan.json)"
+          cancel_sha="$(jq -r '.cancel_preparation // empty' artifact/plan.json)"
+          prepare_selection="$(jq -r '.prepare_selection // empty' artifact/plan.json)"
+          cancel_manifest=null
+          prepare_manifest=null
+          version=""
+
+          if test -n "${cancel_sha}"; then
+            git -C pr-data revert --no-commit "${cancel_sha}"
+            git -C pr-data diff --binary HEAD -- "${release_paths[@]}" > artifact/cancel.patch
+            test -s artifact/cancel.patch
+            test "$(git -C pr-data diff --name-only | sort)" = "$(printf '%s\n' "${release_paths[@]}" | sort)"
+            git -C pr-data add -- "${release_paths[@]}"
+            cancel_tree="$(git -C pr-data write-tree)"
+            cancel_digest="$(sha256sum artifact/cancel.patch | cut -d ' ' -f 1)"
+            cancel_manifest="$(
+              jq -n --arg digest "${cancel_digest}" --arg preparation "${cancel_sha}" '{
+                file: "cancel.patch",
+                sha256: $digest,
+                preparation: $preparation,
+                paths: ["CHANGELOG.md", "pyproject.toml", "uv.lock"]
+              }'
+            )"
+          else
+            cancel_tree="$(git -C pr-data rev-parse 'HEAD^{tree}')"
+          fi
+
+          if test -n "${prepare_selection}"; then
+            (
+              cd pr-data
+              uv version --bump "${prepare_selection}"
+            )
+            version="$(python -c 'import tomllib; print(tomllib.load(open("pr-data/pyproject.toml", "rb"))["project"]["version"])')"
+            python trusted/.github/scripts/release.py prepare-changelog \
+              --path pr-data/CHANGELOG.md \
+              --version "${version}" \
+              --date "$(date -u +%F)"
+            (
+              cd pr-data
+              uv lock
+            )
+            git -C pr-data diff --binary "${cancel_tree}" -- "${release_paths[@]}" > artifact/prepare.patch
+            test -s artifact/prepare.patch
+            test "$(git -C pr-data diff --name-only "${cancel_tree}" | sort)" = "$(printf '%s\n' "${release_paths[@]}" | sort)"
+            prepare_digest="$(sha256sum artifact/prepare.patch | cut -d ' ' -f 1)"
+            prepare_manifest="$(
+              jq -n --arg digest "${prepare_digest}" --arg bump "${prepare_selection}" --arg version "${version}" '{
+                file: "prepare.patch",
+                sha256: $digest,
+                bump: $bump,
+                version: $version,
+                paths: ["CHANGELOG.md", "pyproject.toml", "uv.lock"]
+              }'
+            )"
+          fi
+
+          changed=false
+          if test "${cancel_manifest}" != null || test "${prepare_manifest}" != null; then
+            changed=true
+          fi
+          artifact_name="release-reconcile-${PR_NUMBER}-${HEAD_SHA}"
+          jq -nS \
+            --argjson snapshot "${SNAPSHOT}" \
+            --argjson plan "$(cat artifact/plan.json)" \
+            --argjson cancel "${cancel_manifest}" \
+            --argjson prepare "${prepare_manifest}" \
+            --arg artifact_name "${artifact_name}" \
+            '{
+              snapshot: $snapshot,
+              plan: $plan,
+              cancel: $cancel,
+              prepare: $prepare,
+              artifact_name: $artifact_name
+            }' > artifact/manifest.json
+          (
+            cd artifact
+            sha256sum manifest.json > manifest.sha256
+          )
+          manifest_digest="$(sha256sum artifact/manifest.json | cut -d ' ' -f 1)"
+          {
+            echo "action=${action}"
+            echo "changed=${changed}"
+            echo "desired_ready=${desired_ready}"
+            echo "artifact_name=${artifact_name}"
+            echo "manifest_digest=${manifest_digest}"
+          } >> "${GITHUB_OUTPUT}"
+      - name: Upload the immutable reconciliation plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.compute-plan.outputs.artifact_name }}
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 1
+
+  mutate:
+    needs: [snapshot, compute]
+    if: >-
+      needs.compute.result == 'success' &&
+      needs.compute.outputs.changed == 'true' &&
+      needs.snapshot.outputs.mutation_allowed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.mutate-branch.outputs.changed }}
+      final_head: ${{ steps.mutate-branch.outputs.final_head }}
+    steps:
+      - name: Create fresh trusted and exact-head checkouts
+        id: checkout-data
+        env:
+          TRUSTED_REF: ${{ github.event.repository.default_branch }}
+          PR_NUMBER: ${{ needs.snapshot.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.snapshot.outputs.head_sha }}
+          MAIN_SHA: ${{ needs.snapshot.outputs.main_sha }}
+        run: |
+          set -euo pipefail
+          rm -rf trusted work artifact
+          mkdir trusted work
+          git -C trusted init
+          git -C trusted remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C trusted fetch --no-tags origin "+refs/heads/${TRUSTED_REF}:refs/remotes/origin/${TRUSTED_REF}"
+          git -C trusted cat-file -e "${GITHUB_WORKFLOW_SHA}^{commit}"
+          git -C trusted checkout --detach "${GITHUB_WORKFLOW_SHA}"
+          test -f trusted/.github/scripts/release.py
+
+          git -C work init
+          git -C work remote add base "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C work fetch --no-tags base "+refs/heads/main:refs/remotes/base/main"
+          git -C work fetch --no-tags base "+refs/pull/${PR_NUMBER}/head:refs/remotes/base/pr-head"
+          test "$(git -C work rev-parse refs/remotes/base/main)" = "${MAIN_SHA}"
+          test "$(git -C work rev-parse refs/remotes/base/pr-head)" = "${HEAD_SHA}"
+          git -C work checkout --detach "${HEAD_SHA}"
+          git -C work config core.hooksPath /dev/null
+      - name: Download the computed plan
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.compute.outputs.artifact_name }}
+          path: artifact
+      - name: Validate manifest, snapshot, patch digests, and exact paths
+        id: validate-artifact
+        env:
+          EXPECTED_SNAPSHOT: ${{ needs.snapshot.outputs.snapshot }}
+          EXPECTED_MANIFEST_DIGEST: ${{ needs.compute.outputs.manifest_digest }}
+        run: |
+          set -euo pipefail
+          readonly expected_paths='["CHANGELOG.md","pyproject.toml","uv.lock"]'
+          (cd artifact && sha256sum --check manifest.sha256)
+          test "$(sha256sum artifact/manifest.json | cut -d ' ' -f 1)" = "${EXPECTED_MANIFEST_DIGEST}"
+          test "$(jq -Sc '.snapshot' artifact/manifest.json)" = "$(jq -Sc . <<<"${EXPECTED_SNAPSHOT}")"
+          test "$(jq -r '.artifact_name' artifact/manifest.json)" = "${{ needs.compute.outputs.artifact_name }}"
+
+          validate_patch() {
+            local section="$1"
+            local patch_file digest
+            patch_file="$(jq -r ".${section}.file" artifact/manifest.json)"
+            digest="$(jq -r ".${section}.sha256" artifact/manifest.json)"
+            test "$(jq -c ".${section}.paths | sort" artifact/manifest.json)" = "${expected_paths}"
+            test "$(sha256sum "artifact/${patch_file}" | cut -d ' ' -f 1)" = "${digest}"
+            mapfile -t patch_paths < <(
+              git -C work apply --numstat "../artifact/${patch_file}" \
+                | cut -f 3- \
+                | sort -u
+            )
+            test "$(printf '%s\n' "${patch_paths[@]}")" = "$(printf '%s\n' CHANGELOG.md pyproject.toml uv.lock)"
+            git -C work apply --check "../artifact/${patch_file}"
+          }
+
+          if test "$(jq -r '.cancel != null' artifact/manifest.json)" = true; then
+            validate_patch cancel
+            git -C work apply "../artifact/$(jq -r '.cancel.file' artifact/manifest.json)"
+          fi
+          if test "$(jq -r '.prepare != null' artifact/manifest.json)" = true; then
+            validate_patch prepare
+          fi
+          git -C work reset --hard "${{ needs.snapshot.outputs.head_sha }}"
+      - name: Build verified commits with hooks disabled
+        id: apply-commits
+        env:
+          PR_NUMBER: ${{ needs.snapshot.outputs.pr_number }}
+          HEAD_REF: ${{ needs.snapshot.outputs.head_ref }}
+          HEAD_SHA: ${{ needs.snapshot.outputs.head_sha }}
+          MAIN_SHA: ${{ needs.snapshot.outputs.main_sha }}
+        run: |
+          set -euo pipefail
+          readonly release_paths=(CHANGELOG.md pyproject.toml uv.lock)
+          expected_changed_paths="$(printf '%s\n' "${release_paths[@]}" | sort)"
+          readonly expected_changed_paths
+          git -C work config core.hooksPath /dev/null
+          git -C work config user.name "github-actions[bot]"
+          git -C work config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if test "$(jq -r '.cancel != null' artifact/manifest.json)" = true; then
+            cancel_file="$(jq -r '.cancel.file' artifact/manifest.json)"
+            cancel_sha="$(jq -r '.cancel.preparation' artifact/manifest.json)"
+            git -C work apply --index "../artifact/${cancel_file}"
+            test "$(git -C work diff --cached --name-only | sort)" = "${expected_changed_paths}"
+            git -C work commit \
+              -m "chore: cancel release preparation" \
+              -m "Didimlog-Release-Cancel: ${cancel_sha}"
+          fi
+
+          if test "$(jq -r '.prepare != null' artifact/manifest.json)" = true; then
+            prepare_file="$(jq -r '.prepare.file' artifact/manifest.json)"
+            bump="$(jq -r '.prepare.bump' artifact/manifest.json)"
+            version="$(jq -r '.prepare.version' artifact/manifest.json)"
+            if test "${HEAD_REF}" = develop; then
+              release_kind=develop
+            else
+              release_kind=hotfix
+            fi
+            git -C work apply --index "../artifact/${prepare_file}"
+            test "$(git -C work diff --cached --name-only | sort)" = "${expected_changed_paths}"
+            git -C work commit \
+              -m "chore: prepare ${version} release" \
+              -m "Didimlog-Release-Prep: v${version}
+          Didimlog-Release-Base: ${MAIN_SHA}
+          Didimlog-Release-Bump: ${bump}
+          Didimlog-Release-PR: ${PR_NUMBER}
+          Didimlog-Release-Kind: ${release_kind}"
+          fi
+
+          final_head="$(git -C work rev-parse HEAD)"
+          test "${final_head}" != "${HEAD_SHA}"
+          echo "final_head=${final_head}" >> "${GITHUB_OUTPUT}"
+      - name: Recheck live state and push one fast-forward update
+        id: mutate-branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.snapshot.outputs.pr_number }}
+          HEAD_REF: ${{ needs.snapshot.outputs.head_ref }}
+          HEAD_SHA: ${{ needs.snapshot.outputs.head_sha }}
+          MAIN_SHA: ${{ needs.snapshot.outputs.main_sha }}
+          EXPECTED_SNAPSHOT: ${{ needs.snapshot.outputs.snapshot }}
+          CANDIDATE_HEAD: ${{ steps.apply-commits.outputs.final_head }}
+        run: |
+          set -euo pipefail
+          final_head="$(git -C work rev-parse HEAD)"
+          test "${final_head}" = "${CANDIDATE_HEAD}"
+          live_pr="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
+          live_main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          live_snapshot="$(
+            jq -c --arg main_sha "${live_main_sha}" --arg repository "${GITHUB_REPOSITORY}" '
+              def normalized_selection:
+                [.labels[].name | select(test("^release:(none|patch|minor|major)$"))] as $choices
+                | [$choices[] | select(. != "release:none") | sub("^release:"; "")] as $bumps
+                | if ($bumps | length) > 1
+                    or (($choices | index("release:none")) != null and ($bumps | length) > 0)
+                  then "invalid"
+                  elif ($bumps | length) == 1 then $bumps[0]
+                  else "none"
+                  end;
+              {
+                pr_number: .number,
+                state: .state,
+                base_repo_id: .base.repo.id,
+                head_repo_id: .head.repo.id,
+                base_ref: .base.ref,
+                head_ref: .head.ref,
+                head_sha: .head.sha,
+                main_sha: $main_sha,
+                selection: normalized_selection,
+                labels: ([.labels[].name] | sort | unique),
+                head_repo: .head.repo.full_name,
+                mutation_allowed: (
+                  .state == "open"
+                  and .base.ref == "main"
+                  and .base.repo.full_name == $repository
+                  and .base.repo.id == .head.repo.id
+                  and (.head.ref == "develop" or (.head.ref | test("^hotfix/.+")))
+                )
+              }
+            ' <<<"${live_pr}"
+          )"
+          live_snapshot="$(jq -Sc . <<<"${live_snapshot}")"
+          expected_snapshot="$(jq -Sc . <<<"${EXPECTED_SNAPSHOT}")"
+          test "${live_snapshot}" = "${expected_snapshot}"
+
+          git -C work remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git -C work push origin "HEAD:refs/heads/${HEAD_REF}"
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+          echo "final_head=${final_head}" >> "${GITHUB_OUTPUT}"
+
+  project-ready:
+    needs: [snapshot, compute, mutate]
+    if: >-
+      always() &&
+      needs.snapshot.result == 'success' &&
+      needs.compute.result == 'success' &&
+      (needs.mutate.result == 'success' || needs.mutate.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: read
+    outputs:
+      final_head: ${{ steps.project-ready.outputs.final_head }}
+      desired_ready: ${{ steps.project-ready.outputs.desired_ready }}
+    steps:
+      - name: Project final prepared state to release-ready
+        id: project-ready
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRUSTED_REF: ${{ github.event.repository.default_branch }}
+          PR_NUMBER: ${{ needs.snapshot.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          rm -rf trusted final-data
+          mkdir trusted final-data
+          live_pr="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
+          final_head="$(jq -r '.head.sha' <<<"${live_pr}")"
+          head_ref="$(jq -r '.head.ref' <<<"${live_pr}")"
+          base_ref="$(jq -r '.base.ref' <<<"${live_pr}")"
+          main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          labels="$(jq -c '[.labels[].name] | sort | unique' <<<"${live_pr}")"
+
+          git -C trusted init
+          git -C trusted remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C trusted fetch --no-tags origin "+refs/heads/${TRUSTED_REF}:refs/remotes/origin/${TRUSTED_REF}"
+          git -C trusted checkout --detach "${GITHUB_WORKFLOW_SHA}"
+          git -C final-data init
+          git -C final-data remote add base "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C final-data fetch --no-tags base "+refs/heads/main:refs/remotes/base/main"
+          git -C final-data fetch --no-tags base "+refs/pull/${PR_NUMBER}/head:refs/remotes/base/pr-head"
+          test "$(git -C final-data rev-parse refs/remotes/base/main)" = "${main_sha}"
+          test "$(git -C final-data rev-parse refs/remotes/base/pr-head)" = "${final_head}"
+          git -C final-data checkout --detach "${final_head}"
+          mapfile -t label_args < <(jq -r '.[] | "--label", .' <<<"${labels}")
+          python trusted/.github/scripts/release.py check-pr \
+            --repo final-data \
+            --base-sha "${main_sha}" \
+            --head-sha "${final_head}" \
+            --pr-number "${PR_NUMBER}" \
+            --base-ref "${base_ref}" \
+            --head-ref "${head_ref}" \
+            "${label_args[@]}" > check.json
+          desired_ready="$(jq -r '.["desired_ready"]' check.json)"
+          verdict="$(jq -r '.verdict' check.json)"
+          has_ready="$(jq -r '[.labels[].name == "release:ready"] | any' <<<"${live_pr}")"
+          eligible_projection="$(
+            jq -r --arg repository "${GITHUB_REPOSITORY}" '
+              .state == "open"
+              and .base.ref == "main"
+              and .base.repo.full_name == $repository
+              and .base.repo.id == .head.repo.id
+              and (.head.ref == "develop" or (.head.ref | test("^hotfix/.+")))
+            ' <<<"${live_pr}"
+          )"
+
+          if test "${eligible_projection}" = true && test "${desired_ready}" = true && test "${verdict}" = PASS; then
+            if test "${has_ready}" != true; then
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels" -f 'labels[]=release:ready'
+            fi
+          elif test "${eligible_projection}" = true && test "${has_ready}" = true; then
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/release%3Aready"
+          fi
+          if test "${eligible_projection}" != true; then
+            desired_ready=false
+          fi
+          echo "final_head=${final_head}" >> "${GITHUB_OUTPUT}"
+          echo "desired_ready=${desired_ready}" >> "${GITHUB_OUTPUT}"
+
+  dispatch-ci:
+    needs: [snapshot, mutate, project-ready]
+    if: >-
+      always() &&
+      needs.mutate.result == 'success' &&
+      needs.mutate.outputs.changed == 'true' &&
+      needs.project-ready.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Dispatch CI for the exact mutated head ref
+        id: dispatch-ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ needs.snapshot.outputs.head_ref }}
+          FINAL_HEAD: ${{ needs.mutate.outputs.final_head }}
+        run: |
+          set -euo pipefail
+          remote_head="$(
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${HEAD_REF}" --jq '.object.sha'
+          )"
+          test "${remote_head}" = "${FINAL_HEAD}"
+          test "${FINAL_HEAD}" = "${{ needs.mutate.outputs.final_head }}"
+          gh workflow run ci.yml --ref "${HEAD_REF}"
+
+  check-final:
+    needs:
+      [snapshot, check-start, compute, mutate, project-ready, dispatch-ci]
+    if: always() && needs.snapshot.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check and publish release-state on the exact final head
+        id: final-check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRUSTED_REF: ${{ github.event.repository.default_branch }}
+          PR_NUMBER: ${{ needs.snapshot.outputs.pr_number }}
+          START_CHECK_ID: ${{ needs.check-start.outputs.check_id }}
+          START_HEAD_SHA: ${{ needs.snapshot.outputs.head_sha }}
+          COMPUTE_RESULT: ${{ needs.compute.result }}
+          MUTATE_RESULT: ${{ needs.mutate.result }}
+          PROJECT_RESULT: ${{ needs.project-ready.result }}
+          DISPATCH_RESULT: ${{ needs.dispatch-ci.result }}
+        run: |
+          set -euo pipefail
+          finalized=false
+          active_check_id="${START_CHECK_ID}"
+          active_head_sha="${START_HEAD_SHA}"
+          failure_head_sha="${START_HEAD_SHA}"
+          finalize_release_state_on_exit() {
+            exit_status=$?
+            trap - EXIT
+            if test "${finalized}" = true; then
+              exit "${exit_status}"
+            fi
+            if test "${exit_status}" -eq 0; then
+              exit_status=1
+            fi
+            set +e
+            failure_payload="$(jq -n '{
+              "status": "completed",
+              "conclusion": "failure",
+              "output": {
+                "title": "Release state reconciliation failed",
+                "summary": "The trusted workflow stopped before final verification completed. Rerun reconciliation."
+              }
+            }')"
+            if test -n "${active_check_id}"; then
+              gh api --method PATCH \
+                "repos/${GITHUB_REPOSITORY}/check-runs/${active_check_id}" \
+                --input - <<<"${failure_payload}"
+            fi
+            if test -n "${failure_head_sha}" && {
+              test -z "${active_check_id}" || test "${active_head_sha}" != "${failure_head_sha}"
+            }; then
+              new_failure_payload="$(jq -n --arg head_sha "${failure_head_sha}" '{
+                "name": "release-state",
+                "head_sha": $head_sha,
+                "status": "completed",
+                "conclusion": "failure",
+                "output": {
+                  "title": "Release state reconciliation failed",
+                  "summary": "The trusted workflow stopped before final verification completed. Rerun reconciliation."
+                }
+              }')"
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/check-runs" \
+                --input - <<<"${new_failure_payload}"
+            fi
+            exit "${exit_status}"
+          }
+          trap finalize_release_state_on_exit EXIT
+          rm -rf trusted final-data
+          mkdir trusted
+          git -C trusted init
+          git -C trusted remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C trusted fetch --no-tags origin "+refs/heads/${TRUSTED_REF}:refs/remotes/origin/${TRUSTED_REF}"
+          git -C trusted checkout --detach "${GITHUB_WORKFLOW_SHA}"
+
+          read_live_snapshot() {
+            live_pr="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
+            live_main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+            jq -Sc --arg main_sha "${live_main_sha}" '{
+              pr_number: .number,
+              state: .state,
+              base_repo_id: .base.repo.id,
+              head_repo_id: .head.repo.id,
+              base_ref: .base.ref,
+              head_ref: .head.ref,
+              head_sha: .head.sha,
+              main_sha: $main_sha,
+              selection_labels: ([.labels[].name | select(test("^release:(none|patch|minor|major)$"))] | sort | unique),
+              labels: ([.labels[].name] | sort | unique)
+            }' <<<"${live_pr}"
+          }
+
+          evaluate_snapshot() {
+            local snapshot="$1"
+            FINAL_HEAD_SHA="$(jq -r '.head_sha' <<<"${snapshot}")"
+            FINAL_MAIN_SHA="$(jq -r '.main_sha' <<<"${snapshot}")"
+            final_base_ref="$(jq -r '.base_ref' <<<"${snapshot}")"
+            final_head_ref="$(jq -r '.head_ref' <<<"${snapshot}")"
+            final_labels="$(jq -c '.labels' <<<"${snapshot}")"
+            rm -rf final-data
+            mkdir final-data
+            git -C final-data init
+            git -C final-data remote add base "https://github.com/${GITHUB_REPOSITORY}.git"
+            git -C final-data fetch --no-tags base "+refs/heads/main:refs/remotes/base/main"
+            git -C final-data fetch --no-tags base "+refs/pull/${PR_NUMBER}/head:refs/remotes/base/pr-head"
+            test "$(git -C final-data rev-parse refs/remotes/base/main)" = "${FINAL_MAIN_SHA}"
+            test "$(git -C final-data rev-parse refs/remotes/base/pr-head)" = "${FINAL_HEAD_SHA}"
+            git -C final-data checkout --detach "${FINAL_HEAD_SHA}"
+            mapfile -t label_args < <(jq -r '.[] | "--label", .' <<<"${final_labels}")
+            python trusted/.github/scripts/release.py check-pr \
+              --repo final-data \
+              --base-sha "${FINAL_MAIN_SHA}" \
+              --head-sha "${FINAL_HEAD_SHA}" \
+              --pr-number "${PR_NUMBER}" \
+              --base-ref "${final_base_ref}" \
+              --head-ref "${final_head_ref}" \
+              "${label_args[@]}" > final-check.json
+          }
+
+          stable=false
+          for _ in 1 2; do
+            evaluated_snapshot="$(read_live_snapshot)"
+            evaluate_snapshot "${evaluated_snapshot}"
+            confirmed_snapshot="$(read_live_snapshot)"
+            if test "${evaluated_snapshot}" = "${confirmed_snapshot}"; then
+              stable=true
+              break
+            fi
+          done
+
+          if test "${stable}" != true; then
+            FINAL_HEAD_SHA="$(jq -r '.head_sha' <<<"${confirmed_snapshot}")"
+            check_verdict=FAIL
+            action_message="The pull request changed during final verification. Reconciliation will run again for the new head."
+          else
+            check_verdict="$(jq -r '.verdict' final-check.json)"
+            action_message="$(jq -r '.action_message' final-check.json)"
+          fi
+          failure_head_sha="${FINAL_HEAD_SHA}"
+          if test "${stable}" = true; then
+            final_state="$(jq -r '.state' <<<"${evaluated_snapshot}")"
+          else
+            final_state="$(jq -r '.state' <<<"${confirmed_snapshot}")"
+          fi
+          if test "${final_state}" != open; then
+            check_verdict=FAIL
+            action_message="The pull request is not open. Reopen it before reconciling release state."
+          fi
+
+          pipeline_ok=true
+          test "${COMPUTE_RESULT}" = success || pipeline_ok=false
+          test "${MUTATE_RESULT}" = success || test "${MUTATE_RESULT}" = skipped || pipeline_ok=false
+          test "${PROJECT_RESULT}" = success || pipeline_ok=false
+          test "${DISPATCH_RESULT}" = success || test "${DISPATCH_RESULT}" = skipped || pipeline_ok=false
+          if test "${check_verdict}" = PASS && test "${pipeline_ok}" = true && test "${stable}" = true; then
+            conclusion=success
+          else
+            conclusion=failure
+          fi
+
+          if test -n "${START_CHECK_ID}" && test "${START_HEAD_SHA}" != "${FINAL_HEAD_SHA}"; then
+            old_payload="$(jq -n '{
+              "status": "completed",
+              "conclusion": "failure",
+              "output": {
+                "title": "Release state moved to a new head",
+                "summary": "This head is no longer current. A new release-state check was created for the latest head."
+              }
+            }')"
+            gh api --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/check-runs/${START_CHECK_ID}" \
+              --input - <<<"${old_payload}"
+            active_check_id=""
+            active_head_sha=""
+          fi
+
+          if test -n "${START_CHECK_ID}" && test "${START_HEAD_SHA}" = "${FINAL_HEAD_SHA}"; then
+            final_check_id="${START_CHECK_ID}"
+          else
+            new_payload="$(jq -n --arg head_sha "${FINAL_HEAD_SHA}" '{
+              "name": "release-state",
+              "head_sha": $head_sha,
+              "status": "in_progress",
+              "output": {
+                "title": "Checking final release state",
+                "summary": "The trusted workflow is checking the latest pull request head."
+              }
+            }')"
+            final_check_id="$(
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/check-runs" \
+                --input - --jq '.id' <<<"${new_payload}"
+            )"
+          fi
+          active_check_id="${final_check_id}"
+          active_head_sha="${FINAL_HEAD_SHA}"
+
+          final_payload="$(jq -n \
+            --arg conclusion "${conclusion}" \
+            --arg summary "${action_message}" '{
+              "status": "completed",
+              "conclusion": $conclusion,
+              "output": {
+                "title": "Release state check complete",
+                "summary": $summary
+              }
+            }')"
+          gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/check-runs/${final_check_id}" \
+            --input - <<<"${final_payload}"
+          finalized=true
+          trap - EXIT

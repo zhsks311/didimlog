@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from didimlog import cli
+from didimlog import cli, version as didimlog_version
 from didimlog.errors import DidimError, EXIT_GIT
 from didimlog.personal.lesson_writing import LessonSecret
 from didimlog.project.capture import CaptureRequest
@@ -732,7 +732,7 @@ class InstalledConsoleScriptTests(unittest.TestCase):
         )
 
         self.assertEqual(version.returncode, 0)
-        self.assertEqual(version.stdout, "Didimlog 0.0.2\n")
+        self.assertEqual(version.stdout, f"Didimlog {didimlog_version()}\n")
         self.assertEqual(help_result.returncode, 0)
         self.assertIn("didim setup", help_result.stdout)
 

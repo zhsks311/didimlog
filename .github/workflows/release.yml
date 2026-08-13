@@ -1,59 +1,363 @@
-name: Publish verified release to PyPI
+name: Publish prepared main release
 
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
 
 permissions:
   contents: read
 
+
 jobs:
+  detect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      verdict: ${{ steps.classify.outputs.verdict }}
+      version: ${{ steps.classify.outputs.version }}
+      kind: ${{ steps.classify.outputs.kind }}
+      reason: ${{ steps.classify.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify the immutable merge evidence
+        id: classify
+        run: |
+          set -euo pipefail
+          result="$(python .github/scripts/release.py classify-merge --repo . --merge-sha "${GITHUB_SHA}")"
+          verdict="$(jq -er '.verdict' <<<"${result}")"
+          version="$(jq -r '.version // ""' <<<"${result}")"
+          kind="$(jq -r '.kind // ""' <<<"${result}")"
+          reason="$(jq -er '.reason' <<<"${result}")"
+          {
+            echo "verdict=${verdict}"
+            echo "version=${version}"
+            echo "kind=${kind}"
+            echo "reason=${reason}"
+          } >> "${GITHUB_OUTPUT}"
+
+          case "${verdict}" in
+            PUBLISH)
+              ;;
+            NO_RELEASE)
+              ;;
+            ERROR)
+              echo "Release classification failed: ${reason}" >&2
+              exit 1
+              ;;
+            *)
+              echo "Unknown release classification: ${verdict}" >&2
+              exit 1
+              ;;
+          esac
+
   publish:
-    if: startsWith(github.event.release.tag_name, 'v')
+    needs: detect
+    if: needs.detect.outputs.verdict == 'PUBLISH'
+    concurrency:
+      group: publish-release-${{ needs.detect.outputs.version }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/p/didimlog
     permissions:
-      contents: read
-      id-token: write
       attestations: write
+      contents: write
+      id-token: write
+    env:
+      TAG: v${{ needs.detect.outputs.version }}
+      VERSION: ${{ needs.detect.outputs.version }}
     steps:
-      - name: Require an immutable published release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_ID: ${{ github.event.release.id }}
-          REPOSITORY: ${{ github.repository }}
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Test the exact release commit
         run: |
-          immutable="$(gh api "repos/${REPOSITORY}/releases/${RELEASE_ID}" --jq '.immutable')"
-          test "${immutable}" = "true"
-      - name: Download the preserved package and checksums
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          TAG: ${{ github.event.release.tag_name }}
-        run: |
-          mkdir packages verify
-          gh release download "${TAG}" --repo "${REPOSITORY}" --pattern 'didimlog-*.whl' --pattern 'didimlog-*.tar.gz' --dir packages
-          gh release download "${TAG}" --repo "${REPOSITORY}" --pattern 'SHA256SUMS' --dir verify
+          uv sync --locked --python 3.13
+          uv run --project . python -m unittest discover -s tests -v
+      - name: Build wheel and source distribution once
+        run: uv build --out-dir dist/packages
       - name: Verify tag, filenames, and checksums
-        env:
-          TAG: ${{ github.event.release.tag_name }}
         run: |
-          set -o pipefail
-          version="${TAG#v}"
-          wheel_filename="didimlog-${version}-py3-none-any.whl"
-          sdist_filename="didimlog-${version}.tar.gz"
-          test -f "packages/${wheel_filename}"
-          test -f "packages/${sdist_filename}"
-          test "$(find packages -type f | wc -l)" -eq 2
-          expected_filenames="$(printf '%s\n' "${wheel_filename}" "${sdist_filename}" | sort)"
-          manifest_filenames="$(awk 'length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ && NF == 2 && (substr($0, 65, 2) == "  " || substr($0, 65, 2) == " *") { print substr($0, 67); next } { exit 1 }' verify/SHA256SUMS | sort)"
-          test "${manifest_filenames}" = "${expected_filenames}"
-          cd packages
-          sha256sum --strict --check ../verify/SHA256SUMS
+          set -euo pipefail
+          wheel="didimlog-${VERSION}-py3-none-any.whl"
+          sdist="didimlog-${VERSION}.tar.gz"
+          test -f "dist/packages/${wheel}"
+          test -f "dist/packages/${sdist}"
+          test "$(find dist/packages -type f | wc -l)" -eq 2
+          (
+            cd dist/packages
+            sha256sum "${wheel}" "${sdist}" > ../SHA256SUMS
+            sha256sum --strict --check ../SHA256SUMS
+          )
+      - name: Check whether PyPI already has the exact files
+        id: pypi
+        run: |
+          set -euo pipefail
+          response="${RUNNER_TEMP}/pypi.json"
+          status="$(curl --silent --output "${response}" --write-out '%{http_code}' "https://pypi.org/pypi/didimlog/${VERSION}/json")"
+          if test "${status}" = "404"; then
+            echo "published=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          test "${status}" = "200"
+          wheel="didimlog-${VERSION}-py3-none-any.whl"
+          sdist="didimlog-${VERSION}.tar.gz"
+          wheel_local="$(sha256sum "dist/packages/${wheel}" | cut -d ' ' -f 1)"
+          sdist_local="$(sha256sum "dist/packages/${sdist}" | cut -d ' ' -f 1)"
+          wheel_remote="$(jq -er --arg name "${wheel}" '.urls[] | select(.filename == $name) | .digests.sha256' "${response}")"
+          sdist_remote="$(jq -er --arg name "${sdist}" '.urls[] | select(.filename == $name) | .digests.sha256' "${response}")"
+          test "${wheel_local}" = "${wheel_remote}"
+          test "${sdist_local}" = "${sdist_remote}"
+          expected_files="$(printf '%s\n' "${wheel}" "${sdist}" | sort)"
+          actual_files="$(jq -r '[.urls[].filename] | sort | .[]' "${response}")"
+          test "${actual_files}" = "${expected_files}"
+          echo "published=true" >> "${GITHUB_OUTPUT}"
+      - name: Create or verify the release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh auth setup-git
+          git fetch origin "refs/tags/${TAG}:refs/tags/${TAG}" 2>/dev/null || true
+          if git show-ref --verify --quiet "refs/tags/${TAG}"; then
+            test "$(git rev-list -n 1 "${TAG}")" = "${GITHUB_SHA}"
+          else
+            git tag "${TAG}" "${GITHUB_SHA}"
+            git push origin "${TAG}"
+          fi
+      - name: Create or verify immutable GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          wheel="didimlog-${VERSION}-py3-none-any.whl"
+          sdist="didimlog-${VERSION}.tar.gz"
+          expected_assets="$(printf '%s\n' "${wheel}" "${sdist}" SHA256SUMS | sort)"
+          notes="${RUNNER_TEMP}/release-notes.md"
+          awk -v heading="## [${VERSION}]" '
+            index($0, heading) == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > "${notes}"
+          test -s "${notes}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")"
+            draft="$(jq -r '.draft' <<<"${release}")"
+            immutable="$(jq -r '.immutable' <<<"${release}")"
+            test "${draft}" = "true" || test "${immutable}" = "true"
+            draft_assets="$(jq -r '[.assets[].name] | sort | .[]' <<<"${release}")"
+            test "${draft_assets}" = "${expected_assets}"
+            assets="${RUNNER_TEMP}/release-assets"
+            mkdir "${assets}"
+            gh release download "${TAG}" --pattern "${wheel}" --pattern "${sdist}" --pattern SHA256SUMS --dir "${assets}"
+            cmp "dist/packages/${wheel}" "${assets}/${wheel}"
+            cmp "dist/packages/${sdist}" "${assets}/${sdist}"
+            cmp "dist/SHA256SUMS" "${assets}/SHA256SUMS"
+          else
+            gh release create "${TAG}" \
+              "dist/packages/${wheel}" \
+              "dist/packages/${sdist}" \
+              "dist/SHA256SUMS" \
+              --draft \
+              --verify-tag \
+              --title "Didimlog ${VERSION}" \
+              --notes-file "${notes}"
+            draft=true
+          fi
+          if test "${draft}" = "true"; then
+            gh release edit "${TAG}" --draft=false
+          fi
+          release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")"
+          immutable="$(jq -r '.immutable' <<<"${release}")"
+          actual_assets="$(jq -r '[.assets[].name] | sort | .[]' <<<"${release}")"
+          test "${immutable}" = "true"
+          test "${actual_assets}" = "${expected_assets}"
       - name: Publish with PyPI Trusted Publishing
+        if: steps.pypi.outputs.published != 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: packages/
+          packages-dir: dist/packages/
           attestations: true
+
+  sync-hotfix-to-develop:
+    needs: [detect, publish]
+    if: >-
+      ${{
+        needs.publish.result == 'success' &&
+        needs.detect.outputs.kind == 'hotfix'
+      }}
+    concurrency:
+      group: sync-hotfix-to-develop
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      VERSION: ${{ needs.detect.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Sync published hotfix to develop
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh auth setup-git
+          git config core.hooksPath "/dev/null"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch --no-tags origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/heads/develop:refs/remotes/origin/develop"
+          develop_base_oid="$(git rev-parse origin/develop)"
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "Deployed commit is not contained in the latest main branch" >&2
+            exit 1
+          fi
+          if git merge-base --is-ancestor origin/main origin/develop; then
+            echo "Latest main is already included in develop"
+            exit 0
+          fi
+
+          git switch -C hotfix-sync origin/develop
+          if git merge --no-ff --no-edit origin/main; then
+            git fetch --no-tags origin \
+              "+refs/heads/develop:refs/remotes/origin/develop"
+            remote_develop_oid="$(git rev-parse origin/develop)"
+            if test "${remote_develop_oid}" = "${develop_base_oid}"; then
+              if git push origin HEAD:refs/heads/develop; then
+                echo "Merged the published hotfix into develop"
+                exit 0
+              fi
+            else
+              echo "Develop advanced before the direct hotfix sync push"
+            fi
+          else
+            git merge --abort
+          fi
+
+          git fetch --no-tags origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/heads/develop:refs/remotes/origin/develop"
+          main_oid="$(git rev-parse origin/main)"
+          develop_oid="$(git rev-parse origin/develop)"
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" "${main_oid}"; then
+            echo "Deployed commit is not contained in the refreshed main branch" >&2
+            exit 1
+          fi
+          if git merge-base --is-ancestor "${main_oid}" "${develop_oid}"; then
+            echo "Latest main was included in develop while direct sync was attempted"
+            exit 0
+          fi
+
+          repository_id="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .id)"
+          pull_requests="$(
+            gh api --paginate --slurp \
+              "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=develop&head=${GITHUB_REPOSITORY_OWNER}%3Amain&per_page=100"
+          )"
+          if ! jq -e \
+            --argjson repo_id "${repository_id}" \
+            --arg main_oid "${main_oid}" \
+            'all(.[][];
+              .state == "open" and
+              .base.repo.id == $repo_id and
+              .head.repo.id == $repo_id and
+              .base.ref == "develop" and
+              .head.ref == "main" and
+              .head.sha == $main_oid
+            )' <<<"${pull_requests}" >/dev/null; then
+            echo "Refusing a hotfix sync PR with mismatched repository, ref, or head OID" >&2
+            exit 1
+          fi
+
+          candidate_count="$(jq -er '[.[][]] | length' <<<"${pull_requests}")"
+          title="Sync hotfix ${VERSION} from main to develop"
+          body="$(
+            printf '%s\n\n%s\n%s\n' \
+              "Sync published hotfix ${VERSION} from \`main\` to \`develop\`." \
+              "Deployed commit: \`${GITHUB_SHA}\`" \
+              "Current main: \`${main_oid}\`"
+          )"
+          case "${candidate_count}" in
+            0)
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/pulls" \
+                -f "title=${title}" \
+                -f "body=${body}" \
+                -f "head=main" \
+                -f "base=develop" >/dev/null
+              ;;
+            1)
+              pr_number="$(jq -er '.[][] | .number' <<<"${pull_requests}")"
+              gh api --method PATCH \
+                "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" \
+                -f "title=${title}" \
+                -f "body=${body}" >/dev/null
+              ;;
+            *)
+              echo "Refusing ambiguous hotfix sync PR candidates" >&2
+              exit 1
+              ;;
+          esac
+
+  reconcile-open-prs:
+    needs: [detect, publish]
+    if: >-
+      ${{
+        always() &&
+        (needs.detect.result == 'success' || needs.detect.result == 'failure') &&
+        (
+          needs.publish.result == 'success' ||
+          needs.publish.result == 'skipped' ||
+          needs.publish.result == 'failure'
+        )
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Reconcile every eligible open pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch)"
+          repository_id="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .id)"
+
+          pull_requests="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=main&per_page=100")"
+          pr_numbers="${RUNNER_TEMP}/release-pr-numbers"
+          jq -r --argjson repo_id "${repository_id}" '
+
+            .[][] |
+            select(
+              .state == "open" and
+              .base.ref == "main" and
+              .base.repo.id == $repo_id and
+              .head.repo.id == $repo_id and
+              (
+                .head.ref == "develop" or
+                (.head.ref | startswith("hotfix/"))
+              )
+            ) |
+            .number
+          ' <<<"${pull_requests}" > "${pr_numbers}"
+          while IFS= read -r pr_number; do
+            gh workflow run prepare-release.yml --repo "${GITHUB_REPOSITORY}" \
+              --ref "${default_branch}" \
+              -f "pr_number=${pr_number}"
+          done < "${pr_numbers}"
