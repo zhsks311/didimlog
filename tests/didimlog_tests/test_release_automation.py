@@ -1790,71 +1790,313 @@ class ReleaseAutomationTests(unittest.TestCase):
             self.assertEqual(changelog.read_text(encoding="utf-8"), original)
 
 
-    def test_release_label_workflow_prepares_and_reverts_one_release_commit(self):
+    def reconcile_workflow(self):
         workflow_path = REPO / ".github" / "workflows" / "prepare-release.yml"
         self.assertTrue(workflow_path.is_file())
-        workflow_text = workflow_path.read_text(encoding="utf-8")
-        workflow = yaml.safe_load(workflow_text)
+        return yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+
+    def reconcile_step(self, workflow, job_name, step_id):
+        return next(
+            step
+            for step in workflow["jobs"][job_name]["steps"]
+            if step.get("id") == step_id
+        )
+
+    def test_reconcile_workflow_accepts_all_pr_events_and_pr_number_dispatch(self):
+        workflow = self.reconcile_workflow()
         triggers = workflow.get("on", workflow.get(True))
 
         self.assertEqual(
-            triggers,
-            {
-                "pull_request_target": {"types": ["labeled", "unlabeled"]},
-                "push": {"branches": ["main"]},
-                "workflow_dispatch": None,
-            },
+            triggers["pull_request_target"]["types"],
+            ["opened", "reopened", "synchronize", "labeled", "unlabeled"],
         )
-        self.assertEqual(workflow["permissions"], {"contents": "read"})
-        self.assertEqual(set(workflow["jobs"]), {"bootstrap-labels", "prepare", "cancel"})
-
-        prepare = workflow["jobs"]["prepare"]
         self.assertEqual(
-            prepare["permissions"],
+            triggers["workflow_dispatch"]["inputs"],
             {
-                "actions": "write",
-                "contents": "write",
-                "issues": "write",
-                "pull-requests": "write",
+                "pr_number": {
+                    "description": "Open pull request number to reconcile",
+                    "required": True,
+                    "type": "string",
+                }
             },
         )
-        self.assertIn("github.event.pull_request.base.ref == 'main'", prepare["if"])
-        self.assertIn("github.event.pull_request.head.ref == 'develop'", prepare["if"])
-        self.assertIn("github.event.pull_request.state == 'open'", prepare["if"])
-        for label in (
-            "release:none",
-            "release:patch",
-            "release:minor",
-            "release:major",
-            "release:ready",
-        ):
-            self.assertIn(f'gh label create "{label}"', workflow_text)
-        self.assertIn("uv version --bump", workflow_text)
-        self.assertIn("prepare-changelog", workflow_text)
-        self.assertIn("Didimlog-Release-Prep:", workflow_text)
-        self.assertIn("git push origin HEAD:develop", workflow_text)
-        self.assertIn("gh workflow run ci.yml --ref develop", workflow_text)
-        self.assertIn("release:ready", workflow_text)
-        self.assertIn("persist-credentials: false", workflow_text)
-        self.assertNotIn("GH_TOKEN: ${{ github.token }}\n    steps:", workflow_text)
+        self.assertEqual(set(triggers), {"pull_request_target", "workflow_dispatch"})
+        self.assertEqual(
+            set(workflow["jobs"]),
+            {
+                "snapshot",
+                "check-start",
+                "compute",
+                "mutate",
+                "project-ready",
+                "dispatch-ci",
+                "check-final",
+            },
+        )
+        self.assertNotIn("prepare", workflow["jobs"])
+        self.assertNotIn("cancel", workflow["jobs"])
 
-        cancel = workflow["jobs"]["cancel"]
-        self.assertIn("github.event.action == 'unlabeled'", cancel["if"])
-        self.assertIn("github.event.label.name == 'release:none'", cancel["if"])
-        self.assertIn("git revert", workflow_text)
-        self.assertIn("github.event.pull_request.state == 'open'", cancel["if"])
-        self.assertGreaterEqual(workflow_text.count('"OPEN"'), 2)
-        cancel_push = next(
-            step["run"]
-            for step in cancel["steps"]
-            if step.get("name") == "Push restoration and clear ready state"
+    def test_reconcile_workflow_serializes_each_pr_without_cancelling(self):
+        workflow = self.reconcile_workflow()
+        concurrency = workflow["concurrency"]
+        group = concurrency["group"]
+
+        self.assertFalse(concurrency["cancel-in-progress"])
+        self.assertIn("github.event_name == 'workflow_dispatch'", group)
+        self.assertIn("inputs.pr_number", group)
+        self.assertIn("github.event.pull_request.number", group)
+        self.assertIn(
+            "github.event_name == 'pull_request_target'",
+            workflow["jobs"]["snapshot"]["if"],
+        )
+        self.assertIn(
+            "github.event_name == 'workflow_dispatch'",
+            workflow["jobs"]["snapshot"]["if"],
+        )
+
+    def test_reconcile_workflow_uses_trusted_code_and_treats_head_as_data(self):
+        workflow = self.reconcile_workflow()
+        compute = workflow["jobs"]["compute"]
+        compute_plan = self.reconcile_step(workflow, "compute", "compute-plan")["run"]
+        mutate_branch = self.reconcile_step(
+            workflow, "mutate", "mutate-branch"
+        )["run"]
+
+        self.assertNotIn("environment", compute)
+        self.assertNotIn("secrets.", str(compute))
+        self.assertNotIn("github.token", str(compute))
+        self.assertIn('"${GITHUB_WORKFLOW_SHA}"', compute_plan)
+        self.assertIn('git -C trusted checkout --detach "${GITHUB_WORKFLOW_SHA}"', compute_plan)
+        self.assertIn('git -C pr-data checkout --detach "${HEAD_SHA}"', compute_plan)
+        self.assertIn("trusted/.github/scripts/release.py plan-reconcile", compute_plan)
+        self.assertIn("--repo pr-data", compute_plan)
+        self.assertIn("uv lock", compute_plan)
+        self.assertIn(
+            "readonly release_paths=(CHANGELOG.md pyproject.toml uv.lock)",
+            compute_plan,
+        )
+        self.assertIn(
+            'for release_path in "${release_paths[@]}"', compute_plan
+        )
+        self.assertIn(
+            'git -C pr-data rev-parse "${cancel_sha}^:${release_path}"',
+            compute_plan,
+        )
+        self.assertIn(
+            'git -C pr-data hash-object "${release_path}"', compute_plan
         )
         self.assertLess(
-            cancel_push.index("--json state"),
-            cancel_push.index("git push origin HEAD:develop"),
+            compute_plan.index('git -C pr-data revert --no-commit "${cancel_sha}"'),
+            compute_plan.index('git -C pr-data hash-object "${release_path}"'),
         )
-        self.assertIn("--remove-label \"release:ready\"", workflow_text)
-        self.assertNotIn("git push --force", workflow_text)
+        self.assertLess(
+            compute_plan.index('git -C pr-data hash-object "${release_path}"'),
+            compute_plan.index("artifact/cancel.patch"),
+        )
+        self.assertNotIn("uv sync", compute_plan)
+        self.assertNotIn("python -m unittest", compute_plan)
+        self.assertNotIn("uv build", compute_plan)
+        self.assertNotIn(".github/scripts/release.py", mutate_branch)
+        self.assertNotIn("uv ", mutate_branch)
+        self.assertNotIn("python ", mutate_branch)
+        self.assertNotIn("actions/", mutate_branch)
+
+    def test_reconcile_workflow_separates_compute_mutation_check_and_ci_permissions(self):
+        workflow = self.reconcile_workflow()
+        jobs = workflow["jobs"]
+
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        self.assertEqual(
+            jobs["snapshot"]["permissions"],
+            {"contents": "read", "pull-requests": "read"},
+        )
+        self.assertEqual(
+            jobs["check-start"]["permissions"],
+            {"checks": "write", "contents": "read", "pull-requests": "read"},
+        )
+        self.assertEqual(
+            jobs["compute"]["permissions"],
+            {"contents": "read", "pull-requests": "read"},
+        )
+        self.assertEqual(jobs["mutate"]["permissions"], {"contents": "write"})
+        self.assertEqual(
+            jobs["project-ready"]["permissions"],
+            {"issues": "write", "pull-requests": "read"},
+        )
+        self.assertEqual(
+            jobs["dispatch-ci"]["permissions"],
+            {"actions": "write", "contents": "read"},
+        )
+        self.assertEqual(
+            jobs["check-final"]["permissions"],
+            {"checks": "write", "contents": "read", "pull-requests": "read"},
+        )
+        self.assertEqual(jobs["check-start"]["needs"], ["snapshot"])
+        self.assertEqual(jobs["compute"]["needs"], ["snapshot", "check-start"])
+        self.assertEqual(jobs["mutate"]["needs"], ["snapshot", "compute"])
+        self.assertEqual(
+            jobs["project-ready"]["needs"], ["snapshot", "compute", "mutate"]
+        )
+        self.assertEqual(
+            jobs["dispatch-ci"]["needs"], ["snapshot", "mutate", "project-ready"]
+        )
+        self.assertEqual(
+            jobs["check-final"]["needs"],
+            [
+                "snapshot",
+                "check-start",
+                "compute",
+                "mutate",
+                "project-ready",
+                "dispatch-ci",
+            ],
+        )
+        self.assertIn(
+            "needs.compute.outputs.changed == 'true'", jobs["mutate"]["if"]
+        )
+        self.assertIn(
+            "needs.snapshot.outputs.mutation_allowed == 'true'",
+            jobs["mutate"]["if"],
+        )
+        self.assertIn("always()", jobs["project-ready"]["if"])
+        self.assertIn("needs.mutate.result == 'skipped'", jobs["project-ready"]["if"])
+        self.assertIn("always()", jobs["check-final"]["if"])
+
+    def test_reconcile_workflow_rechecks_full_snapshot_before_push(self):
+        workflow = self.reconcile_workflow()
+        snapshot = workflow["jobs"]["snapshot"]
+        snapshot_run = self.reconcile_step(
+            workflow, "snapshot", "live-snapshot"
+        )["run"]
+        validate_artifact = self.reconcile_step(
+            workflow, "mutate", "validate-artifact"
+        )["run"]
+        mutate_branch = self.reconcile_step(
+            workflow, "mutate", "mutate-branch"
+        )["run"]
+
+        self.assertEqual(
+            set(snapshot["outputs"]),
+            {
+                "pr_number",
+                "state",
+                "base_repo_id",
+                "head_repo_id",
+                "base_ref",
+                "head_ref",
+                "head_sha",
+                "main_sha",
+                "selection",
+                "labels",
+                "head_repo",
+                "mutation_allowed",
+                "snapshot",
+            },
+        )
+        for field in (
+            "pr_number",
+            "state",
+            "base_repo_id",
+            "head_repo_id",
+            "base_ref",
+            "head_ref",
+            "head_sha",
+            "main_sha",
+            "selection",
+            "labels",
+        ):
+            self.assertIn(field, snapshot_run)
+            self.assertIn(field, mutate_branch)
+        self.assertIn("sha256sum --check manifest.sha256", validate_artifact)
+        self.assertIn("EXPECTED_MANIFEST_DIGEST", validate_artifact)
+        self.assertIn(
+            "needs.compute.outputs.manifest_digest",
+            str(workflow["jobs"]["mutate"]),
+        )
+        self.assertIn("git -C work apply --numstat", validate_artifact)
+        self.assertIn("mapfile -t patch_paths", validate_artifact)
+        self.assertIn("sort -u", validate_artifact)
+        self.assertIn("pyproject.toml", validate_artifact)
+        self.assertIn("uv.lock", validate_artifact)
+        self.assertIn("CHANGELOG.md", validate_artifact)
+        self.assertIn("live_snapshot", mutate_branch)
+        self.assertIn(
+            'gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}"',
+            mutate_branch,
+        )
+        self.assertNotIn("curl ", mutate_branch)
+        self.assertLess(
+            mutate_branch.index("test \"${live_snapshot}\" = \"${expected_snapshot}\""),
+            mutate_branch.index("git -C work push origin"),
+        )
+        self.assertNotIn("git push --force", mutate_branch)
+        self.assertEqual(mutate_branch.count("git -C work push origin"), 1)
+
+    def test_reconcile_workflow_posts_release_state_to_exact_final_head(self):
+        workflow = self.reconcile_workflow()
+        start_check = self.reconcile_step(
+            workflow, "check-start", "start-check"
+        )["run"]
+        final_check = self.reconcile_step(
+            workflow, "check-final", "final-check"
+        )["run"]
+
+        self.assertIn('"name": "release-state"', start_check)
+        self.assertIn('"status": "in_progress"', start_check)
+        self.assertIn("needs.snapshot.outputs.head_sha", str(workflow["jobs"]["check-start"]))
+        self.assertIn("trusted/.github/scripts/release.py check-pr", final_check)
+        self.assertIn('--head-sha "${FINAL_HEAD_SHA}"', final_check)
+        self.assertIn('"name": "release-state"', final_check)
+        self.assertIn('"head_sha": $head_sha', final_check)
+        self.assertIn('"conclusion": "failure"', final_check)
+        self.assertIn("START_HEAD_SHA", final_check)
+        self.assertIn("FINAL_HEAD_SHA", final_check)
+        self.assertLess(
+            final_check.index('"conclusion": "failure"'),
+            final_check.index('"head_sha": $head_sha'),
+        )
+        self.assertIn("trap finalize_release_state_on_exit EXIT", final_check)
+        self.assertIn('active_check_id="${final_check_id}"', final_check)
+        self.assertIn('test -n "${active_check_id}"', final_check)
+        self.assertIn('"status": "completed"', final_check)
+        self.assertNotIn("|| true", final_check)
+        self.assertLess(
+            final_check.index("trap finalize_release_state_on_exit EXIT"),
+            final_check.index("git -C trusted fetch"),
+        )
+        self.assertLess(
+            final_check.rindex('--input - <<<"${final_payload}"'),
+            final_check.index("finalized=true"),
+        )
+        self.assertLess(
+            final_check.index("finalized=true"),
+            final_check.index("trap - EXIT", final_check.index("finalized=true")),
+        )
+
+    def test_reconcile_workflow_projects_ready_and_redispatches_ci_after_mutation(self):
+        workflow = self.reconcile_workflow()
+        project_ready = self.reconcile_step(
+            workflow, "project-ready", "project-ready"
+        )["run"]
+        dispatch_ci = self.reconcile_step(
+            workflow, "dispatch-ci", "dispatch-ci"
+        )["run"]
+        dispatch_job = workflow["jobs"]["dispatch-ci"]
+
+        self.assertIn("trusted/.github/scripts/release.py check-pr", project_ready)
+        self.assertIn('"desired_ready"', project_ready)
+        self.assertIn('issues/${PR_NUMBER}/labels', project_ready)
+        self.assertIn("--method POST", project_ready)
+        self.assertIn("--method DELETE", project_ready)
+        self.assertIn("needs.mutate.outputs.changed == 'true'", dispatch_job["if"])
+        self.assertIn(
+            'gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${HEAD_REF}"',
+            dispatch_ci,
+        )
+        self.assertNotIn("git ls-remote", dispatch_ci)
+        self.assertIn("needs.project-ready.result == 'success'", dispatch_job["if"])
+        self.assertIn("needs.mutate.outputs.final_head", dispatch_ci)
+        self.assertIn('gh workflow run ci.yml --ref "${HEAD_REF}"', dispatch_ci)
 
     def test_main_push_release_workflow_builds_once_and_publishes_verified_files(self):
         workflow_path = REPO / ".github" / "workflows" / "release.yml"
