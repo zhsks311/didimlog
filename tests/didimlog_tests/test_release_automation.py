@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,293 @@ class ReleaseAutomationTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+
+    def git(self, repository, *arguments, input_text=None):
+        return subprocess.run(
+            ["git", "-C", str(repository), *arguments],
+            check=True,
+            capture_output=True,
+            input=input_text,
+            text=True,
+        ).stdout.strip()
+
+    def initialize_git_repository(self, repository):
+        repository.mkdir()
+        self.git(repository, "init")
+        self.git(repository, "config", "user.name", "Didimlog Test")
+        self.git(repository, "config", "user.email", "didimlog@example.invalid")
+        self.git(repository, "branch", "-M", "main")
+        (repository / "fixture.txt").write_text("base\n", encoding="utf-8")
+        self.git(repository, "add", "fixture.txt")
+        self.git(repository, "commit", "-m", "test: base")
+        return self.git(repository, "rev-parse", "HEAD")
+
+    def commit(self, repository, message):
+        self.git(repository, "commit", "--allow-empty", "-m", message)
+        return self.git(repository, "rev-parse", "HEAD")
+
+    def create_branch(self, repository, name, start):
+        self.git(repository, "branch", name, start)
+
+    def checkout(self, repository, revision):
+        self.git(repository, "checkout", revision)
+
+    def merge_commit(self, repository, first_parent, second_parent, message):
+        tree = self.git(repository, "rev-parse", f"{first_parent}^{{tree}}")
+        return self.git(
+            repository,
+            "commit-tree",
+            tree,
+            "-p",
+            first_parent,
+            "-p",
+            second_parent,
+            input_text=f"{message}\n",
+        )
+
+    def file_at_revision(self, repository, revision, path):
+        return self.git(repository, "show", f"{revision}:{path}")
+
+    def preparation_message(
+        self,
+        base_sha,
+        *,
+        version="0.0.3",
+        bump="patch",
+        pr_number=42,
+        release_kind="develop",
+    ):
+        return "\n".join(
+            (
+                f"Didimlog-Release-Prep: v{version}",
+                f"Didimlog-Release-Base: {base_sha}",
+                f"Didimlog-Release-Bump: {bump}",
+                f"Didimlog-Release-PR: {pr_number}",
+                f"Didimlog-Release-Kind: {release_kind}",
+            )
+        )
+
+    def inspect_pr(
+        self,
+        repository,
+        base_sha,
+        head_sha,
+        *,
+        pr_number=42,
+        base_ref="main",
+        head_ref="develop",
+        selection="patch",
+    ):
+        result = self.run_script(
+            "inspect-pr",
+            "--repo",
+            str(repository),
+            "--base-sha",
+            base_sha,
+            "--head-sha",
+            head_sha,
+            "--pr-number",
+            str(pr_number),
+            "--base-ref",
+            base_ref,
+            "--head-ref",
+            head_ref,
+            "--selection",
+            selection,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_inspect_pr_tracks_prepare_cancel_and_reprepare(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            base_sha = self.initialize_git_repository(repository)
+            first_preparation = self.commit(
+                repository,
+                self.preparation_message(base_sha),
+            )
+            self.commit(
+                repository,
+                f"Didimlog-Release-Cancel: {first_preparation}",
+            )
+            active_preparation = self.commit(
+                repository,
+                self.preparation_message(base_sha),
+            )
+
+            evidence = self.inspect_pr(
+                repository,
+                base_sha,
+                active_preparation,
+            )
+
+            self.assertEqual(evidence["state"], "prepared")
+            self.assertEqual(
+                evidence["active_preparation"],
+                active_preparation,
+            )
+            self.assertEqual(evidence["base_sha"], base_sha)
+            self.assertEqual(evidence["reason"], "active_preparation")
+
+    def test_inspect_pr_rejects_dangling_cross_pr_and_duplicate_cancel_markers(self):
+        cases = (
+            ("dangling", "cancel_target_missing"),
+            ("cross-pr", "cancel_target_other_pr"),
+            ("duplicate", "invalid_cancel_marker"),
+        )
+        for case, reason in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary_directory:
+                repository = Path(temporary_directory) / "repository"
+                base_sha = self.initialize_git_repository(repository)
+                if case == "dangling":
+                    head_sha = self.commit(
+                        repository,
+                        f"Didimlog-Release-Cancel: {'0' * 40}",
+                    )
+                else:
+                    preparation = self.commit(
+                        repository,
+                        self.preparation_message(
+                            base_sha,
+                            pr_number=7 if case == "cross-pr" else 42,
+                        ),
+                    )
+                    cancel_marker = f"Didimlog-Release-Cancel: {preparation}"
+                    head_sha = self.commit(
+                        repository,
+                        (
+                            cancel_marker
+                            if case == "cross-pr"
+                            else f"{cancel_marker}\n{cancel_marker}"
+                        ),
+                    )
+
+                evidence = self.inspect_pr(repository, base_sha, head_sha)
+
+                self.assertEqual(evidence["state"], "invalid")
+                self.assertIsNone(evidence["active_preparation"])
+                self.assertEqual(evidence["base_sha"], base_sha)
+                self.assertEqual(evidence["reason"], reason)
+
+    def test_inspect_pr_ignores_markers_from_other_prs(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            base_sha = self.initialize_git_repository(repository)
+            self.create_branch(repository, "foreign-pr", base_sha)
+            self.checkout(repository, "foreign-pr")
+            foreign_preparation = self.commit(
+                repository,
+                self.preparation_message(base_sha, pr_number=7),
+            )
+            self.checkout(repository, "main")
+            active_preparation = self.commit(
+                repository,
+                self.preparation_message(base_sha),
+            )
+            head_sha = self.merge_commit(
+                repository,
+                active_preparation,
+                foreign_preparation,
+                "test: combine PR histories",
+            )
+
+            evidence = self.inspect_pr(repository, base_sha, head_sha)
+
+            self.assertEqual(evidence["state"], "prepared")
+            self.assertEqual(
+                evidence["active_preparation"],
+                active_preparation,
+            )
+            self.assertEqual(evidence["base_sha"], base_sha)
+            self.assertEqual(evidence["reason"], "active_preparation")
+            self.assertEqual(
+                self.file_at_revision(repository, head_sha, "fixture.txt"),
+                "base",
+            )
+
+    def test_inspect_pr_rejects_cancel_from_sibling_branch(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            base_sha = self.initialize_git_repository(repository)
+            self.create_branch(repository, "preparation", base_sha)
+            self.checkout(repository, "preparation")
+            preparation = self.commit(
+                repository,
+                self.preparation_message(base_sha),
+            )
+            self.checkout(repository, "main")
+            sibling_cancel = self.commit(
+                repository,
+                f"Didimlog-Release-Cancel: {preparation}",
+            )
+            head_sha = self.merge_commit(
+                repository,
+                sibling_cancel,
+                preparation,
+                "test: combine sibling histories",
+            )
+
+            evidence = self.inspect_pr(repository, base_sha, head_sha)
+
+            self.assertEqual(evidence["state"], "invalid")
+            self.assertIsNone(evidence["active_preparation"])
+            self.assertEqual(evidence["base_sha"], base_sha)
+            self.assertEqual(
+                evidence["reason"],
+                "cancel_target_not_ancestor",
+            )
+
+    def test_inspect_pr_rejects_malformed_marker_from_other_pr(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            base_sha = self.initialize_git_repository(repository)
+            lines = self.preparation_message(
+                base_sha,
+                pr_number=7,
+            ).splitlines()
+            lines.pop()
+            head_sha = self.commit(repository, "\n".join(lines))
+
+            evidence = self.inspect_pr(repository, base_sha, head_sha)
+
+            self.assertEqual(evidence["state"], "invalid")
+            self.assertIsNone(evidence["active_preparation"])
+            self.assertEqual(evidence["base_sha"], base_sha)
+            self.assertEqual(
+                evidence["reason"],
+                "invalid_preparation_marker",
+            )
+
+    def test_inspect_pr_rejects_missing_or_duplicate_prep_fields(self):
+        marker_names = ("Prep", "Base", "Bump", "PR", "Kind")
+        for marker_name in marker_names:
+            for mutation in ("missing", "duplicate"):
+                with self.subTest(
+                    marker=marker_name,
+                    mutation=mutation,
+                ), tempfile.TemporaryDirectory() as temporary_directory:
+                    repository = Path(temporary_directory) / "repository"
+                    base_sha = self.initialize_git_repository(repository)
+                    lines = self.preparation_message(base_sha).splitlines()
+                    marker_prefix = f"Didimlog-Release-{marker_name}:"
+                    matching_line = next(
+                        line for line in lines if line.startswith(marker_prefix)
+                    )
+                    if mutation == "missing":
+                        lines.remove(matching_line)
+                    else:
+                        lines.append(matching_line)
+                    head_sha = self.commit(repository, "\n".join(lines))
+
+                    evidence = self.inspect_pr(repository, base_sha, head_sha)
+
+                    self.assertEqual(evidence["state"], "invalid")
+                    self.assertIsNone(evidence["active_preparation"])
+                    self.assertEqual(evidence["base_sha"], base_sha)
+                    self.assertEqual(
+                        evidence["reason"],
+                        "invalid_preparation_marker",
+                    )
 
     def test_prepare_changelog_promotes_unreleased_and_updates_links(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
