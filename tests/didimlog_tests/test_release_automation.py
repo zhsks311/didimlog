@@ -301,6 +301,76 @@ class ReleaseAutomationTests(unittest.TestCase):
             self.assertEqual(evidence["base_sha"], base_sha)
             self.assertEqual(evidence["reason"], "active_preparation")
 
+
+    def test_inspect_pr_accepts_cancel_that_preserves_later_release_file_changes(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repository = Path(temporary_directory) / "repository"
+            initial_sha = self.initialize_git_repository(repository)
+            base_project = self.file_at_revision(
+                repository,
+                initial_sha,
+                "pyproject.toml",
+            )
+            padding = "\n".join(
+                f'padding{index} = "base"' for index in range(20)
+            )
+            base_project = (
+                base_project
+                + "\n\n[tool.fixture]\n"
+                + padding
+                + "\n"
+            )
+            base_sha = self.commit(
+                repository,
+                "test: add distant project metadata",
+                files={"pyproject.toml": base_project},
+            )
+            prepared_files = self.release_files("0.0.3", prepared=True)
+            prepared_project = base_project.replace(
+                'version = "0.0.2"',
+                'version = "0.0.3"',
+            )
+            prepared_files["pyproject.toml"] = prepared_project
+            preparation = self.preparation_commit(
+                repository,
+                base_sha,
+                files=prepared_files,
+            )
+            later_project = prepared_project.replace(
+                'padding19 = "base"',
+                'padding19 = "added after preparation"',
+            )
+            self.commit(
+                repository,
+                "test: edit release file after preparation",
+                files={"pyproject.toml": later_project},
+            )
+            self.git(repository, "revert", "--no-commit", preparation)
+            cancellation = self.commit(
+                repository,
+                f"Didimlog-Release-Cancel: {preparation}",
+            )
+
+            evidence = self.inspect_pr(
+                repository,
+                base_sha,
+                cancellation,
+            )
+
+            self.assertEqual(evidence["state"], "none")
+            self.assertEqual(evidence["reason"], "no_active_preparation")
+            self.assertIn(
+                'padding19 = "added after preparation"',
+                self.file_at_revision(
+                    repository,
+                    cancellation,
+                    "pyproject.toml",
+                ),
+            )
+
+
     def test_inspect_pr_rejects_dangling_cross_pr_and_duplicate_cancel_markers(self):
         cases = (
             ("dangling", "cancel_target_missing"),
@@ -1931,21 +2001,14 @@ class ReleaseAutomationTests(unittest.TestCase):
             compute_plan,
         )
         self.assertIn(
-            'for release_path in "${release_paths[@]}"', compute_plan
-        )
-        self.assertIn(
-            'git -C pr-data rev-parse "${cancel_sha}^:${release_path}"',
+            'git -C pr-data revert --no-commit "${cancel_sha}"',
             compute_plan,
         )
-        self.assertIn(
-            'git -C pr-data hash-object "${release_path}"', compute_plan
-        )
+        self.assertNotIn("parent_blob=", compute_plan)
+        self.assertNotIn("restored_blob=", compute_plan)
+        self.assertNotIn("hash-object", compute_plan)
         self.assertLess(
             compute_plan.index('git -C pr-data revert --no-commit "${cancel_sha}"'),
-            compute_plan.index('git -C pr-data hash-object "${release_path}"'),
-        )
-        self.assertLess(
-            compute_plan.index('git -C pr-data hash-object "${release_path}"'),
             compute_plan.index("artifact/cancel.patch"),
         )
         self.assertNotIn("uv sync", compute_plan)
@@ -2425,6 +2488,13 @@ class ReleaseAutomationTests(unittest.TestCase):
         normalized_condition = " ".join(condition.split())
 
         self.assertEqual(sync["needs"], ["detect", "publish"])
+        self.assertEqual(
+            sync["concurrency"],
+            {
+                "group": "sync-hotfix-to-develop",
+                "cancel-in-progress": False,
+            },
+        )
         self.assertIn("needs.publish.result == 'success'", condition)
         self.assertIn("needs.detect.outputs.kind == 'hotfix'", condition)
         self.assertNotIn("always()", condition)

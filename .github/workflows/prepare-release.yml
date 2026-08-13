@@ -215,11 +215,6 @@ jobs:
 
           if test -n "${cancel_sha}"; then
             git -C pr-data revert --no-commit "${cancel_sha}"
-            for release_path in "${release_paths[@]}"; do
-              parent_blob="$(git -C pr-data rev-parse "${cancel_sha}^:${release_path}")"
-              restored_blob="$(git -C pr-data hash-object "${release_path}")"
-              test "${restored_blob}" = "${parent_blob}"
-            done
             git -C pr-data diff --binary HEAD -- "${release_paths[@]}" > artifact/cancel.patch
             test -s artifact/cancel.patch
             test "$(git -C pr-data diff --name-only | sort)" = "$(printf '%s\n' "${release_paths[@]}" | sort)"

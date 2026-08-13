@@ -196,6 +196,9 @@ jobs:
         needs.publish.result == 'success' &&
         needs.detect.outputs.kind == 'hotfix'
       }}
+    concurrency:
+      group: sync-hotfix-to-develop
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: write

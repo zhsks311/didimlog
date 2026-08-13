@@ -201,7 +201,7 @@ uv run --project . python -m unittest tests.didimlog_tests.test_release -v
 
 - GitHub Actions의 `Workflow permissions`를 `Read and write permissions`로 설정합니다.
 - `release:none`, `release:patch`, `release:minor`, `release:major`, `release:ready` 레이블을 만듭니다.
-- `main`은 PR, CI, `release-state` 통과를 필수로 설정합니다. 병합 방식은 merge commit만 허용하고 squash, rebase, direct push는 막습니다.
+- `main`은 PR, CI, `release-state` 통과를 필수로 설정하고, PR 브랜치가 최신 `main`을 반영해야 병합할 수 있도록 설정합니다. 병합 방식은 merge commit만 허용하고 squash, rebase, direct push는 막습니다.
 - `develop`에는 GitHub Actions가 준비 커밋과 취소 커밋을 push할 수 있게 둡니다.
 - `pypi` environment(배포 환경)를 만들고, 완전 자동 배포를 원하면 필수 승인자를 두지 않습니다.
 - PyPI Trusted Publisher에 소유자 `zhsks311`, 저장소 `didimlog`, workflow `release.yml`, environment `pypi`를 등록합니다.

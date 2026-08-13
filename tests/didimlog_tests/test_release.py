@@ -139,6 +139,10 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIn(f"`{check_name}` 통과를 필수", release_guide)
         self.assertIn("현재 PR 커밋의 Git 이력", release_guide)
         self.assertIn("바로 그 커밋", release_guide)
+        self.assertIn(
+            "최신 `main`을 반영해야 병합할 수 있도록",
+            release_guide,
+        )
 
         classify = next(
             step["run"]
@@ -187,6 +191,8 @@ class ReleaseContractTests(unittest.TestCase):
             "취소가 먼저 오든 병합이 먼저 오든",
             "여러 릴리스 PR을 최신 기준으로 다시 계산",
             "`main` → `develop` 동기화 PR",
+            "취소 과정은 후속 변경을 보존",
+            "hotfix 동기화는 한 번에 하나씩",
         ):
             self.assertIn(documented_outcome, unreleased_items[0])
 

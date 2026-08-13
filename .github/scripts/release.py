@@ -422,22 +422,26 @@ def _validate_cancel_tree(
         repo,
         preparation.commit_sha,
     )[0]
-    for path in _RELEASE_PATHS:
-        try:
-            cancel_blob = _git(
-                repo,
-                "rev-parse",
-                f"{cancel.commit_sha}:{path}",
-            )
-            parent_blob = _git(
-                repo,
-                "rev-parse",
-                f"{preparation_parent}:{path}",
-            )
-        except ReleaseError:
-            return "cancel_tree_mismatch"
-        if cancel_blob != parent_blob:
-            return "cancel_tree_mismatch"
+    try:
+        expected_tree = _git(
+            repo,
+            "merge-tree",
+            "--write-tree",
+            "--no-messages",
+            "--merge-base",
+            preparation.commit_sha,
+            cancel_parents[0],
+            preparation_parent,
+        )
+        cancel_tree = _git(
+            repo,
+            "rev-parse",
+            f"{cancel.commit_sha}^{{tree}}",
+        )
+    except ReleaseError:
+        return "cancel_tree_mismatch"
+    if not _SHA_PATTERN.fullmatch(expected_tree) or cancel_tree != expected_tree:
+        return "cancel_tree_mismatch"
     return None
 
 
