@@ -380,6 +380,32 @@ uv build
 uv run --project . python -m unittest tests.didimlog_tests.test_release -v
 ```
 
+### 릴리스
+
+릴리스 자동화를 사용하기 전에 저장소 관리자가 다음 설정을 직접 적용해야 합니다. workflow 파일만 병합해도 이 설정은 생기지 않습니다.
+
+- GitHub Actions의 `Workflow permissions`를 `Read and write permissions`로 설정합니다.
+- `release:none`, `release:patch`, `release:minor`, `release:major`, `release:ready` 레이블을 만듭니다.
+- `main`은 PR, CI, `release-state` 통과를 필수로 설정하고, PR 브랜치가 최신 `main`을 반영해야 병합할 수 있도록 설정합니다. 병합 방식은 merge commit만 허용하고 squash, rebase, direct push는 막습니다.
+- `develop`에는 GitHub Actions가 준비 커밋과 취소 커밋을 push할 수 있게 둡니다.
+- `pypi` environment(배포 환경)를 만들고, 완전 자동 배포를 원하면 필수 승인자를 두지 않습니다.
+- PyPI Trusted Publisher에 소유자 `zhsks311`, 저장소 `didimlog`, workflow `release.yml`, environment `pypi`를 등록합니다.
+- GitHub Release immutability(공개 후 수정 금지)를 켭니다.
+
+`develop` → `main` PR에 선택 레이블이 없거나 `release:none`이면 배포하지 않습니다. 배포하려면 다음 버전 레이블 중 하나만 붙입니다.
+
+- `release:patch`: 버그 수정 버전 준비
+- `release:minor`: 하위 호환 기능 버전 준비
+- `release:major`: 호환성이 깨지는 버전 준비
+
+자동화는 `pyproject.toml`, `uv.lock`, `CHANGELOG.md`를 갱신하고 전체 테스트와 빌드를 실행합니다. 준비가 끝나면 `release:ready`를 붙이지만, 이 레이블은 현재 상태를 보여 주는 표시입니다. 실제 필수 병합 기준은 현재 PR 커밋의 Git 이력에 유효한 준비 기록이 남아 있고, 바로 그 커밋에 대한 `release-state` 검사가 통과하는 것입니다.
+
+준비 뒤 PR에 커밋을 추가하면 자동화가 이전 준비를 취소하고 새 커밋 기준으로 다시 준비합니다. 그사이 `main`이 전진하면 이전 준비를 취소하고 PR 브랜치가 최신 `main`을 반영할 때까지 기다립니다. 반영 뒤 자동으로 다시 준비합니다.
+
+`main` 병합은 두 부모를 가진 merge commit만 배포 대상으로 인식합니다. squash, rebase, direct push는 배포하지 않고 릴리스 workflow를 오류로 끝냅니다.
+
+`hotfix/*` → `main` PR은 `release:patch`만 지원합니다. patch 배포에 성공하면 `main`을 `develop`에 직접 합칩니다. 보호 규칙이나 충돌로 직접 반영할 수 없으면 `main` → `develop` 동기화 PR을 만들거나 갱신합니다.
+
 기여 방법은 [`CONTRIBUTING.md`](CONTRIBUTING.md), 보안 제보 방법은 [`SECURITY.md`](SECURITY.md), 사용자에게 보이는 변경은 [`CHANGELOG.md`](CHANGELOG.md)에서 확인할 수 있습니다.
 
 ## 라이선스

@@ -8,12 +8,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from didimlog import version as didimlog_version
+
 from didimlog.claude.probe import inspect
 
 
 REPO = Path(__file__).resolve().parents[2]
 DATE = "2026-08-05"
-VERSION = "0.0.2"
+VERSION = didimlog_version()
 
 
 def _tree_bytes(root):
@@ -49,7 +51,7 @@ class PackageLifecycleTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-            wheel = next(build.glob("didimlog-0.0.2-*.whl"))
+            wheel = next(build.glob(f"didimlog-{VERSION}-*.whl"))
             subprocess.run(
                 [uv, "venv", str(virtual_environment), "--python", sys.executable],
                 check=True,
@@ -113,7 +115,7 @@ class PackageLifecycleTests(unittest.TestCase):
                 )
                 return result
 
-            self.assertEqual(run("--version").stdout.strip(), "Didimlog 0.0.2")
+            self.assertEqual(run("--version").stdout.strip(), f"Didimlog {VERSION}")
             steps.append("version")
             dry_run = run("setup", "--dry-run", "--config-dir", str(config))
             self.assertIn("개인 지식", dry_run.stdout)
@@ -224,7 +226,7 @@ date: 2026-08-05
             self.assertIn("PERSONAL_INDEX_CURRENT", index_check.stdout)
             self.assertIn("PROJECT_INDEX_CURRENT", index_check.stdout)
             status = run("status", "--config-dir", str(config))
-            self.assertIn("Didimlog 0.0.2", status.stdout)
+            self.assertIn(f"Didimlog {VERSION}", status.stdout)
             doctor = run("doctor", "--config-dir", str(config))
             self.assertIn("문제 없음", doctor.stdout)
             steps.extend(("index-check", "status", "doctor"))
