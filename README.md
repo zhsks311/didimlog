@@ -1,71 +1,301 @@
 # Didimlog
 
-Didimlog는 AI와 함께 일하며 확인한 사실, 실험 결과, 재사용할 교훈을 로컬 파일로 남기고 필요한 순간에만 다시 찾게 하는 CLI입니다.
+English | [한국어](README.ko.md)
 
-- 개인 지식은 `~/knowledge`에 프로젝트별로 나눠 보존합니다.
-- 프로젝트 지식은 프로젝트 디렉터리의 `knowledge/records`에 observation, experiment, evidence로 보존하며 기본적으로 Git 추적에서 제외합니다.
-- Claude Code에는 전체 본문 대신 짧은 조회 지침만 연결합니다.
-- 기존 원문은 덮어쓰거나 삭제하지 않습니다.
+Didimlog is a CLI that stores **lessons, observations, experiments, and evidence** gathered while working with Claude Code in local files, then retrieves only what is needed for the next task.
 
-현재 지원 범위는 macOS·Linux와 Python 3.11~3.14입니다. Windows 지원은 아직 검증하지 않았습니다.
+It is well suited for the following use cases:
 
-## 설치
+- Preserve verified lessons by project so you do not solve the same problem twice.
+- Link experiment results and raw artifacts to a Git project for traceability.
+- Load only relevant material instead of placing the entire knowledge base in the AI context.
+- Use a local-first storage model that never overwrites source content.
 
-권장 설치 방법:
+The project is currently **Pre-Alpha**. It supports macOS and Linux with Python 3.11–3.14. Windows has not yet been verified.
+
+## Requirements
+
+- macOS or Linux
+- Python 3.11–3.14
+- [`uv`](https://docs.astral.sh/uv/), the recommended installation tool
+- A Git repository when storing project records
+- A Claude configuration directory created by running Claude Code at least once when integrating with Claude Code (default: `~/.claude`)
+
+If you do not use Claude Code or have not configured it yet, you can use `--skip-claude` during initial setup.
+
+## Quick Start
+
+This walkthrough installs Didimlog, prepares storage in a Git project, saves the first lesson, and checks the index status.
+
+### 1. Install
 
 ```sh
 uv tool install didimlog
 didim --version
 ```
 
-`pipx`를 사용해도 됩니다.
+The current version prints:
 
-```sh
-pipx install didimlog
+```text
+Didimlog 0.0.2
 ```
 
-## 처음 설정
+If you use `pipx`, install it with `pipx install didimlog`.
 
-먼저 변경될 파일을 확인합니다.
+### 2. Review the Change Plan and Set Up
+
+Run these commands from the top-level directory of the target Git project.
 
 ```sh
+cd /path/to/your-project
 didim setup --dry-run
-```
-
-출력된 계획이 맞으면 승인합니다.
-
-```sh
 didim setup --yes
 ```
 
-`setup`은 다음 작업을 순서대로 수행합니다.
+`--dry-run` shows the planned changes to personal knowledge, project evidence, and the Claude integration without modifying any files. When the actual setup finishes, the final line prints:
 
-1. `~/knowledge`에 개인 지식 디렉터리와 검색용 index를 준비합니다.
-2. 현재 위치가 Git 저장소라면 프로젝트 `knowledge/` 폴더와 index를 준비합니다.
-3. Claude Code 설정에 Didimlog가 관리하는 조회 지침과 SessionStart hook을 연결합니다.
-4. 실제 파일과 연결 상태를 다시 검사합니다.
+```text
+Didimlog 준비를 마쳤습니다.
+```
 
-사용자가 직접 작성한 `~/knowledge`, 프로젝트 `knowledge/`, Claude 설정의 사용자 소유 본문은 덮어쓰지 않습니다. 기존 파일과 충돌하거나 symlink·path escape가 발견되면 쓰기를 중단합니다. 계획을 확인한 뒤 다른 프로세스가 파일을 바꾼 경우에도 작업을 중단하고, Didimlog가 만든 내용 중 그대로 남아 있는 것만 되돌립니다. 동시에 저장된 사용자 변경은 되돌리거나 덮어쓰지 않습니다.
+If you run the same command again, items that are already prepared are shown as `변경 없음`.
 
-프로젝트 `knowledge/`의 기본값은 로컬 전용입니다. `.gitignore`를 바꾸지 않고 현재 로컬 Git 저장소가 사용하는 `info/exclude` 파일(일반 저장소의 `.git/info/exclude`)에 `/knowledge/` 규칙을 추가합니다. 같은 로컬 저장소에 연결된 작업 트리(linked worktree)는 이 파일을 공유하므로 한 작업 트리의 설정이 다른 연결된 작업 트리에도 적용됩니다.
+### 3. Check Readiness
 
-프로젝트 지식을 팀과 공유하려면 다음 명령으로 `shared`를 선택합니다.
+```sh
+didim status
+```
+
+If setup completed successfully, you can verify the following status. The project name is the name of the current Git top-level directory.
+
+```text
+Didimlog 0.0.2
+개인 지식: 최신
+현재 프로젝트: <프로젝트 이름>
+프로젝트 근거: 최신
+Claude 연결: 정상
+```
+
+### 4. Save Your First Lesson
+
+Lessons accept Markdown source through standard input. The following example includes the execution time in the slug, so repeated runs do not overwrite an existing lesson.
+
+```sh
+today="$(date +%F)"
+slug="didimlog-quick-start-$(date +%Y%m%d-%H%M%S)"
+cat > /tmp/didimlog-quick-start.md <<EOF
+---
+topic: didimlog-quick-start
+title: 같은 문제를 다시 풀지 않는다
+summary: 검증한 해결 방법을 저장하고 다음 작업에서 다시 찾는다
+tags: [didimlog, quick-start]
+date: $today
+---
+## 상황
+반복되는 작업에서 이미 검증한 해결 방법이 필요했다.
+
+## 교훈
+작업이 끝난 뒤 재사용할 조건과 절차를 교훈으로 저장한다.
+
+## 근거
+Didimlog로 교훈을 저장하고 index 상태를 확인했다.
+EOF
+
+didim add lesson "$slug" --date "$today" < /tmp/didimlog-quick-start.md
+didim index --check
+```
+
+On success, Didimlog prints the lesson path and the current status of both indexes.
+
+```text
+lessons/<프로젝트 이름>/didimlog-quick-start-<실행 시각>.md
+개인 지식: PERSONAL_INDEX_CURRENT
+프로젝트 근거: PROJECT_INDEX_CURRENT
+```
+
+The lesson source now remains in `~/knowledge/lessons/<프로젝트 이름>/`. During the next task, Claude Code searches the index first and reads only the relevant source content.
+
+## Next Steps
+
+- If your team needs to share records from the same project through Git, see [Share Project Knowledge with the Team](#share-project-knowledge-with-the-team).
+- To record facts you have directly verified, see [Record a Project Observation](#record-a-project-observation).
+- To record a hypothesis together with its result, see [Record Experiment Results](#record-experiment-results).
+- To bundle a file or Git source in a verifiable form, see [Register Evidence](#register-evidence).
+- If the status differs from what you expect, see [Diagnose Problems](#diagnose-problems).
+
+## Common Tasks
+
+### Share Project Knowledge with the Team
+
+By default, the project's `knowledge/` directory is used only on this computer. To include it in Git, reapply the setup with the following command.
 
 ```sh
 didim setup --yes --project-knowledge shared
 ```
 
-`shared`는 로컬 제외 설정에서 Didimlog 관리 표시로 둘러싼 블록만 제거하고 사용자 규칙은 바꾸지 않습니다. 같은 파일의 다른 규칙, `.gitignore`, 사용자의 전역 제외 설정 등이 `knowledge/`를 계속 제외하면 안내를 표시하므로, Git에 포함하려면 해당 규칙을 직접 바꿔야 합니다.
+`shared` removes only the Didimlog-managed block from the local Git exclude file. It does not modify `.gitignore`, global exclude settings, or other user-defined exclusion rules. If the command reports that exclusion rules remain, you must inspect those rules yourself.
 
-Claude Code를 연결하지 않고 저장 공간만 준비하려면 다음 명령을 사용합니다.
+To switch back to local-only storage, use:
 
 ```sh
-didim setup --yes --skip-claude
+didim setup --yes --project-knowledge local
 ```
 
-## 저장 구조
+### Record a Project Observation
 
-개인 지식:
+An observation is a reusable fact that you have directly verified. Include only `body` in the JSON body.
+
+```sh
+today="$(date +%F)"
+printf '%s' '{"body":"setup 뒤 status의 네 항목이 모두 정상 또는 최신으로 표시됐다."}' |
+  didim add observation \
+    --date "$today" \
+    --title "초기 설정 상태 확인" \
+    --tags "setup,status"
+```
+
+On success, Didimlog assigns an ID and prints a path in the following form.
+
+```text
+<git-root>/knowledge/records/observation/OBS-YYYYMMDD-NN.md
+```
+
+### Record Experiment Results
+
+An experiment stores the hypothesis, method, result, contradiction signal, and interpretation together. `result` must be one of `success`, `failure`, or `inconclusive`. Set `contradicts` to `none` when there is no contradiction.
+
+```sh
+today="$(date +%F)"
+printf '%s' '{"hypothesis":"index를 다시 만들면 저장 직후 상태를 유지한다.","method":"didim index를 실행한 뒤 didim index --check를 실행했다.","result":"success","contradicts":"none","interpretation":"두 index가 최신이므로 현재 기록 트리와 일치한다."}' |
+  didim add experiment \
+    --date "$today" \
+    --title "index 재생성 확인" \
+    --tags "index"
+```
+
+On success, Didimlog prints a path in the following form.
+
+```text
+<git-root>/knowledge/records/experiment/EXP-YYYYMMDD-NN.md
+```
+
+### Register Evidence
+
+To register a local file as evidence, first create it under `knowledge/raw/` and submit its SHA-256 digest. The following example uses a unique filename.
+
+```sh
+today="$(date +%F)"
+artifact="knowledge/raw/setup-status-$(date +%Y%m%d-%H%M%S).txt"
+printf 'setup status: current\n' > "$artifact"
+digest="$(python3 -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "$artifact")"
+printf '{"artifact":"%s","origin":"didim status output","collection":"captured after setup","artifact_sha256":"%s"}' "$artifact" "$digest" |
+  didim add evidence \
+    --date "$today" \
+    --title "설정 상태 원본" \
+    --tags "setup,status"
+```
+
+On success, Didimlog prints a path in the following form.
+
+```text
+<git-root>/knowledge/records/evidence/EVD-YYYYMMDD-NN.md
+```
+
+For an artifact included in a Git commit, put the full commit object ID in `artifact_git` instead of `artifact_sha256`. For path constraints, Git verification behavior, and the record lifecycle, refer to the installed copy of [`knowledge/README.md`](src/didimlog/resources/project/README.md) created during setup.
+
+### Rebuild the Indexes
+
+Rebuild the indexes for all personal knowledge and the current Git project.
+
+```sh
+didim index
+```
+
+To verify that the source content and indexes match without changing files, use:
+
+```sh
+didim index --check
+```
+
+When both indexes are current, the command returns exit `0` and the following tokens.
+
+```text
+개인 지식: PERSONAL_INDEX_CURRENT
+프로젝트 근거: PROJECT_INDEX_CURRENT
+```
+
+### Diagnose Problems
+
+```sh
+didim status
+didim doctor
+```
+
+`status` summarizes the version, personal knowledge, current project, project evidence, and Claude integration. `doctor` shows the impact of each detected problem together with the next command to run.
+
+If you also need error explanations in automation logs, place the global option before the command.
+
+```sh
+didim --explain-errors index --check
+```
+
+## Command Summary
+
+The following table summarizes commands intended to be run directly by users. See `didim <command> --help` in the installed version for every available option.
+
+| Command | Result | Main options or input |
+| --- | --- | --- |
+| `didim setup` | Prepare personal and project storage and the Claude integration | `--dry-run`, `--yes`, `--skip-claude`, `--project-knowledge local\|shared`, `--config-dir` |
+| `didim connect claude` | Add the Claude Code integration | `--yes`, `--config-dir` |
+| `didim disconnect claude` | Remove the Claude integration managed by Didimlog | `--config-dir` |
+| `didim add lesson <slug>` | Save a personal lesson as create-only | Markdown stdin, `--date`, `--project`, `--global` |
+| `didim add observation` | Save a project observation record | JSON stdin, common record options |
+| `didim add experiment` | Save a project experiment record | JSON stdin, common record options |
+| `didim add evidence` | Link project evidence with its artifact | JSON stdin, common record options |
+| `didim index` | Rebuild personal and project indexes | `--check` |
+| `didim status` | Summarize the current status | `--config-dir` |
+| `didim doctor` | Diagnose problems and remediation steps | `--config-dir` |
+
+The global options are `--version` and `--explain-errors`. `didim hook session-start` is an internal command used by the Claude Code integration.
+
+### Common Record Options
+
+`observation`, `experiment`, and `evidence` share the following options.
+
+| Option | Meaning |
+| --- | --- |
+| `--date YYYY-MM-DD` | Creation date. Required for non-interactive execution using standard input |
+| `--title` | Record title. Required |
+| `--scope` | `project` or `task:<name>`. Default: `project` |
+| `--tags` | Comma-separated tags |
+| `--sources` | Comma-separated EVD or EXP IDs |
+
+The exact fields accepted through JSON stdin are listed below. Non-string values and unknown fields are rejected.
+
+| Type | Required fields |
+| --- | --- |
+| observation | `body` |
+| experiment | `hypothesis`, `method`, `result`, `contradicts`, `interpretation` |
+| evidence | `artifact`, `origin`, `collection`, and exactly one of `artifact_sha256` or `artifact_git` |
+
+CLI standard input is limited to 64 KiB. Generated project records are limited to 12,000 UTF-8 bytes and 200 LF characters. For the authoritative format and validation rules, refer to `knowledge/README.md` and `knowledge/schema/record.schema.json` in the installed project.
+
+### Errors and Exit Codes
+
+The English token on the first error line and the exit code are stable behaviors that can be used in automation. In an interactive terminal or when using `--explain-errors`, a Korean `도움말:` line is appended.
+
+| Exit code | Meaning |
+| --- | --- |
+| `2` | Command usage or input format error |
+| `3` | Violation of a knowledge integrity policy involving a path, artifact, index, or similar input |
+| `5` | Content resembling a secret was detected in a lesson |
+| `7` | The Git repository or object cannot be verified |
+
+`LESSON_SECRET` rejects the lesson without printing the detected value. `KNOWLEDGE_INDEX_STALE` or `PROJECT_INDEX_STALE` means that the source content was saved successfully but the index update failed. Recover by running `didim index`.
+
+## Storage Model and Safety Rules
+
+Personal knowledge is stored in the home directory.
 
 ```text
 ~/knowledge/
@@ -78,13 +308,13 @@ didim setup --yes --skip-claude
 └── index/<project>.md
 ```
 
-- `lessons`: 다음 작업에서 행동을 바꿀 검증된 교훈
-- `docs`: 정확한 절차, 계획, 조사 결과
-- `book`: 여러 자료의 배경과 사례를 엮은 해설
-- `_global`: 여러 프로젝트에 그대로 적용되는 자료
-- `index`: 제목, 찾을 때, 상세 파일 경로만 담은 재생성 가능한 목록
+- `lessons`: Verified lessons that should change behavior in future tasks
+- `docs`: Precise procedures, plans, and research results
+- `book`: Explanations that connect background information and examples from multiple sources
+- `_global`: Material that applies unchanged across multiple projects
+- `index`: A regenerable list containing only titles, when-to-use guidance, and detailed file paths
 
-프로젝트 지식:
+Project knowledge is stored at the top level of the Git repository.
 
 ```text
 <git-root>/knowledge/
@@ -92,137 +322,94 @@ didim setup --yes --skip-claude
 ├── README.md
 ├── records/
 ├── raw/
+├── schema/record.schema.json
 ├── index/INDEX.md
 └── active/harness.md
 ```
 
-`records/`가 프로젝트 지식의 유일한 원본입니다. `INDEX.md`는 모든 record를 검증한 뒤 다시 만들 수 있는 9-field TSV 색인입니다. `active/harness.md`는 v0.0.1에서 header-only이며 Didimlog가 승격 규칙을 쓰지 않습니다.
+`records/` is the source of truth for project knowledge, and `INDEX.md` can be regenerated by revalidating every record. The default `local` configuration adds `/knowledge/` to the current local repository's `info/exclude` without modifying `.gitignore`. Linked worktrees share this file, so configuration in one worktree also applies to other linked worktrees.
 
-## 일상 사용
+Didimlog enforces the following safety rules:
 
-### 개인 교훈 저장
+- Lesson and record source files are create-only. Existing source files are never overwritten or deleted.
+- Before setup, Didimlog checks the complete change plan. If a path or file changes after approval, it stops writing.
+- Symlinks and parent-path traversal are rejected.
+- If setup fails, Didimlog rolls back only content created by the current run that remains unchanged. Concurrent user changes are not modified.
+- If only the index update fails after creating a record file, Didimlog preserves the source content and provides a recovery command.
+- Evidence backed by Git objects is verified only against the object database of the repository identified when the command starts. Didimlog does not use the current shell's Git environment variables or external alternates to locate other objects.
 
-입력 형식과 필수 옵션은 명령의 도움말에서 확인합니다.
+## Claude Code Integration
+
+`didim setup --yes` prepares both storage and the Claude Code integration. To prepare storage only, use:
 
 ```sh
-didim add lesson --help
+didim setup --yes --skip-claude
 ```
 
-lesson은 create-only로 저장됩니다. 같은 이름의 파일이 이미 있으면 기존 파일을 바꾸지 않고 실패합니다. 저장에 성공하면 개인 index를 다시 만듭니다.
-비밀값으로 보이는 내용은 저장하지 않으며, 값을 출력하지 않고 `LESSON_SECRET`
-오류와 exit `5`를 반환합니다.
-
-### 프로젝트 관찰·실험·증거 저장
+You can also manage the integration separately.
 
 ```sh
-didim add observation --help
-didim add experiment --help
-didim add evidence --help
-```
-
-- observation: 실제로 관찰한 재사용 가능한 사실
-- experiment: 가설, 방법, 결과, 해석을 함께 남기는 실험
-- evidence: SHA-256 또는 검증된 Git object에 결합한 원자료. Git object 방식은 현재 shell의 Git 환경 변수나 외부 alternates를 사용하지 않고, 명령을 시작할 때 확인한 저장소의 object database에서만 검증합니다. linked worktree에서는 공통 object database를 사용합니다.
-
-ID는 `OBS-YYYYMMDD-NN`, `EXP-YYYYMMDD-NN`, `EVD-YYYYMMDD-NN` 형식으로 Didimlog가 할당합니다. 기록을 저장하는 동안 프로젝트 경로나 `knowledge/records`가 다른 디렉터리로 교체되면 새 경로에 기록하지 않고 중단합니다. 기록 파일이 원래 디렉터리에 완전히 만들어진 뒤 project index 갱신에 실패하면 원문은 보존하고 `PROJECT_INDEX_STALE: run didim index`를 출력합니다.
-
-Git metadata나 object database가 검증 도중 바뀌어 같은 저장소라고 확정할 수 없으면 `GIT_UNVERIFIABLE <record-id>`로 중단합니다. 검증 실패를 성공으로 간주하거나 다른 저장소에서 object를 찾지 않습니다.
-
-### index 다시 만들기
-
-개인 지식 전체와 현재 Git 프로젝트의 index를 다시 만듭니다.
-
-```sh
-didim index
-```
-
-파일을 바꾸지 않고 현재 상태만 검사할 수 있습니다.
-
-```sh
-didim index --check
-```
-
-### 상태와 문제 해결
-
-```sh
-didim status
-didim doctor
-```
-
-`status`는 버전, 개인 index, 현재 프로젝트, Claude 연결을 한 화면에 요약합니다. `doctor`는 문제가 미치는 영향과 다음 실행 명령을 함께 보여 줍니다.
-
-오류 첫 줄의 영문 token과 exit code는 자동화 계약입니다. 실제 TTY에서는 다음 줄에 한국어 `도움말:`이 표시됩니다. non-TTY 로그에서도 설명이 필요하면 전역 옵션을 사용합니다.
-
-```sh
-didim --explain-errors index --check
-```
-
-## Claude Code 연결
-
-`didim setup --yes`가 연결까지 처리합니다. 연결만 따로 관리할 수도 있습니다.
-
-```sh
-didim connect claude
+didim connect claude --yes
 didim disconnect claude
 ```
 
-연결된 새 Claude 세션은 `KNOWLEDGE_USAGE.md`의 짧은 절차만 자동으로 읽습니다. 실제 작업에서는 현재 프로젝트와 `_global` index를 검색하고, 관련 상세 자료만 최대 5건 읽습니다. 전체 index나 모든 lesson 본문을 시작 context에 싣지 않습니다.
+A newly connected Claude session automatically reads only the short retrieval procedure in `KNOWLEDGE_USAGE.md`. During actual work, it searches the current project and `_global` indexes and reads up to five relevant source documents. It does not load the complete indexes or every lesson body into the session-start context.
 
-## 제거
+## Uninstallation
 
-먼저 Claude Code 연결을 해제한 뒤 도구를 제거합니다.
+First disconnect Claude Code, then uninstall the tool.
 
 ```sh
 didim disconnect claude
 uv tool uninstall didimlog
 ```
 
-제거해도 `~/knowledge`와 각 프로젝트의 `knowledge/` 원문은 남습니다.
+Uninstallation leaves `~/knowledge` and the source content under each project's `knowledge/` directory intact.
 
-## 개발과 검증
+## Development and Verification
 
-고정된 의존성을 설치하고 전체 suite를 실행합니다.
+Install locked dependencies and run the full test suite.
 
 ```sh
 uv sync --locked
 uv run --project . python -m unittest discover -s tests -v
 ```
 
-배포 파일과 공개 allowlist를 확인합니다.
+Verify the distribution files and public allowlist.
 
 ```sh
 uv build
 uv run --project . python -m unittest tests.didimlog_tests.test_release -v
 ```
 
-### 릴리스
+### Release
 
-릴리스 자동화를 사용하기 전에 저장소 관리자가 다음 설정을 직접 적용해야 합니다. workflow 파일만 병합해도 이 설정은 생기지 않습니다.
+Before using release automation, a repository administrator must apply the following settings manually. Merging the workflow file alone does not create these settings.
 
-- GitHub Actions의 `Workflow permissions`를 `Read and write permissions`로 설정합니다.
-- `release:none`, `release:patch`, `release:minor`, `release:major`, `release:ready` 레이블을 만듭니다.
-- `main`은 PR, CI, `release-state` 통과를 필수로 설정하고, PR 브랜치가 최신 `main`을 반영해야 병합할 수 있도록 설정합니다. 병합 방식은 merge commit만 허용하고 squash, rebase, direct push는 막습니다.
-- `develop`에는 GitHub Actions가 준비 커밋과 취소 커밋을 push할 수 있게 둡니다.
-- `pypi` environment(배포 환경)를 만들고, 완전 자동 배포를 원하면 필수 승인자를 두지 않습니다.
-- PyPI Trusted Publisher에 소유자 `zhsks311`, 저장소 `didimlog`, workflow `release.yml`, environment `pypi`를 등록합니다.
-- GitHub Release immutability(공개 후 수정 금지)를 켭니다.
+- Set GitHub Actions `Workflow permissions` to `Read and write permissions`.
+- Create the `release:none`, `release:patch`, `release:minor`, `release:major`, and `release:ready` labels.
+- Configure `main` to require PRs, CI, and `release-state`, and require PR branches to include the latest `main` before they can be merged. Allow only merge commits, and block squash merges, rebases, and direct pushes.
+- Allow GitHub Actions to push preparation and cancellation commits to `develop`.
+- Create the `pypi` environment, and do not assign required reviewers if fully automated deployment is desired.
+- Register a PyPI Trusted Publisher with owner `zhsks311`, repository `didimlog`, workflow `release.yml`, and environment `pypi`.
+- Enable GitHub Release immutability so releases cannot be modified after publication.
 
-`develop` → `main` PR에 선택 레이블이 없거나 `release:none`이면 배포하지 않습니다. 배포하려면 다음 버전 레이블 중 하나만 붙입니다.
+A `develop` → `main` PR is not released if it has no release label or has `release:none`. To release it, apply exactly one of the following version labels:
 
-- `release:patch`: 버그 수정 버전 준비
-- `release:minor`: 하위 호환 기능 버전 준비
-- `release:major`: 호환성이 깨지는 버전 준비
+- `release:patch`: Prepare a bug-fix release
+- `release:minor`: Prepare a backward-compatible feature release
+- `release:major`: Prepare a release with breaking changes
 
-자동화는 `pyproject.toml`, `uv.lock`, `CHANGELOG.md`를 갱신하고 전체 테스트와 빌드를 실행합니다. 준비가 끝나면 `release:ready`를 붙이지만, 이 레이블은 현재 상태를 보여 주는 표시입니다. 실제 필수 병합 기준은 현재 PR 커밋의 Git 이력에 유효한 준비 기록이 남아 있고, 바로 그 커밋에 대한 `release-state` 검사가 통과하는 것입니다.
+The automation updates `pyproject.toml`, `uv.lock`, and `CHANGELOG.md`, then runs the full test suite and build. When preparation finishes, it applies `release:ready`, but this label is only an indicator of the current state. The actual required merge condition is that the Git history of the current PR commit contains a valid preparation record and the `release-state` check passes for that exact commit.
 
-준비 뒤 PR에 커밋을 추가하면 자동화가 이전 준비를 취소하고 새 커밋 기준으로 다시 준비합니다. 그사이 `main`이 전진하면 이전 준비를 취소하고 PR 브랜치가 최신 `main`을 반영할 때까지 기다립니다. 반영 뒤 자동으로 다시 준비합니다.
+If a commit is added to the PR after preparation, the automation cancels the previous preparation and prepares again from the new commit. If `main` advances in the meantime, it cancels the previous preparation and waits until the PR branch includes the latest `main`. It then prepares the release again automatically.
 
-`main` 병합은 두 부모를 가진 merge commit만 배포 대상으로 인식합니다. squash, rebase, direct push는 배포하지 않고 릴리스 workflow를 오류로 끝냅니다.
+Only a merge commit on `main` with two parents is recognized as a release target. Squash merges, rebases, and direct pushes are not released and cause the release workflow to finish with an error.
 
-`hotfix/*` → `main` PR은 `release:patch`만 지원합니다. patch 배포에 성공하면 `main`을 `develop`에 직접 합칩니다. 보호 규칙이나 충돌로 직접 반영할 수 없으면 `main` → `develop` 동기화 PR을 만들거나 갱신합니다.
+A `hotfix/*` → `main` PR supports only `release:patch`. After a successful patch release, the automation merges `main` directly into `develop`. If protection rules or conflicts prevent the direct update, it creates or updates a `main` → `develop` synchronization PR.
 
-기여 방법은 [`CONTRIBUTING.md`](CONTRIBUTING.md), 보안 제보 방법은 [`SECURITY.md`](SECURITY.md), 사용자-visible 변경은 [`CHANGELOG.md`](CHANGELOG.md)에서 확인할 수 있습니다.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for contribution instructions, [`SECURITY.md`](SECURITY.md) for reporting security issues, and [`CHANGELOG.md`](CHANGELOG.md) for user-visible changes.
 
-## 라이선스
+## License
 
-Didimlog는 MIT License로 배포됩니다. Python-Markdown과 vendored Mermaid의 라이선스는 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)에 있습니다.
+Didimlog is distributed under the [MIT License](LICENSE). Licenses for Python-Markdown and the vendored Mermaid are listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
