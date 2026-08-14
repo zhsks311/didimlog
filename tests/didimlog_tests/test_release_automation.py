@@ -2697,6 +2697,16 @@ class ReleaseAutomationTests(unittest.TestCase):
             ["main", "develop"],
         )
 
+        self.assertEqual(workflow["permissions"]["statuses"], "write")
+        publish_status = next(
+            step
+            for step in workflow["jobs"]["test"]["steps"]
+            if step.get("name") == "Publish exact-head required status"
+        )
+        self.assertIn("github.event_name == 'workflow_dispatch'", publish_status["if"])
+        self.assertIn("statuses/${GITHUB_SHA}", publish_status["run"])
+        self.assertIn('context="${STATUS_CONTEXT}"', publish_status["run"])
+
 
 if __name__ == "__main__":
     unittest.main()
