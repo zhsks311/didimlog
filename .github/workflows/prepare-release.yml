@@ -217,7 +217,7 @@ jobs:
             git -C pr-data revert --no-commit "${cancel_sha}"
             git -C pr-data diff --binary HEAD -- "${release_paths[@]}" > artifact/cancel.patch
             test -s artifact/cancel.patch
-            test "$(git -C pr-data diff --name-only | sort)" = "$(printf '%s\n' "${release_paths[@]}" | sort)"
+            test "$(git -C pr-data diff --name-only HEAD | sort)" = "$(printf '%s\n' "${release_paths[@]}" | sort)"
             git -C pr-data add -- "${release_paths[@]}"
             cancel_tree="$(git -C pr-data write-tree)"
             cancel_digest="$(sha256sum artifact/cancel.patch | cut -d ' ' -f 1)"
