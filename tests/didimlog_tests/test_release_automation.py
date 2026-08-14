@@ -2004,6 +2004,10 @@ class ReleaseAutomationTests(unittest.TestCase):
             'git -C pr-data revert --no-commit "${cancel_sha}"',
             compute_plan,
         )
+        self.assertIn(
+            "git -C pr-data diff --name-only HEAD | sort",
+            compute_plan,
+        )
         self.assertNotIn("parent_blob=", compute_plan)
         self.assertNotIn("restored_blob=", compute_plan)
         self.assertNotIn("hash-object", compute_plan)
@@ -2039,7 +2043,7 @@ class ReleaseAutomationTests(unittest.TestCase):
         self.assertEqual(jobs["mutate"]["permissions"], {"contents": "write"})
         self.assertEqual(
             jobs["project-ready"]["permissions"],
-            {"issues": "write", "pull-requests": "read"},
+            {"pull-requests": "write"},
         )
         self.assertEqual(
             jobs["dispatch-ci"]["permissions"],
