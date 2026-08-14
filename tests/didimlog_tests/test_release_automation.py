@@ -2253,6 +2253,7 @@ class ReleaseAutomationTests(unittest.TestCase):
                 "version": "${{ steps.classify.outputs.version }}",
                 "kind": "${{ steps.classify.outputs.kind }}",
                 "reason": "${{ steps.classify.outputs.reason }}",
+                "release_sha": "${{ steps.classify.outputs.release_sha }}",
             },
         )
         self.assertEqual(checkout["uses"], "actions/checkout@v4")
@@ -2262,7 +2263,12 @@ class ReleaseAutomationTests(unittest.TestCase):
         self.assertEqual(len(detect["steps"]), 2)
 
         self.assertIn(
-            '.github/scripts/release.py classify-merge --repo . --merge-sha "${GITHUB_SHA}"',
+            '.github/scripts/release.py classify-merge --repo . --merge-sha "${RELEASE_SHA}"',
+            classify,
+        )
+        self.assertIn('test "${GITHUB_REF}" = "refs/heads/main"', classify)
+        self.assertIn(
+            'git merge-base --is-ancestor "${REQUESTED_RELEASE_SHA}" origin/main',
             classify,
         )
         self.assertIn("PUBLISH)", classify)
@@ -2358,13 +2364,16 @@ class ReleaseAutomationTests(unittest.TestCase):
         self.assertEqual(build_step, "uv build --out-dir dist/packages")
         self.assertIn('wheel="didimlog-${VERSION}-py3-none-any.whl"', digest_step)
         self.assertIn('sdist="didimlog-${VERSION}.tar.gz"', digest_step)
-        self.assertIn('test "$(find dist/packages -type f | wc -l)" -eq 2', digest_step)
+        self.assertIn(
+            'find dist/packages -type f ! -name ".gitignore" | wc -l',
+            digest_step,
+        )
         self.assertIn('sha256sum "${wheel}" "${sdist}" > ../SHA256SUMS', digest_step)
         self.assertIn("sha256sum --strict --check ../SHA256SUMS", digest_step)
         self.assertIn(
-            'test "$(git rev-list -n 1 "${TAG}")" = "${GITHUB_SHA}"', tag_step
+            'test "$(git rev-list -n 1 "${TAG}")" = "${RELEASE_SHA}"', tag_step
         )
-        self.assertIn('git tag "${TAG}" "${GITHUB_SHA}"', tag_step)
+        self.assertIn('git tag "${TAG}" "${RELEASE_SHA}"', tag_step)
         self.assertIn(
             'expected_assets="$(printf \'%s\\n\' "${wheel}" "${sdist}" SHA256SUMS | sort)"',
             release_step,
@@ -2423,7 +2432,10 @@ class ReleaseAutomationTests(unittest.TestCase):
             workflow, "reconcile-open-prs", "Reconcile every eligible open pull request"
         )["run"]
 
-        self.assertEqual(triggers, {"push": {"branches": ["main"]}})
+        self.assertEqual(triggers["push"], {"branches": ["main"]})
+        self.assertTrue(
+            triggers["workflow_dispatch"]["inputs"]["release_sha"]["required"]
+        )
         self.assertEqual(workflow["permissions"], {"contents": "read"})
         self.assertEqual(
             set(workflow["jobs"]),
@@ -2460,6 +2472,7 @@ class ReleaseAutomationTests(unittest.TestCase):
 
         self.assertEqual(fanout["needs"], ["detect", "publish"])
         self.assertIn("always()", condition)
+        self.assertIn("github.event_name == 'push'", condition)
         self.assertIn("needs.detect.result == 'success'", condition)
         self.assertIn("needs.detect.result == 'failure'", condition)
         self.assertIn("needs.publish.result == 'success'", condition)
@@ -2540,7 +2553,7 @@ class ReleaseAutomationTests(unittest.TestCase):
             "git fetch --no-tags origin", pre_push_fetch + 1
         )
         self.assertIn(
-            'git merge-base --is-ancestor "${GITHUB_SHA}" origin/main', run
+            'git merge-base --is-ancestor "${RELEASE_SHA}" origin/main', run
         )
         self.assertIn(
             "git merge-base --is-ancestor origin/main origin/develop", run
@@ -2612,7 +2625,7 @@ class ReleaseAutomationTests(unittest.TestCase):
         self.assertIn(".head.sha == $main_oid", run)
         self.assertLess(
             run.index(
-                'git merge-base --is-ancestor "${GITHUB_SHA}" "${main_oid}"'
+                'git merge-base --is-ancestor "${RELEASE_SHA}" "${main_oid}"'
             ),
             run.index(
                 'repository_id="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .id)"'
@@ -2654,7 +2667,7 @@ class ReleaseAutomationTests(unittest.TestCase):
         self.assertIn('-f "title=${title}"', run)
         self.assertIn('-f "body=${body}"', run)
         self.assertIn("${VERSION}", run)
-        self.assertIn("${GITHUB_SHA}", run)
+        self.assertIn("${RELEASE_SHA}", run)
 
     def test_hotfix_sync_rejects_fork_wrong_ref_oid_and_multiple_candidates(self):
         workflow = self.release_workflow()
@@ -2673,7 +2686,7 @@ class ReleaseAutomationTests(unittest.TestCase):
         ):
             self.assertIn(invariant, run)
         self.assertIn(
-            'git merge-base --is-ancestor "${GITHUB_SHA}" "${main_oid}"', run
+            'git merge-base --is-ancestor "${RELEASE_SHA}" "${main_oid}"', run
         )
         self.assertIn('echo "Refusing ambiguous hotfix sync PR candidates"', run)
         self.assertRegex(

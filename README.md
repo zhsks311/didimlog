@@ -406,6 +406,8 @@ If a commit is added to the PR after preparation, the automation cancels the pre
 
 Only a merge commit on `main` with two parents is recognized as a release target. Squash merges, rebases, and direct pushes are not released and cause the release workflow to finish with an error.
 
+If deployment fails, select `Run workflow` in GitHub Actions under `Publish prepared main release`, then enter the failed merge commit SHA. The automation verifies that the commit is still a valid release contained in the current `main`, and resumes publication of the same version only when it does not conflict with existing tags or files.
+
 A `hotfix/*` → `main` PR supports only `release:patch`. After a successful patch release, the automation merges `main` directly into `develop`. If protection rules or conflicts prevent the direct update, it creates or updates a `main` → `develop` synchronization PR.
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for contribution instructions, [`SECURITY.md`](SECURITY.md) for reporting security issues, and [`CHANGELOG.md`](CHANGELOG.md) for user-visible changes.

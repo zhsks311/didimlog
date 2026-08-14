@@ -89,7 +89,10 @@ class ReleaseContractTests(unittest.TestCase):
         workflow = yaml.safe_load(workflow_text)
         triggers = workflow.get("on", workflow.get(True))
 
-        self.assertEqual(triggers, {"push": {"branches": ["main"]}})
+        self.assertEqual(triggers["push"], {"branches": ["main"]})
+        release_sha = triggers["workflow_dispatch"]["inputs"]["release_sha"]
+        self.assertTrue(release_sha["required"])
+        self.assertEqual(release_sha["type"], "string")
         self.assertEqual(workflow["permissions"], {"contents": "read"})
         for job in workflow["jobs"].values():
             self.assertFalse(self._contains_key(job, "password"))
@@ -126,7 +129,10 @@ class ReleaseContractTests(unittest.TestCase):
             reconcile_triggers["pull_request_target"]["types"],
             ["opened", "reopened", "synchronize", "labeled", "unlabeled"],
         )
-        self.assertEqual(delivery_triggers, {"push": {"branches": ["main"]}})
+        self.assertEqual(delivery_triggers["push"], {"branches": ["main"]})
+        self.assertTrue(
+            delivery_triggers["workflow_dispatch"]["inputs"]["release_sha"]["required"]
+        )
         self.assertIn("must apply the following settings manually", release_guide)
         self.assertIn(
             "Merging the workflow file alone does not create these settings.",
@@ -170,7 +176,11 @@ class ReleaseContractTests(unittest.TestCase):
             release_guide,
         )
         self.assertIn("`main` advances", release_guide)
-        self.assertIn("waits until the PR branch includes the latest `main`", release_guide)
+        self.assertIn("failed merge commit SHA", release_guide)
+        self.assertIn("Publish prepared main release", release_guide)
+        self.assertIn(
+            "waits until the PR branch includes the latest `main`", release_guide
+        )
 
         hotfix_sync = delivery["jobs"]["sync-hotfix-to-develop"]
         self.assertEqual(hotfix_sync["needs"], ["detect", "publish"])
