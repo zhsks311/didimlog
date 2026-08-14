@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "didimlog"
-version = "0.0.3"
+version = "0.0.2"
 description = "Local-first, evidence-led personal and project knowledge CLI"
 readme = "README.md"
 requires-python = ">=3.11"
