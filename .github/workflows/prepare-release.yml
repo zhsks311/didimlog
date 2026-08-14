@@ -590,7 +590,7 @@ jobs:
           )"
           test "${remote_head}" = "${FINAL_HEAD}"
           test "${FINAL_HEAD}" = "${{ needs.mutate.outputs.final_head }}"
-          gh workflow run ci.yml --ref "${HEAD_REF}"
+          gh workflow run ci.yml --repo "${GITHUB_REPOSITORY}" --ref "${HEAD_REF}"
 
   check-final:
     needs:
