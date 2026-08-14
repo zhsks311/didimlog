@@ -497,8 +497,7 @@ jobs:
       (needs.mutate.result == 'success' || needs.mutate.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
-      issues: write
-      pull-requests: read
+      pull-requests: write
     outputs:
       final_head: ${{ steps.project-ready.outputs.final_head }}
       desired_ready: ${{ steps.project-ready.outputs.desired_ready }}

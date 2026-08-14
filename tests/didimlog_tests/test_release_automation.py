@@ -2039,7 +2039,7 @@ class ReleaseAutomationTests(unittest.TestCase):
         self.assertEqual(jobs["mutate"]["permissions"], {"contents": "write"})
         self.assertEqual(
             jobs["project-ready"]["permissions"],
-            {"issues": "write", "pull-requests": "read"},
+            {"pull-requests": "write"},
         )
         self.assertEqual(
             jobs["dispatch-ci"]["permissions"],
