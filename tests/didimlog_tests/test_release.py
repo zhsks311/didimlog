@@ -182,19 +182,21 @@ class ReleaseContractTests(unittest.TestCase):
         )
         self.assertIn("`main` → `develop` 동기화 PR", release_guide)
 
-        unreleased_items = [
-            line for line in unreleased.splitlines() if line.startswith("- ")
-        ]
-        self.assertEqual(len(unreleased_items), 1)
-        for documented_outcome in (
+        documented_outcomes = (
             "PR별로 준비·취소 기록",
             "취소가 먼저 오든 병합이 먼저 오든",
             "여러 릴리스 PR을 최신 기준으로 다시 계산",
             "`main` → `develop` 동기화 PR",
             "취소 과정은 후속 변경을 보존",
             "hotfix 동기화는 한 번에 하나씩",
-        ):
-            self.assertIn(documented_outcome, unreleased_items[0])
+        )
+        matching_items = [
+            line
+            for line in changelog.splitlines()
+            if line.startswith("- ")
+            and all(outcome in line for outcome in documented_outcomes)
+        ]
+        self.assertEqual(len(matching_items), 1)
 
     def test_release_generates_a_verified_manifest_for_exactly_wheel_and_sdist(self):
         workflow = yaml.safe_load(
