@@ -2218,7 +2218,10 @@ class ReleaseAutomationTests(unittest.TestCase):
         self.assertNotIn("git ls-remote", dispatch_ci)
         self.assertIn("needs.project-ready.result == 'success'", dispatch_job["if"])
         self.assertIn("needs.mutate.outputs.final_head", dispatch_ci)
-        self.assertIn('gh workflow run ci.yml --ref "${HEAD_REF}"', dispatch_ci)
+        self.assertIn(
+            'gh workflow run ci.yml --repo "${GITHUB_REPOSITORY}" --ref "${HEAD_REF}"',
+            dispatch_ci,
+        )
 
     def release_workflow(self):
         workflow_path = REPO / ".github" / "workflows" / "release.yml"
