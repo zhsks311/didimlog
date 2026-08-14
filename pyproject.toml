@@ -39,6 +39,7 @@ didim = "didimlog.cli:main"
 source-include = [
     "CHANGELOG.md",
     "CONTRIBUTING.md",
+    "README.ko.md",
     "SECURITY.md",
     "uv.lock",
 ]

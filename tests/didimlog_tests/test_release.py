@@ -21,6 +21,7 @@ PUBLIC_SOURCE_FILES = {
     "CONTRIBUTING.md",
     "LICENSE",
     "README.md",
+    "README.ko.md",
     "SECURITY.md",
     "THIRD_PARTY_NOTICES.md",
     "pyproject.toml",
@@ -62,6 +63,13 @@ class ReleaseContractTests(unittest.TestCase):
         for name in ("CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md"):
             self.assertTrue((REPO / name).is_file(), name)
 
+    def test_readmes_expose_language_switches(self):
+        english = (REPO / "README.md").read_text(encoding="utf-8")
+        korean = (REPO / "README.ko.md").read_text(encoding="utf-8")
+
+        self.assertIn("English | [한국어](README.ko.md)", english)
+        self.assertIn("[English](README.md) | 한국어", korean)
+
     def test_ci_covers_supported_matrix_canonical_suite_build_and_wheel_smoke(self):
         workflow = (REPO / ".github/workflows/ci.yml").read_text(encoding="utf-8")
 
@@ -100,7 +108,7 @@ class ReleaseContractTests(unittest.TestCase):
 
     def test_release_guide_matches_reconciliation_and_delivery_workflows(self):
         readme = (REPO / "README.md").read_text(encoding="utf-8")
-        release_guide = readme.split("### 릴리스", 1)[1].split("\n## ", 1)[0]
+        release_guide = readme.split("### Release", 1)[1].split("\n## ", 1)[0]
         changelog = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
         unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
         reconcile = yaml.safe_load(
@@ -119,9 +127,9 @@ class ReleaseContractTests(unittest.TestCase):
             ["opened", "reopened", "synchronize", "labeled", "unlabeled"],
         )
         self.assertEqual(delivery_triggers, {"push": {"branches": ["main"]}})
-        self.assertIn("직접 적용해야 합니다", release_guide)
+        self.assertIn("must apply the following settings manually", release_guide)
         self.assertIn(
-            "workflow 파일만 병합해도 이 설정은 생기지 않습니다.",
+            "Merging the workflow file alone does not create these settings.",
             release_guide,
         )
 
@@ -136,11 +144,11 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertEqual(check_name, "release-state")
         self.assertIn('--head-sha "${FINAL_HEAD_SHA}"', final_check)
         self.assertIn('"head_sha": $head_sha', final_check)
-        self.assertIn(f"`{check_name}` 통과를 필수", release_guide)
-        self.assertIn("현재 PR 커밋의 Git 이력", release_guide)
-        self.assertIn("바로 그 커밋", release_guide)
+        self.assertIn(f"`{check_name}` check passes", release_guide)
+        self.assertIn("Git history of the current PR commit", release_guide)
+        self.assertIn("that exact commit", release_guide)
         self.assertIn(
-            "최신 `main`을 반영해야 병합할 수 있도록",
+            "include the latest `main` before they can be merged",
             release_guide,
         )
 
@@ -150,19 +158,19 @@ class ReleaseContractTests(unittest.TestCase):
             if step.get("name") == "Classify the immutable merge evidence"
         )
         self.assertIn("classify-merge", classify)
-        self.assertIn("두 부모를 가진 merge commit만", release_guide)
+        self.assertIn("merge commit on `main` with two parents", release_guide)
         for unsupported_merge in ("squash", "rebase", "direct push"):
             self.assertIn(unsupported_merge, release_guide)
 
         reconcile_open_prs = delivery["jobs"]["reconcile-open-prs"]
         self.assertEqual(reconcile_open_prs["needs"], ["detect", "publish"])
-        self.assertIn("준비 뒤 PR에 커밋을 추가하면", release_guide)
+        self.assertIn("commit is added to the PR after preparation", release_guide)
         self.assertIn(
-            "이전 준비를 취소하고 새 커밋 기준으로 다시 준비",
+            "cancels the previous preparation and prepares again from the new commit",
             release_guide,
         )
-        self.assertIn("`main`이 전진", release_guide)
-        self.assertIn("최신 `main`을 반영할 때까지 기다립니다", release_guide)
+        self.assertIn("`main` advances", release_guide)
+        self.assertIn("waits until the PR branch includes the latest `main`", release_guide)
 
         hotfix_sync = delivery["jobs"]["sync-hotfix-to-develop"]
         self.assertEqual(hotfix_sync["needs"], ["detect", "publish"])
@@ -175,12 +183,12 @@ class ReleaseContractTests(unittest.TestCase):
         )
         self.assertIn('-f "base=develop"', sync_run)
         self.assertIn('-f "head=main"', sync_run)
-        self.assertIn("patch 배포에 성공하면", release_guide)
+        self.assertIn("After a successful patch release", release_guide)
         self.assertIn(
-            "`hotfix/*` → `main` PR은 `release:patch`만 지원",
+            "`hotfix/*` → `main` PR supports only `release:patch`",
             release_guide,
         )
-        self.assertIn("`main` → `develop` 동기화 PR", release_guide)
+        self.assertIn("`main` → `develop` synchronization PR", release_guide)
 
         unreleased_items = [
             line for line in unreleased.splitlines() if line.startswith("- ")

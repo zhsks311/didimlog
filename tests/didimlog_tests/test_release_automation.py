@@ -814,7 +814,7 @@ class ReleaseAutomationTests(unittest.TestCase):
 
     def test_documented_release_labels_match_runtime_selection_policy(self):
         readme = (REPO / "README.md").read_text(encoding="utf-8")
-        release_guide = readme.split("### 릴리스", 1)[1].split("\n## ", 1)[0]
+        release_guide = readme.split("### Release", 1)[1].split("\n## ", 1)[0]
         documented_labels = set(
             re.findall(r"`(release:[a-z]+)`", release_guide)
         )
@@ -829,12 +829,12 @@ class ReleaseAutomationTests(unittest.TestCase):
             },
         )
         self.assertIn(
-            "선택 레이블이 없거나 `release:none`이면 배포하지 않습니다",
+            "has no release label or has `release:none`",
             release_guide,
         )
-        self.assertIn("다음 버전 레이블 중 하나만 붙입니다", release_guide)
+        self.assertIn("apply exactly one of the following version labels", release_guide)
         self.assertIn(
-            "`release:ready`를 붙이지만, 이 레이블은 현재 상태를 보여 주는 표시",
+            "applies `release:ready`, but this label is only an indicator",
             release_guide,
         )
 
