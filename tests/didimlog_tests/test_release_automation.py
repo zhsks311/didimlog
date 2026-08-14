@@ -2684,6 +2684,12 @@ class ReleaseAutomationTests(unittest.TestCase):
         self.assertIn("workflow_dispatch", triggers)
         self.assertIsNone(triggers["workflow_dispatch"])
 
+        self.assertEqual(triggers["push"]["branches"], ["main"])
+        self.assertEqual(
+            triggers["pull_request"]["branches"],
+            ["main", "develop"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
