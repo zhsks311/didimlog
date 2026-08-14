@@ -81,7 +81,10 @@ class ReleaseContractTests(unittest.TestCase):
         workflow = yaml.safe_load(workflow_text)
         triggers = workflow.get("on", workflow.get(True))
 
-        self.assertEqual(triggers, {"push": {"branches": ["main"]}})
+        self.assertEqual(triggers["push"], {"branches": ["main"]})
+        release_sha = triggers["workflow_dispatch"]["inputs"]["release_sha"]
+        self.assertTrue(release_sha["required"])
+        self.assertEqual(release_sha["type"], "string")
         self.assertEqual(workflow["permissions"], {"contents": "read"})
         for job in workflow["jobs"].values():
             self.assertFalse(self._contains_key(job, "password"))
@@ -118,7 +121,10 @@ class ReleaseContractTests(unittest.TestCase):
             reconcile_triggers["pull_request_target"]["types"],
             ["opened", "reopened", "synchronize", "labeled", "unlabeled"],
         )
-        self.assertEqual(delivery_triggers, {"push": {"branches": ["main"]}})
+        self.assertEqual(delivery_triggers["push"], {"branches": ["main"]})
+        self.assertTrue(
+            delivery_triggers["workflow_dispatch"]["inputs"]["release_sha"]["required"]
+        )
         self.assertIn("직접 적용해야 합니다", release_guide)
         self.assertIn(
             "workflow 파일만 병합해도 이 설정은 생기지 않습니다.",
@@ -162,6 +168,8 @@ class ReleaseContractTests(unittest.TestCase):
             release_guide,
         )
         self.assertIn("`main`이 전진", release_guide)
+        self.assertIn("실패한 merge commit SHA", release_guide)
+        self.assertIn("Publish prepared main release", release_guide)
         self.assertIn("최신 `main`을 반영할 때까지 기다립니다", release_guide)
 
         hotfix_sync = delivery["jobs"]["sync-hotfix-to-develop"]

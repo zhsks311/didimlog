@@ -219,6 +219,8 @@ uv run --project . python -m unittest tests.didimlog_tests.test_release -v
 
 `main` 병합은 두 부모를 가진 merge commit만 배포 대상으로 인식합니다. squash, rebase, direct push는 배포하지 않고 릴리스 workflow를 오류로 끝냅니다.
 
+배포가 실패하면 GitHub Actions의 `Publish prepared main release`에서 `Run workflow`를 선택하고 실패한 merge commit SHA를 입력합니다. 자동화는 그 커밋이 현재 `main`에 포함된 유효한 릴리스인지 다시 검증하고, 이미 만들어진 태그·파일과 충돌하지 않을 때만 같은 버전 배포를 이어서 실행합니다.
+
 `hotfix/*` → `main` PR은 `release:patch`만 지원합니다. patch 배포에 성공하면 `main`을 `develop`에 직접 합칩니다. 보호 규칙이나 충돌로 직접 반영할 수 없으면 `main` → `develop` 동기화 PR을 만들거나 갱신합니다.
 
 기여 방법은 [`CONTRIBUTING.md`](CONTRIBUTING.md), 보안 제보 방법은 [`SECURITY.md`](SECURITY.md), 사용자-visible 변경은 [`CHANGELOG.md`](CHANGELOG.md)에서 확인할 수 있습니다.
