@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-08-14
+
 ### 추가
 
 - 릴리스 PR별로 준비·취소 기록을 Git 이력에 남기고, 취소가 먼저 오든 병합이 먼저 오든 같은 배포 여부를 결정하도록 바꿨습니다. `main`이 전진하면 열려 있는 여러 릴리스 PR을 최신 기준으로 다시 계산합니다. 준비 뒤 릴리스 파일을 수정해도 취소 과정은 후속 변경을 보존하며, 여러 hotfix 동기화는 한 번에 하나씩 처리합니다. `hotfix/*`의 patch 배포 뒤에는 `main`을 `develop`에 직접 합치고, 보호 규칙이나 충돌로 막히면 `main` → `develop` 동기화 PR을 만들거나 갱신합니다.
@@ -38,6 +40,7 @@
 - macOS·Linux 및 Python 3.11~3.14 지원 계약.
 
 
-[Unreleased]: https://github.com/zhsks311/didimlog/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/zhsks311/didimlog/compare/v0.0.3...HEAD
+[0.0.3]: https://github.com/zhsks311/didimlog/releases/tag/v0.0.3
 [0.0.2]: https://github.com/zhsks311/didimlog/releases/tag/v0.0.2
 [0.0.1]: https://github.com/zhsks311/didimlog/releases/tag/v0.0.1
