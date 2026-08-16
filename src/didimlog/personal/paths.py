@@ -137,7 +137,7 @@ def resolve_project_directory(base: Path, project: str) -> ProjectDirectory | No
     logical = normalized_base / validated_project
     try:
         entry_info = logical.lstat()
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         entry_info = None
 
     try:

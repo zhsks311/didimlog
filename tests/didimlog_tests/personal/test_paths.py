@@ -162,6 +162,34 @@ class PersonalPathTests(unittest.TestCase):
                 "source category must be a real directory",
             )
 
+    def test_project_directory_rejects_base_replaced_by_file_during_lookup(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            base = root / "knowledge" / "lessons"
+            base.mkdir(parents=True)
+            logical = base / "missing"
+            original_lstat = Path.lstat
+
+            def replace_base_with_file_before_child_lstat(path):
+                if path == logical:
+                    base.rename(root / "original-lessons")
+                    base.write_text("not a directory", encoding="utf-8")
+                return original_lstat(path)
+
+            with mock.patch.object(
+                Path,
+                "lstat",
+                replace_base_with_file_before_child_lstat,
+            ):
+                with self.assertRaises(ProjectDirectoryError) as caught:
+                    resolve_project_directory(base, "missing")
+
+            self.assertEqual(caught.exception.logical, base)
+            self.assertEqual(
+                caught.exception.reason,
+                "source category must be a real directory",
+            )
+
     def test_project_directory_rejects_symlink_base(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
