@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import os
 import re
+import stat
 import subprocess
 from pathlib import Path
 
@@ -12,6 +15,25 @@ from didimlog.errors import DidimError, EXIT_GIT, EXIT_POLICY, EXIT_USAGE
 _PROJECT_SLUG = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$")
 _GLOBAL_PROJECT = "_global"
 _GIT_TIMEOUT_SECONDS = 5
+
+
+@dataclass(frozen=True)
+class ProjectDirectory:
+    logical: Path
+    physical: Path
+    entry_identity: tuple[int, int, int]
+    target_identity: tuple[int, int, int]
+
+
+class ProjectDirectoryError(ValueError):
+    def __init__(self, logical: Path, reason: str) -> None:
+        super().__init__(reason)
+        self.logical = logical
+        self.reason = reason
+
+
+def _directory_identity(info: os.stat_result) -> tuple[int, int, int]:
+    return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode))
 
 
 class _ProjectError(DidimError, ValueError):
@@ -92,6 +114,96 @@ def validate_project(value: str, *, allow_global: bool = False) -> str:
             help_text="프로젝트 이름에는 영문자, 숫자와 단일 하이픈만 사용하세요.",
         )
     return value
+
+
+def resolve_project_directory(base: Path, project: str) -> ProjectDirectory | None:
+    """Resolve a validated logical project entry to a real directory."""
+    validated_project = validate_project(project, allow_global=True)
+    normalized_base = Path(os.path.abspath(base))
+    try:
+        base_info = normalized_base.lstat()
+    except OSError as error:
+        raise ProjectDirectoryError(
+            normalized_base,
+            "source category must be a real directory",
+        ) from error
+    if not stat.S_ISDIR(base_info.st_mode):
+        raise ProjectDirectoryError(
+            normalized_base,
+            "source category must be a real directory",
+        )
+
+    logical = normalized_base / validated_project
+    try:
+        entry_info = logical.lstat()
+    except FileNotFoundError:
+        return None
+
+    if stat.S_ISDIR(entry_info.st_mode):
+        identity = _directory_identity(entry_info)
+        return ProjectDirectory(
+            logical=logical,
+            physical=logical,
+            entry_identity=identity,
+            target_identity=identity,
+        )
+
+    if not stat.S_ISLNK(entry_info.st_mode):
+        raise ProjectDirectoryError(
+            logical,
+            "project entry must point to a directory",
+        )
+
+    try:
+        physical = logical.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise ProjectDirectoryError(
+            logical,
+            "project link target is missing",
+        ) from error
+    except (OSError, RuntimeError) as error:
+        raise ProjectDirectoryError(
+            logical,
+            "project link cannot be resolved",
+        ) from error
+
+    try:
+        target_info = physical.stat()
+    except FileNotFoundError as error:
+        raise ProjectDirectoryError(
+            logical,
+            "project link target is missing",
+        ) from error
+    except OSError as error:
+        raise ProjectDirectoryError(
+            logical,
+            "project link cannot be resolved",
+        ) from error
+
+    if not stat.S_ISDIR(target_info.st_mode):
+        raise ProjectDirectoryError(
+            logical,
+            "project entry must point to a directory",
+        )
+
+    return ProjectDirectory(
+        logical=logical,
+        physical=physical,
+        entry_identity=_directory_identity(entry_info),
+        target_identity=_directory_identity(target_info),
+    )
+
+
+def project_directory_unchanged(directory: ProjectDirectory) -> bool:
+    """Return whether a project entry still resolves to the same directory."""
+    try:
+        current = resolve_project_directory(
+            directory.logical.parent,
+            directory.logical.name,
+        )
+    except (OSError, ValueError):
+        return False
+    return current == directory
 
 
 def resolve_project(
