@@ -37,6 +37,14 @@ find_when: [mongodb, recovery]
 장문 해설 본문 표식
 """
 
+def _synthetic_entry(name, info):
+    entry = mock.Mock()
+    entry.name = name
+    entry.suffix = Path(name).suffix
+    entry.lstat.return_value = info
+    return entry
+
+
 def _write_paused_stale_index(root, snapshot_ready, release_snapshot):
     data_root = Path(root)
     original_build_all = knowledge_index.build_all
@@ -220,6 +228,75 @@ class KnowledgeIndexTests(unittest.TestCase):
         self.write("book/demo-api/drafts/ignored.md", "not book metadata")
 
         self.assertEqual(knowledge_index.build_all(self.root), expected)
+
+    def test_invalid_utf8_unrelated_entries_do_not_change_generated_indexes(self):
+        source = self.write("lessons/demo-api/rule.md", LESSON)
+        expected = knowledge_index.build_all(self.root)
+        lessons = self.root / "lessons"
+        project = lessons / "demo-api"
+        original_iterdir = Path.iterdir
+        invalid_root_file = _synthetic_entry(
+            "notes-\udcff",
+            source.lstat(),
+        )
+        invalid_project = _synthetic_entry(
+            "not_\udcff",
+            project.lstat(),
+        )
+        invalid_project_file = _synthetic_entry(
+            "notes-\udcff.txt",
+            source.lstat(),
+        )
+        invalid_nested_directory = _synthetic_entry(
+            "drafts-\udcff",
+            project.lstat(),
+        )
+
+        def injected_entries(path):
+            entries = list(original_iterdir(path))
+            if path == lessons:
+                return [*entries, invalid_root_file, invalid_project]
+            if path == project:
+                return [
+                    *entries,
+                    invalid_project_file,
+                    invalid_nested_directory,
+                ]
+            return entries
+
+        with mock.patch.object(Path, "iterdir", injected_entries):
+            actual = knowledge_index.build_all(self.root)
+
+        self.assertEqual(actual, expected)
+
+    def test_invalid_utf8_selected_markdown_has_structured_logical_error(self):
+        placeholder = self.write("docs/demo-api/placeholder.txt", "ignored")
+        project = placeholder.parent
+        invalid_markdown = _synthetic_entry(
+            "bad-\udcff.md",
+            placeholder.lstat(),
+        )
+        original_iterdir = Path.iterdir
+
+        def injected_entries(path):
+            entries = list(original_iterdir(path))
+            if path == project:
+                return [*entries, invalid_markdown]
+            return entries
+
+        with mock.patch.object(
+            Path,
+            "iterdir",
+            injected_entries,
+        ), self.assertRaises(knowledge_index.KnowledgeSourceError) as caught:
+            knowledge_index.build_all(self.root)
+
+        self.assertEqual(caught.exception.logical_path, "docs/demo-api")
+        self.assertEqual(
+            caught.exception.reason,
+            "source name must be valid UTF-8",
+        )
+        self.assertNotIn(str(self.temporary), str(caught.exception))
 
     def test_noncanonical_lesson_tags_are_rejected(self):
         invalid = LESSON.replace(

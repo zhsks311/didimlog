@@ -79,13 +79,21 @@ def _logical_source_path(
     project: ProjectDirectory,
     relative: Path | None = None,
 ) -> str:
-    logical = Path(project.logical.parent.name) / project.logical.name
+    base = Path(project.logical.parent.name) / project.logical.name
+    logical = base
     if relative is not None:
         logical /= relative
     value = logical.as_posix()
+    try:
+        _byte_key(value)
+    except UnicodeEncodeError as exc:
+        raise KnowledgeSourceError(
+            base.as_posix(),
+            "source name must be valid UTF-8",
+        ) from exc
     if any(ord(char) < 32 or ord(char) == 127 for char in value):
         raise KnowledgeSourceError(
-            "{}/{}".format(project.logical.parent.name, project.logical.name),
+            base.as_posix(),
             "source path contains a control character",
         )
     return value
@@ -123,20 +131,24 @@ def _project_directories(root: Path) -> dict[str, ProjectDirectory]:
         )
 
     try:
-        entries = sorted(root.iterdir(), key=lambda entry: _byte_key(entry.name))
+        entries = list(root.iterdir())
     except OSError as exc:
         raise KnowledgeSourceError(
             root.name,
             "cannot inspect source directory",
         ) from exc
 
-    result = {}
+    selected = []
     for entry in entries:
         try:
             validate_project(entry.name, allow_global=True)
         except ValueError:
             continue
+        selected.append(entry)
 
+    entries = sorted(selected, key=lambda entry: _byte_key(entry.name))
+    result = {}
+    for entry in entries:
         logical_path = "{}/{}".format(root.name, entry.name)
         try:
             entry_info = entry.lstat()
@@ -244,53 +256,68 @@ def _markdown_files(
 
     def scan(directory: Path, parent_relative: Path) -> None:
         try:
-            entries = sorted(
-                directory.iterdir(),
-                key=lambda entry: _byte_key(entry.name),
-            )
+            entries = list(directory.iterdir())
         except OSError as exc:
             raise KnowledgeSourceError(
                 _logical_source_path(project, parent_relative),
                 "cannot inspect source directory",
             ) from exc
 
+        selected = []
         for entry in entries:
             relative = parent_relative / entry.name
-            logical_path = _logical_source_path(project, relative)
             try:
                 entry_info = entry.lstat()
             except OSError as exc:
                 raise KnowledgeSourceError(
-                    logical_path,
+                    _logical_source_path(project, relative),
                     "cannot inspect source entry",
                 ) from exc
 
             if stat.S_ISLNK(entry_info.st_mode):
                 if entry.suffix == ".md":
-                    raise KnowledgeSourceError(
-                        logical_path,
-                        "source must be a regular file",
-                    )
-                if _symlink_points_to_directory(entry):
-                    raise KnowledgeSourceError(
-                        logical_path,
-                        "source directory must be a real directory",
-                    )
+                    action = "invalid-file"
+                elif _symlink_points_to_directory(entry):
+                    action = "invalid-directory"
+                else:
+                    continue
+            elif stat.S_ISDIR(entry_info.st_mode):
+                if not recursive:
+                    continue
+                action = "directory"
+            elif entry.suffix != ".md":
                 continue
+            elif not stat.S_ISREG(entry_info.st_mode):
+                action = "invalid-file"
+            else:
+                action = "file"
 
-            if stat.S_ISDIR(entry_info.st_mode):
-                if recursive:
-                    scan(entry, relative)
-                continue
+            logical_path = _logical_source_path(project, relative)
+            selected.append(
+                (
+                    _byte_key(relative.as_posix()),
+                    entry,
+                    relative,
+                    logical_path,
+                    action,
+                )
+            )
 
-            if entry.suffix != ".md":
-                continue
-            if not stat.S_ISREG(entry_info.st_mode):
+        for _, entry, relative, logical_path, action in sorted(selected):
+            if action == "invalid-file":
                 raise KnowledgeSourceError(
                     logical_path,
                     "source must be a regular file",
                 )
-            files.append(relative)
+            if action == "invalid-directory":
+                raise KnowledgeSourceError(
+                    logical_path,
+                    "source directory must be a real directory",
+                )
+            if action == "directory":
+                scan(entry, relative)
+            else:
+                files.append(relative)
 
     scan(project.physical, Path())
     return sorted(files, key=lambda relative: _byte_key(relative.as_posix()))
