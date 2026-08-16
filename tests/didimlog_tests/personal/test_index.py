@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from didimlog.personal import index as knowledge_index
 from didimlog.personal.lesson_writing import publish_lesson
@@ -201,6 +202,25 @@ class KnowledgeIndexTests(unittest.TestCase):
         self.assertNotIn("전역 규칙", outputs["demo-api"])
         self.assertNotIn("전역 문서", outputs["demo-api"])
 
+    def test_unrelated_entries_do_not_change_generated_indexes(self):
+        self.write("lessons/demo-api/rule.md", LESSON)
+        expected = knowledge_index.build_all(self.root)
+
+        for relative in (
+            "lessons/.DS_Store",
+            "docs/.DS_Store",
+            "book/.DS_Store",
+            "lessons/demo-api/notes.txt",
+            "docs/demo-api/image.png",
+            "book/demo-api/draft.txt",
+            "lessons/not_a_project/ignored.md",
+        ):
+            self.write(relative, "ignored")
+        self.write("lessons/demo-api/guides/ignored.md", "not lesson metadata")
+        self.write("book/demo-api/drafts/ignored.md", "not book metadata")
+
+        self.assertEqual(knowledge_index.build_all(self.root), expected)
+
     def test_noncanonical_lesson_tags_are_rejected(self):
         invalid = LESSON.replace(
             "tags: [nullable, partial-update]",
@@ -335,38 +355,144 @@ body
         target = self.root / "index" / "demo-api.md"
         target.write_text("keep\n", encoding="utf-8")
 
-        with self.assertRaises(knowledge_index.KnowledgeIndexError):
+        with self.assertRaises(knowledge_index.KnowledgeSourceError) as caught:
             knowledge_index.write_all(data_root=self.root, target=self.root / "index")
 
+        self.assertEqual(caught.exception.logical_path, "docs/demo-api/linked")
+        self.assertEqual(
+            caught.exception.reason,
+            "source directory must be a real directory",
+        )
+        self.assertNotIn(str(outside), str(caught.exception))
         self.assertEqual(target.read_text(encoding="utf-8"), "keep\n")
 
-    def test_project_source_symlink_is_rejected(self):
+    def test_target_markdown_symlink_is_rejected_but_other_file_symlinks_are_ignored(
+        self,
+    ):
         outside = self.temporary / "outside"
         outside.mkdir()
-        os.symlink(outside, self.root / "lessons" / "linked")
+        target_markdown = outside / "notice.md"
+        target_markdown.write_text(DOC, encoding="utf-8")
+        target_text = outside / "readme.txt"
+        target_text.write_text("ignored", encoding="utf-8")
+        project = self.root / "docs" / "demo-api"
+        project.mkdir(parents=True)
+        linked_markdown = project / "linked.md"
+        linked_markdown.symlink_to(target_markdown)
 
-        with self.assertRaises(knowledge_index.KnowledgeIndexError):
+        with self.assertRaises(knowledge_index.KnowledgeSourceError) as caught:
             knowledge_index.build_all(self.root)
 
-    def test_nonrecursive_sources_cannot_hide_nested_markdown(self):
-        cases = (
-            ("lessons/demo-api/guides/item.md", LESSON),
-            ("book/demo-api/guides/item.md", BOOK),
+        self.assertEqual(caught.exception.logical_path, "docs/demo-api/linked.md")
+        self.assertEqual(
+            caught.exception.reason,
+            "source must be a regular file",
         )
-        for relative, text in cases:
-            with self.subTest(relative=relative):
-                self.write(relative, text)
-                target = self.root / "index" / "demo-api.md"
-                target.write_text("keep\n", encoding="utf-8")
+        self.assertNotIn(str(outside), str(caught.exception))
 
-                with self.assertRaises(knowledge_index.KnowledgeIndexError):
-                    knowledge_index.write_all(
-                        data_root=self.root,
-                        target=self.root / "index",
-                    )
+        linked_markdown.unlink()
+        (project / "readme.txt").symlink_to(target_text)
+        self.write("docs/demo-api/guide.md", DOC)
 
-                self.assertEqual(target.read_text(encoding="utf-8"), "keep\n")
-                shutil.rmtree((self.root / relative).parents[1])
+        output = knowledge_index.build_all(self.root)["demo-api"]
+
+        self.assertIn("`docs/demo-api/guide.md`", output)
+        self.assertNotIn("readme.txt", output)
+
+    def test_malformed_markdown_has_stable_logical_error_details(self):
+        self.write("docs/demo-api/bad.md", "# no metadata\n")
+
+        with self.assertRaises(knowledge_index.KnowledgeSourceError) as caught:
+            knowledge_index.build_all(self.root)
+
+        self.assertEqual(caught.exception.logical_path, "docs/demo-api/bad.md")
+        self.assertEqual(caught.exception.reason, "missing title or find_when")
+        self.assertNotIn(str(self.temporary), str(caught.exception))
+
+    def test_linked_projects_are_indexed_with_logical_paths(self):
+        external = self.temporary / "external"
+        lesson_root = external / "lessons"
+        docs_root = external / "docs"
+        book_root = external / "book"
+        lesson_root.mkdir(parents=True)
+        docs_root.mkdir()
+        book_root.mkdir()
+        (lesson_root / "rule.md").write_text(LESSON, encoding="utf-8")
+        (docs_root / "nested").mkdir()
+        (docs_root / "nested" / "guide.md").write_text(DOC, encoding="utf-8")
+        (book_root / "guide.md").write_text(BOOK, encoding="utf-8")
+        (self.root / "lessons" / "demo-api").symlink_to(
+            lesson_root,
+            target_is_directory=True,
+        )
+        (self.root / "docs" / "demo-api").symlink_to(
+            docs_root,
+            target_is_directory=True,
+        )
+        (self.root / "book" / "demo-api").symlink_to(
+            book_root,
+            target_is_directory=True,
+        )
+
+        output = knowledge_index.build_all(self.root)["demo-api"]
+
+        self.assertIn("`lessons/demo-api/rule.md`", output)
+        self.assertIn("`docs/demo-api/nested/guide.md`", output)
+        self.assertIn("`book/demo-api/guide.md`", output)
+        self.assertNotIn(str(external), output)
+
+    def test_project_link_change_during_scan_preserves_existing_index(self):
+        external = self.temporary / "external"
+        external.mkdir()
+        (external / "rule.md").write_text(LESSON, encoding="utf-8")
+        (self.root / "lessons" / "demo-api").symlink_to(
+            external,
+            target_is_directory=True,
+        )
+        target = self.root / "index" / "demo-api.md"
+        target.write_bytes(b"user bytes\r\n")
+
+        with mock.patch.object(
+            knowledge_index,
+            "project_directory_unchanged",
+            return_value=False,
+        ), self.assertRaises(knowledge_index.KnowledgeSourceError) as caught:
+            knowledge_index.write_all(data_root=self.root, target=self.root / "index")
+
+        self.assertEqual(caught.exception.logical_path, "lessons/demo-api")
+        self.assertEqual(
+            caught.exception.reason,
+            "project link changed during scan",
+        )
+        self.assertNotIn(str(external), str(caught.exception))
+        self.assertEqual(target.read_bytes(), b"user bytes\r\n")
+
+    def test_nonrecursive_sources_ignore_nested_markdown(self):
+        cases = (
+            (
+                "lessons/demo-api/rule.md",
+                LESSON,
+                "lessons/demo-api/guides/item.md",
+                LESSON,
+            ),
+            (
+                "book/demo-api/guide.md",
+                BOOK,
+                "book/demo-api/guides/item.md",
+                BOOK,
+            ),
+        )
+        for direct_relative, direct_text, nested_relative, nested_text in cases:
+            with self.subTest(nested_relative=nested_relative):
+                self.write(direct_relative, direct_text)
+                self.write(nested_relative, nested_text)
+
+                output = knowledge_index.build_all(self.root)["demo-api"]
+
+                self.assertIn("`{}`".format(direct_relative), output)
+                self.assertNotIn(nested_relative, output)
+                self.assertEqual(output.count("  - 상세:"), 1)
+                shutil.rmtree((self.root / direct_relative).parent)
 
     def test_docs_are_recursive_but_book_assets_and_html_are_not_indexed(self):
         self.write("docs/demo-api/guides/nested.md", DOC)
@@ -382,11 +508,23 @@ body
         self.assertNotIn("html/rendered.md", output)
         self.assertEqual(output.count("  - 상세:"), 2)
 
-    def test_hidden_or_invalid_project_directory_is_not_silently_skipped(self):
-        (self.root / "lessons" / ".hidden").mkdir()
+    def test_hidden_or_invalid_project_directory_is_ignored(self):
+        self.write("lessons/.hidden/ignored.md", "not lesson metadata")
+        self.write("docs/not_a_project/ignored.md", "not document metadata")
 
-        with self.assertRaises(knowledge_index.KnowledgeIndexError):
+        self.assertEqual(knowledge_index.build_all(self.root), {})
+
+    def test_valid_project_name_must_be_a_directory_or_link(self):
+        self.write("lessons/demo-api", "not a directory")
+
+        with self.assertRaises(knowledge_index.KnowledgeSourceError) as caught:
             knowledge_index.build_all(self.root)
+
+        self.assertEqual(caught.exception.logical_path, "lessons/demo-api")
+        self.assertEqual(
+            caught.exception.reason,
+            "project entry must point to a directory",
+        )
 
     def test_large_source_set_has_no_count_or_32_kib_output_cap(self):
         project = self.root / "lessons" / "large"
