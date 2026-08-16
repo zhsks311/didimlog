@@ -132,11 +132,30 @@ def resolve_project_directory(base: Path, project: str) -> ProjectDirectory | No
             normalized_base,
             "source category must be a real directory",
         )
+    base_identity = _directory_identity(base_info)
 
     logical = normalized_base / validated_project
     try:
         entry_info = logical.lstat()
     except FileNotFoundError:
+        entry_info = None
+
+    try:
+        current_base_info = normalized_base.lstat()
+    except OSError as error:
+        raise ProjectDirectoryError(
+            normalized_base,
+            "source category must be a real directory",
+        ) from error
+    if (
+        not stat.S_ISDIR(current_base_info.st_mode)
+        or _directory_identity(current_base_info) != base_identity
+    ):
+        raise ProjectDirectoryError(
+            normalized_base,
+            "source category must be a real directory",
+        )
+    if entry_info is None:
         return None
 
     if stat.S_ISDIR(entry_info.st_mode):
