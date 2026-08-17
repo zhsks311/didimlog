@@ -428,6 +428,7 @@ def _replace_output(
             if _entry_revision(moved) != _entry_revision(existing):
                 raise ValueError("book output changed during render")
 
+        revision = _entry_revision(os.fstat(temporary_descriptor))
         try:
             os.link(
                 temporary_name,
@@ -439,7 +440,6 @@ def _replace_output(
         except FileExistsError:
             raise ValueError("book output changed during render") from None
 
-        revision = _entry_revision(os.fstat(temporary_descriptor))
         publication = _OutputPublication(
             name=output_name,
             descriptor=temporary_descriptor,

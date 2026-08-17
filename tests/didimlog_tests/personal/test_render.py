@@ -350,6 +350,53 @@ class RenderBookTests(unittest.TestCase):
         self.assertEqual(existing_output.read_bytes(), concurrent)
         self.assertEqual(list(external_html.glob(".render-*")), [])
 
+    def test_publish_retarget_preserves_in_place_change_immediately_after_link(self):
+        external = self.root / "external-book"
+        (external / "assets").mkdir(parents=True)
+        replacement = self.root / "replacement-book"
+        replacement.mkdir()
+        self.assets.rmdir()
+        self.project_book.rmdir()
+        self.make_symlink(
+            self.project_book,
+            external,
+            target_is_directory=True,
+        )
+        (external / "test.md").write_text(
+            book_markdown("# linked\n"),
+            encoding="utf-8",
+            newline="\n",
+        )
+        concurrent_output = external / "html" / "test.html"
+        concurrent = b"user changed linked output in place\n"
+        real_link = render_module.os.link
+        changed = False
+
+        def link_change_and_retarget(source, destination, *args, **kwargs):
+            nonlocal changed
+            result = real_link(source, destination, *args, **kwargs)
+            if destination == "test.html" and not changed:
+                concurrent_output.write_bytes(concurrent)
+                self.project_book.unlink()
+                os.symlink(
+                    replacement,
+                    self.project_book,
+                    target_is_directory=True,
+                )
+                changed = True
+            return result
+
+        with mock.patch.object(
+            render_module.os,
+            "link",
+            side_effect=link_change_and_retarget,
+        ), self.assertRaises(ValueError):
+            self.render()
+
+        self.assertEqual(concurrent_output.read_bytes(), concurrent)
+        self.assertFalse((replacement / "html" / "test.html").exists())
+        self.assertEqual(list((external / "html").glob(".render-*")), [])
+
     def test_rollback_preserves_output_created_after_current_entry_check(self):
         external = self.root / "external-book"
         (external / "assets").mkdir(parents=True)
