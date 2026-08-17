@@ -301,7 +301,11 @@ def _replace_regular_file_at_if_unchanged(
             mode,
         )
         _write_all_and_sync(temporary_descriptor, replacement)
+        os.fchmod(temporary_descriptor, mode)
+        os.fsync(temporary_descriptor)
         temporary_info = os.fstat(temporary_descriptor)
+        if stat.S_IMODE(temporary_info.st_mode) != mode:
+            raise UnsafePathError("unable to apply replacement mode")
         published_revision = _conditional_replace_revision(temporary_info)
 
         backup_name, backup_descriptor = _create_temporary_file_at(
@@ -360,6 +364,7 @@ def _replace_regular_file_at_if_unchanged(
         if (
             published_data != replacement
             or _conditional_replace_revision(published_info) != published_revision
+            or stat.S_IMODE(published_info.st_mode) != mode
             or moved_after != expected
             or (
                 expected_info is not None

@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from didimlog import file_io
 from didimlog.personal import index as knowledge_index
 from didimlog.personal import render as personal_render
 from didimlog.personal.lesson_writing import publish_lesson
@@ -1539,6 +1540,69 @@ body
             current.read_bytes(),
             (GENERATED_NOTICE + "\n# replacement\n").encode("utf-8"),
         )
+
+    def test_existing_index_restore_applies_exact_mode_after_writing_bytes(self):
+        target = self.root / "index"
+        current = target / "demo-api.md"
+        previous = (GENERATED_NOTICE + "\n# previous\n").encode("utf-8")
+        replacement = (GENERATED_NOTICE + "\n# replacement\n").encode("utf-8")
+        current.write_bytes(replacement)
+        expected_info = current.stat()
+        events = []
+        original_write = os.write
+        original_fchmod = os.fchmod
+
+        def trace_write(descriptor, data):
+            events.append(("write", descriptor, None))
+            return original_write(descriptor, data)
+
+        def trace_fchmod(descriptor, mode):
+            events.append(("fchmod", descriptor, mode))
+            return original_fchmod(descriptor, mode)
+
+        directory_descriptor = file_io.open_directory_path(target)
+        try:
+            with mock.patch.object(
+                file_io.os,
+                "write",
+                side_effect=trace_write,
+            ), mock.patch.object(
+                file_io.os,
+                "fchmod",
+                side_effect=trace_fchmod,
+            ):
+                restored_info = (
+                    file_io.replace_regular_file_at_if_unchanged_with_info(
+                        directory_descriptor,
+                        current.name,
+                        replacement,
+                        previous,
+                        0o4755,
+                        expected_info=expected_info,
+                    )
+                )
+        finally:
+            os.close(directory_descriptor)
+
+        self.assertIsNotNone(restored_info)
+        replacement_descriptor = next(
+            descriptor
+            for action, descriptor, _ in events
+            if action == "write"
+        )
+        last_write = max(
+            index
+            for index, event in enumerate(events)
+            if event[:2] == ("write", replacement_descriptor)
+        )
+        final_mode = max(
+            index
+            for index, event in enumerate(events)
+            if event == ("fchmod", replacement_descriptor, 0o4755)
+        )
+        self.assertGreater(final_mode, last_write)
+        self.assertEqual(current.read_bytes(), previous)
+        self.assertEqual(stat.S_IMODE(current.stat().st_mode), 0o4755)
 
     def test_recovery_record_restores_exact_special_mode_bits(self):
         target = self.root / "index"
