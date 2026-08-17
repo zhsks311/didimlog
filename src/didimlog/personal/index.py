@@ -911,7 +911,7 @@ def _reconcile_index_recovery(directory_descriptor: int) -> None:
 def _validate_index_directory(
     directory_descriptor: int,
     expected: set[str],
-) -> None:
+) -> set[str]:
     try:
         names = tuple(os.listdir(directory_descriptor))
     except OSError as exc:
@@ -975,6 +975,22 @@ def _validate_index_directory(
                 "KNOWLEDGE_INDEX_INVALID {}: "
                 "index entry is not generator-owned".format(name)
             )
+    return {
+        name
+        for name in names
+        if Path(name).suffix == ".md"
+    }
+
+
+def validated_public_index_names(
+    target: Path,
+    expected: set[str],
+) -> set[str]:
+    directory_descriptor = open_directory_path(target)
+    try:
+        return _validate_index_directory(directory_descriptor, expected)
+    finally:
+        os.close(directory_descriptor)
 
 
 def _domain_root(data_root=None, target=None) -> Path:
@@ -1730,12 +1746,7 @@ def _check_locked(data_root=None, target=None) -> int:
         expected = _expected_names(outputs)
         directory_descriptor = open_directory_path(destination)
         identity = _index_directory_identity(os.fstat(directory_descriptor))
-        _validate_index_directory(directory_descriptor, expected)
-        actual = {
-            name
-            for name in os.listdir(directory_descriptor)
-            if Path(name).suffix == ".md"
-        }
+        actual = _validate_index_directory(directory_descriptor, expected)
         if actual != expected:
             raise KnowledgeIndexError("index file set is out of date")
         for project, text in outputs.items():

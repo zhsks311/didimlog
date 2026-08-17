@@ -133,12 +133,14 @@ def _personal_check_locked(root: Path) -> str:
         return "PERSONAL_INDEX_EXTRA"
     if not destination.is_dir():
         return "PERSONAL_INDEX_MISSING"
-    try:
-        entries = tuple(destination.iterdir())
-    except OSError:
-        return "PERSONAL_INDEX_EXTRA"
     expected_names = {project + ".md" for project in outputs}
-    actual_names = {entry.name for entry in entries}
+    try:
+        actual_names = personal_index.validated_public_index_names(
+            destination,
+            expected_names,
+        )
+    except (personal_index.KnowledgeIndexError, OSError, UnsafePathError):
+        return "PERSONAL_INDEX_EXTRA"
     if expected_names - actual_names:
         return "PERSONAL_INDEX_MISSING"
     if actual_names - expected_names:
