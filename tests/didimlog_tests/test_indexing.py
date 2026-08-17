@@ -7,8 +7,8 @@ from pathlib import Path
 from unittest import mock
 
 import didimlog.indexing as indexing_module
-
 from didimlog.indexing import IndexResult, run_index
+from didimlog.personal import index as personal_index
 from didimlog.project.scaffold import apply_scaffold, plan_scaffold
 
 
@@ -275,6 +275,49 @@ class IndexServiceTests(unittest.TestCase):
             },
             history_before,
         )
+
+    def test_check_rejects_pathname_swap_after_namespace_validation(self):
+        self._write_lesson()
+        run_index(check=False, home=self.home, cwd=self.cwd)
+        destination = self.home / "knowledge" / "index"
+        saved = self.root / "index-saved"
+        replacement = self.root / "index-replacement"
+        replacement.mkdir()
+        (replacement / "_global.md").write_bytes(
+            (destination / "_global.md").read_bytes()
+        )
+        outside = self.root / "outside-entry"
+        outside.write_bytes(b"user bytes\n")
+        (replacement / "unknown-link").symlink_to(outside)
+        original_validate = personal_index._validate_index_directory
+        swapped = False
+
+        def swap_after_validation(directory_descriptor, expected):
+            nonlocal swapped
+            public_names = original_validate(directory_descriptor, expected)
+            destination.rename(saved)
+            replacement.rename(destination)
+            swapped = True
+            return public_names
+
+        try:
+            with mock.patch.object(
+                personal_index,
+                "_validate_index_directory",
+                side_effect=swap_after_validation,
+            ):
+                result = run_index(check=True, home=self.home, cwd=self.cwd)
+        finally:
+            if swapped:
+                destination.rename(replacement)
+                saved.rename(destination)
+
+        self.assertEqual(result.personal_token, "PERSONAL_INDEX_EXTRA")
+        self.assertEqual(
+            (replacement / "_global.md").read_bytes(),
+            (destination / "_global.md").read_bytes(),
+        )
+        self.assertTrue((replacement / "unknown-link").is_symlink())
 
     def test_check_distinguishes_invalid_source_and_does_not_mask_project_result(self):
         project = self._git_project()

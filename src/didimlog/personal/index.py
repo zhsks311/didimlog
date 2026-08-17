@@ -53,6 +53,13 @@ class KnowledgeIndexError(ValueError):
     """지식 원본이나 생성 인덱스가 안전한 생성 계약을 위반했다."""
 
 
+class IndexCheckState(Enum):
+    CURRENT = "current"
+    MISSING = "missing"
+    EXTRA = "extra"
+    STALE = "stale"
+
+
 class KnowledgeSourceError(KnowledgeIndexError):
     def __init__(self, logical_path: str, reason: str) -> None:
         self.logical_path = logical_path
@@ -982,15 +989,6 @@ def _validate_index_directory(
     }
 
 
-def validated_public_index_names(
-    target: Path,
-    expected: set[str],
-) -> set[str]:
-    directory_descriptor = open_directory_path(target)
-    try:
-        return _validate_index_directory(directory_descriptor, expected)
-    finally:
-        os.close(directory_descriptor)
 
 
 def _domain_root(data_root=None, target=None) -> Path:
@@ -1045,6 +1043,79 @@ def _require_index_directory_unchanged(
         raise KnowledgeIndexError(
             "KNOWLEDGE_INDEX_INVALID: index directory changed during publish"
         )
+
+
+def inspect_index(
+    outputs: Mapping[str, str],
+    target: Path,
+) -> IndexCheckState:
+    normalized = _normalized_outputs(outputs)
+    destination = Path(target)
+    try:
+        initial_info = destination.lstat()
+    except FileNotFoundError:
+        return IndexCheckState.MISSING
+    except OSError:
+        return IndexCheckState.EXTRA
+    if (
+        stat.S_ISLNK(initial_info.st_mode)
+        or not stat.S_ISDIR(initial_info.st_mode)
+    ):
+        return IndexCheckState.EXTRA
+
+    try:
+        directory_descriptor = open_directory_path(destination)
+    except (OSError, UnsafePathError):
+        return IndexCheckState.EXTRA
+    try:
+        identity = None
+        try:
+            identity = _index_directory_identity(
+                os.fstat(directory_descriptor)
+            )
+            expected = _expected_names(normalized)
+            actual = _validate_index_directory(
+                directory_descriptor,
+                expected,
+            )
+        except (
+            KnowledgeIndexError,
+            OSError,
+            UnsafePathError,
+            UnicodeDecodeError,
+        ):
+            status = IndexCheckState.EXTRA
+        else:
+            if expected - actual:
+                status = IndexCheckState.MISSING
+            elif actual - expected:
+                status = IndexCheckState.EXTRA
+            else:
+                status = IndexCheckState.CURRENT
+                for project, text in normalized.items():
+                    expected_bytes = text.encode("utf-8")
+                    try:
+                        current = read_regular_file_at(
+                            directory_descriptor,
+                            project + ".md",
+                            len(expected_bytes),
+                        )
+                    except (OSError, UnsafePathError):
+                        status = IndexCheckState.MISSING
+                        break
+                    if current != expected_bytes:
+                        status = IndexCheckState.STALE
+                        break
+
+        if identity is None:
+            return IndexCheckState.EXTRA
+        try:
+            _require_index_directory_unchanged(destination, identity)
+        except (KnowledgeIndexError, OSError):
+            return IndexCheckState.EXTRA
+        return status
+    finally:
+        os.close(directory_descriptor)
 
 
 def _cleanup_index_temporaries(
@@ -1740,27 +1811,12 @@ def write_all(outputs=None, data_root=None, target=None) -> Path:
 def _check_locked(data_root=None, target=None) -> int:
     """잠금을 보유한 호출자가 현재 개인 인덱스를 검사한다."""
     destination = Path(target) if target is not None else index_dir()
-    directory_descriptor = None
     try:
-        outputs = _normalized_outputs(build_all(data_root))
-        expected = _expected_names(outputs)
-        directory_descriptor = open_directory_path(destination)
-        identity = _index_directory_identity(os.fstat(directory_descriptor))
-        actual = _validate_index_directory(directory_descriptor, expected)
-        if actual != expected:
-            raise KnowledgeIndexError("index file set is out of date")
-        for project, text in outputs.items():
-            expected_bytes = text.encode("utf-8")
-            if (
-                read_regular_file_at(
-                    directory_descriptor,
-                    project + ".md",
-                    len(expected_bytes),
-                )
-                != expected_bytes
-            ):
-                raise KnowledgeIndexError("{} is out of date".format(project))
-        _require_index_directory_unchanged(destination, identity)
+        state = inspect_index(build_all(data_root), destination)
+        if state is not IndexCheckState.CURRENT:
+            raise KnowledgeIndexError(
+                "index is {}".format(state.value)
+            )
     except (KnowledgeIndexError, OSError, UnicodeDecodeError) as exc:
         print(
             "KNOWLEDGE_INDEX_STALE: {}. 재생성 가능한 파생 파일이며 원본은 "
@@ -1768,9 +1824,6 @@ def _check_locked(data_root=None, target=None) -> int:
             file=sys.stderr,
         )
         return 1
-    finally:
-        if directory_descriptor is not None:
-            os.close(directory_descriptor)
     return 0
 
 
