@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
 import hashlib
 import html
 from html.parser import HTMLParser
@@ -12,16 +13,23 @@ import mimetypes
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
-import tempfile
 
 import markdown
 from markdown.extensions.fenced_code import FencedBlockPreprocessor
 from markdown.inlinepatterns import AUTOLINK_RE, AUTOMAIL_RE, BACKTICK_RE, HTML_RE
 from markdown.preprocessors import NormalizeWhitespace
 
+from didimlog import file_io
+
 from .lesson import parse_frontmatter_text
-from .paths import data_home, validate_project
+from .paths import (
+    data_home,
+    project_directory_unchanged,
+    resolve_project_directory,
+    validate_project,
+)
 
 
 _SLUG = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$")
@@ -224,54 +232,276 @@ def _load_mermaid() -> str:
         raise ValueError("vendored Mermaid runtime missing") from error
 
 
-def _prepare_output_directory(output_directory: Path, project_book: Path) -> None:
-    _assert_no_symlink(output_directory, project_book, "book output directory")
-    if output_directory.exists():
+def _directory_identity(info: os.stat_result) -> tuple[int, int, int]:
+    return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode))
+
+
+def _entry_revision(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_uid,
+        info.st_gid,
+        info.st_size,
+        info.st_mtime_ns,
+    )
+
+
+def _project_directory_is_current(directory, descriptor: int) -> bool:
+    try:
+        opened_identity = _directory_identity(os.fstat(descriptor))
+    except OSError:
+        return False
+    return (
+        opened_identity == directory.target_identity
+        and project_directory_unchanged(directory)
+    )
+
+
+def _prepare_output_directory(project_descriptor: int) -> int:
+    try:
+        linked = os.stat(
+            "html",
+            dir_fd=project_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
         try:
-            status = output_directory.lstat()
+            os.mkdir("html", 0o700, dir_fd=project_descriptor)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise ValueError("book output directory could not be created") from error
+        try:
+            linked = os.stat(
+                "html",
+                dir_fd=project_descriptor,
+                follow_symlinks=False,
+            )
         except OSError as error:
             raise ValueError("book output directory must be a real directory") from error
-        if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
-            raise ValueError("book output directory must be a real directory")
-        _assert_real_descendant(output_directory, project_book, "book output directory")
-        return
-    try:
-        os.mkdir(output_directory, 0o700)
     except OSError as error:
-        raise ValueError("book output directory could not be created") from error
-    _assert_no_symlink(output_directory, project_book, "book output directory")
-    _assert_real_descendant(output_directory, project_book, "book output directory")
+        raise ValueError("book output directory must be a real directory") from error
 
-
-def _replace_output(output: Path, document: str) -> None:
-    if os.path.lexists(output):
-        status = output.lstat()
-        if stat.S_ISDIR(status.st_mode) and not stat.S_ISLNK(status.st_mode):
-            raise ValueError("book output must not be a directory")
-
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=".render-",
-        suffix=".tmp",
-        dir=output.parent,
-    )
-    temporary = Path(temporary_name)
+    if stat.S_ISLNK(linked.st_mode) or not stat.S_ISDIR(linked.st_mode):
+        raise ValueError("book output directory must be a real directory")
     try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            descriptor = -1
-            handle.write(document)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, output)
-        temporary = None
-    finally:
-        if descriptor != -1:
+        return file_io.open_child_directory(project_descriptor, "html")
+    except OSError as error:
+        raise ValueError("book output directory must be a real directory") from error
+
+
+def _temporary_output(
+    output_descriptor: int,
+    suffix: str,
+) -> tuple[str, int]:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    for _ in range(32):
+        name = ".render-{}{}".format(secrets.token_hex(12), suffix)
+        try:
+            descriptor = os.open(
+                name,
+                flags,
+                0o600,
+                dir_fd=output_descriptor,
+            )
+        except FileExistsError:
+            continue
+        try:
+            os.fchmod(descriptor, 0o600)
+        except OSError as error:
             os.close(descriptor)
-        if temporary is not None:
             try:
-                temporary.unlink()
+                os.unlink(name, dir_fd=output_descriptor)
             except OSError:
                 pass
+            raise ValueError("book output temporary file could not be created") from error
+        return name, descriptor
+    raise ValueError("book output temporary file could not be created")
+
+
+def _write_all(descriptor: int, data: bytes) -> None:
+    offset = 0
+    while offset < len(data):
+        written = os.write(descriptor, data[offset:])
+        if written <= 0:
+            raise OSError("short write")
+        offset += written
+    os.fsync(descriptor)
+
+
+@dataclass
+class _OutputPublication:
+    name: str
+    descriptor: int
+    revision: tuple[int, ...]
+    backup_name: str | None
+
+
+def _replace_output(
+    output_descriptor: int,
+    output_name: str,
+    document: str,
+) -> _OutputPublication:
+    existing: os.stat_result | None
+    try:
+        existing = os.stat(
+            output_name,
+            dir_fd=output_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        existing = None
+    except OSError as error:
+        raise ValueError("book output could not be inspected") from error
+    if existing is not None and stat.S_ISDIR(existing.st_mode):
+        raise ValueError("book output must not be a directory")
+
+    temporary_name: str | None = None
+    temporary_descriptor: int | None = None
+    backup_name: str | None = None
+    publication: _OutputPublication | None = None
+    published = False
+    completed = False
+    try:
+        temporary_name, temporary_descriptor = _temporary_output(
+            output_descriptor,
+            ".tmp",
+        )
+        _write_all(temporary_descriptor, document.encode("utf-8"))
+
+        if existing is not None:
+            backup_name, backup_descriptor = _temporary_output(
+                output_descriptor,
+                ".bak",
+            )
+            os.close(backup_descriptor)
+            os.rename(
+                output_name,
+                backup_name,
+                src_dir_fd=output_descriptor,
+                dst_dir_fd=output_descriptor,
+            )
+            moved = os.stat(
+                backup_name,
+                dir_fd=output_descriptor,
+                follow_symlinks=False,
+            )
+            if _entry_revision(moved) != _entry_revision(existing):
+                raise ValueError("book output changed during render")
+
+        os.rename(
+            temporary_name,
+            output_name,
+            src_dir_fd=output_descriptor,
+            dst_dir_fd=output_descriptor,
+        )
+        temporary_name = None
+        published = True
+        revision = _entry_revision(os.fstat(temporary_descriptor))
+        publication = _OutputPublication(
+            name=output_name,
+            descriptor=temporary_descriptor,
+            revision=revision,
+            backup_name=backup_name,
+        )
+        temporary_descriptor = None
+        linked = os.stat(
+            output_name,
+            dir_fd=output_descriptor,
+            follow_symlinks=False,
+        )
+        if _entry_revision(linked) != revision:
+            raise ValueError("book output changed during render")
+        os.fsync(output_descriptor)
+        completed = True
+        return publication
+    except OSError as error:
+        raise ValueError("book output could not be replaced") from error
+    finally:
+        if publication is not None and not completed:
+            try:
+                _finish_output(
+                    output_descriptor,
+                    publication,
+                    rollback=True,
+                )
+            except (OSError, ValueError):
+                pass
+        if temporary_descriptor is not None:
+            os.close(temporary_descriptor)
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=output_descriptor)
+            except OSError:
+                pass
+        if not published and backup_name is not None:
+            try:
+                os.rename(
+                    backup_name,
+                    output_name,
+                    src_dir_fd=output_descriptor,
+                    dst_dir_fd=output_descriptor,
+                )
+                backup_name = None
+            except OSError:
+                pass
+        if not published and backup_name is not None:
+            try:
+                os.unlink(backup_name, dir_fd=output_descriptor)
+            except OSError:
+                pass
+
+
+def _finish_output(
+    output_descriptor: int,
+    publication: _OutputPublication,
+    *,
+    rollback: bool,
+) -> None:
+    try:
+        current: os.stat_result | None
+        try:
+            current = os.stat(
+                publication.name,
+                dir_fd=output_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            current = None
+
+        published_is_current = (
+            current is not None
+            and _entry_revision(current) == publication.revision
+            and _entry_revision(os.fstat(publication.descriptor))
+            == publication.revision
+        )
+        if rollback and published_is_current:
+            if publication.backup_name is None:
+                os.unlink(publication.name, dir_fd=output_descriptor)
+            else:
+                os.rename(
+                    publication.backup_name,
+                    publication.name,
+                    src_dir_fd=output_descriptor,
+                    dst_dir_fd=output_descriptor,
+                )
+                publication.backup_name = None
+        if publication.backup_name is not None:
+            os.unlink(publication.backup_name, dir_fd=output_descriptor)
+            publication.backup_name = None
+        os.fsync(output_descriptor)
+    except OSError as error:
+        raise ValueError("book output cleanup failed") from error
+    finally:
+        os.close(publication.descriptor)
 
 
 def render_book(
@@ -284,76 +514,133 @@ def render_book(
     """Render one canonical ``book/<project>/<topic>.md`` into its HTML view."""
     project = validate_project(project)
     root = _absolute(data_home() if data_root is None else Path(data_root))
-    project_book = root / "book" / project
+    logical_project = root / "book" / project
     source_path = _absolute(Path(source))
     output_path = _absolute(Path(output))
 
     if source_path.suffix != ".md":
         raise ValueError("book source must be a Markdown file")
     topic = _validate_topic(source_path.stem)
-    expected_source = project_book / (topic + ".md")
-    expected_output = project_book / "html" / (topic + ".html")
+    expected_source = logical_project / (topic + ".md")
+    expected_output = logical_project / "html" / (topic + ".html")
     if source_path != expected_source:
         raise ValueError("book markdown escapes selected project")
     if output_path != expected_output:
         raise ValueError("book output must match the selected source")
 
-    _assert_no_symlink(project_book, root, "project book directory")
+    resolved = resolve_project_directory(root / "book", project)
+    if resolved is None:
+        raise ValueError("project book directory missing")
+    physical_project = resolved.physical
+    physical_source = physical_project / source_path.relative_to(resolved.logical)
+    physical_output = physical_project / output_path.relative_to(resolved.logical)
+
+    project_descriptor: int | None = None
+    output_descriptor: int | None = None
+    publication: _OutputPublication | None = None
     try:
-        project_status = project_book.lstat()
-    except OSError as error:
-        raise ValueError("project book directory missing") from error
-    if stat.S_ISLNK(project_status.st_mode) or not stat.S_ISDIR(project_status.st_mode):
-        raise ValueError("project book directory must be a real directory")
-    _assert_real_descendant(project_book, root, "project book directory")
-    _assert_no_symlink(source_path, project_book, "book markdown")
-    if not source_path.exists():
-        raise ValueError("book markdown missing: {}".format(source_path))
-    _assert_real_descendant(source_path, project_book, "book markdown")
-    source_text = _read_source(source_path)
+        try:
+            project_descriptor = file_io.open_directory_path(physical_project)
+        except OSError as error:
+            raise ValueError("project book link changed during render") from error
+        if not _project_directory_is_current(resolved, project_descriptor):
+            raise ValueError("project book link changed during render")
 
-    source_title = topic
-    body_source = source_text
-    if source_text.startswith("---"):
-        parsed = parse_frontmatter_text(source_path.name, source_text, ("title", "find_when"))
-        if parsed is None:
-            raise ValueError("book markdown metadata is invalid")
-        fields, lines, closing = parsed
-        source_title = fields["title"].strip()
-        if not source_title or not fields["find_when"].strip():
-            raise ValueError("book markdown metadata is invalid")
-        body_source = "\n".join(lines[closing + 1 :])
+        _assert_no_symlink(physical_source, physical_project, "book markdown")
+        if not physical_source.exists():
+            raise ValueError("book markdown missing: {}".format(source_path))
+        _assert_real_descendant(physical_source, physical_project, "book markdown")
+        source_text = _read_source(physical_source)
 
-    _reject_raw_html(body_source)
-    body = markdown.markdown(
-        body_source,
-        extensions=("extra", "fenced_code", "tables", "sane_lists"),
-        output_format="html5",
-    )
-    body = _MERMAID_BLOCK.sub(
-        lambda match: '<pre class="mermaid">{}</pre>'.format(match.group(1)),
-        body,
-    )
-    body = _inline_images(body, source_path, project_book)
-    _reject_unsafe_links(body)
+        source_title = topic
+        body_source = source_text
+        if source_text.startswith("---"):
+            parsed = parse_frontmatter_text(
+                physical_source.name,
+                source_text,
+                ("title", "find_when"),
+            )
+            if parsed is None:
+                raise ValueError("book markdown metadata is invalid")
+            fields, lines, closing = parsed
+            source_title = fields["title"].strip()
+            if not source_title or not fields["find_when"].strip():
+                raise ValueError("book markdown metadata is invalid")
+            body_source = "\n".join(lines[closing + 1 :])
 
-    heading = re.search(r"^#\s+(.+)$", body_source, re.MULTILINE)
-    title = heading.group(1).strip() if heading else source_title
-    mermaid = _load_mermaid()
-    document = """<!doctype html>
+        _reject_raw_html(body_source)
+        body = markdown.markdown(
+            body_source,
+            extensions=("extra", "fenced_code", "tables", "sane_lists"),
+            output_format="html5",
+        )
+        body = _MERMAID_BLOCK.sub(
+            lambda match: '<pre class="mermaid">{}</pre>'.format(match.group(1)),
+            body,
+        )
+        body = _inline_images(body, physical_source, physical_project)
+        _reject_unsafe_links(body)
+
+        heading = re.search(r"^#\s+(.+)$", body_source, re.MULTILINE)
+        title = heading.group(1).strip() if heading else source_title
+        mermaid = _load_mermaid()
+        document = """<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title}</title><style>{style}</style></head><body><main>{body}
 <p class="source">원천: book/{project}/{topic}.md · 이 HTML은 재생성 가능한 파생 뷰입니다.</p></main>
 <script>{mermaid}</script><script>mermaid.initialize({{startOnLoad:true,securityLevel:'strict',theme:'default'}});</script>
 </body></html>""".format(
-        title=html.escape(title),
-        style=_STYLE,
-        body=body,
-        project=html.escape(project),
-        topic=html.escape(topic),
-        mermaid=mermaid,
-    )
+            title=html.escape(title),
+            style=_STYLE,
+            body=body,
+            project=html.escape(project),
+            topic=html.escape(topic),
+            mermaid=mermaid,
+        )
 
-    _prepare_output_directory(output_path.parent, project_book)
-    _replace_output(output_path, document)
-    return output_path
+        output_descriptor = _prepare_output_directory(project_descriptor)
+        if not _project_directory_is_current(resolved, project_descriptor):
+            raise ValueError("project book link changed during render")
+        if physical_output.parent.name != "html":
+            raise ValueError("book output must match the selected source")
+        if not _project_directory_is_current(resolved, project_descriptor):
+            raise ValueError("project book link changed during render")
+
+        publication = _replace_output(
+            output_descriptor,
+            physical_output.name,
+            document,
+        )
+        if not _project_directory_is_current(resolved, project_descriptor):
+            try:
+                _finish_output(
+                    output_descriptor,
+                    publication,
+                    rollback=True,
+                )
+            finally:
+                publication = None
+            raise ValueError("project book link changed during render")
+        try:
+            _finish_output(
+                output_descriptor,
+                publication,
+                rollback=False,
+            )
+        finally:
+            publication = None
+        return output_path
+    finally:
+        if publication is not None and output_descriptor is not None:
+            try:
+                _finish_output(
+                    output_descriptor,
+                    publication,
+                    rollback=True,
+                )
+            except (OSError, ValueError):
+                pass
+        if output_descriptor is not None:
+            os.close(output_descriptor)
+        if project_descriptor is not None:
+            os.close(project_descriptor)

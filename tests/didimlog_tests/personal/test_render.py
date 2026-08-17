@@ -1,5 +1,7 @@
 import base64
 import hashlib
+import os
+import stat
 import tempfile
 import unittest
 from unittest import mock
@@ -61,6 +63,222 @@ class RenderBookTests(unittest.TestCase):
             link.symlink_to(target, target_is_directory=target_is_directory)
         except (NotImplementedError, OSError) as error:
             self.skipTest("symlinks unavailable: {}".format(error))
+
+    def test_renders_linked_book_project_and_returns_logical_output(self):
+        external = self.root / "external-book"
+        external_assets = external / "assets"
+        external_assets.mkdir(parents=True)
+        (external_assets / "pixel.png").write_bytes(PNG)
+        self.assets.rmdir()
+        self.project_book.rmdir()
+        self.make_symlink(
+            self.project_book,
+            external,
+            target_is_directory=True,
+        )
+        (external / "test.md").write_text(
+            book_markdown("# linked\n\n![점](assets/pixel.png)"),
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        rendered = self.render()
+
+        external_output = external / "html" / "test.html"
+        self.assertEqual(rendered, self.output)
+        self.assertTrue(external_output.is_file())
+        self.assertIn(
+            "data:image/png;base64",
+            external_output.read_text(encoding="utf-8"),
+        )
+
+    def test_link_change_after_output_prepare_leaves_no_rendered_output(self):
+        external = self.root / "external-book"
+        (external / "assets").mkdir(parents=True)
+        replacement = self.root / "replacement-book"
+        replacement.mkdir()
+        self.assets.rmdir()
+        self.project_book.rmdir()
+        self.make_symlink(
+            self.project_book,
+            external,
+            target_is_directory=True,
+        )
+        (external / "test.md").write_text(
+            book_markdown("# linked\n"),
+            encoding="utf-8",
+            newline="\n",
+        )
+        real_prepare = render_module._prepare_output_directory
+
+        def prepare_and_retarget(*args, **kwargs):
+            descriptor = real_prepare(*args, **kwargs)
+            self.project_book.unlink()
+            os.symlink(
+                replacement,
+                self.project_book,
+                target_is_directory=True,
+            )
+            return descriptor
+
+        with mock.patch.object(
+            render_module,
+            "_prepare_output_directory",
+            side_effect=prepare_and_retarget,
+        ), self.assertRaisesRegex(
+            ValueError,
+            "project book link changed during render",
+        ):
+            self.render()
+
+        self.assertFalse((external / "html" / "test.html").exists())
+        self.assertFalse((replacement / "html" / "test.html").exists())
+        self.assertEqual(list((external / "html").glob(".render-*")), [])
+
+    def test_link_change_before_publish_leaves_no_rendered_output(self):
+        external = self.root / "external-book"
+        (external / "assets").mkdir(parents=True)
+        replacement = self.root / "replacement-book"
+        replacement.mkdir()
+        self.assets.rmdir()
+        self.project_book.rmdir()
+        self.make_symlink(
+            self.project_book,
+            external,
+            target_is_directory=True,
+        )
+        (external / "test.md").write_text(
+            book_markdown("# linked\n"),
+            encoding="utf-8",
+            newline="\n",
+        )
+        real_replace = render_module._replace_output
+
+        def retarget_and_publish(*args, **kwargs):
+            self.project_book.unlink()
+            os.symlink(
+                replacement,
+                self.project_book,
+                target_is_directory=True,
+            )
+            return real_replace(*args, **kwargs)
+
+        with mock.patch.object(
+            render_module,
+            "_replace_output",
+            side_effect=retarget_and_publish,
+        ), self.assertRaisesRegex(
+            ValueError,
+            "project book link changed during render",
+        ):
+            self.render()
+
+        self.assertFalse((external / "html" / "test.html").exists())
+        self.assertFalse((replacement / "html" / "test.html").exists())
+        self.assertEqual(list((external / "html").glob(".render-*")), [])
+
+    def test_link_change_before_publish_restores_existing_output_and_cleans_artifacts(
+        self,
+    ):
+        external = self.root / "external-book"
+        external_html = external / "html"
+        external_html.mkdir(parents=True)
+        replacement = self.root / "replacement-book"
+        replacement.mkdir()
+        existing_output = external_html / "test.html"
+        existing_output.write_bytes(b"original rendered entry\n")
+        existing_output.chmod(0o640)
+        original_info = existing_output.lstat()
+        self.assets.rmdir()
+        self.project_book.rmdir()
+        self.make_symlink(
+            self.project_book,
+            external,
+            target_is_directory=True,
+        )
+        (external / "test.md").write_text(
+            book_markdown("# linked\n"),
+            encoding="utf-8",
+            newline="\n",
+        )
+        real_replace = render_module._replace_output
+
+        def retarget_and_publish(*args, **kwargs):
+            self.project_book.unlink()
+            os.symlink(
+                replacement,
+                self.project_book,
+                target_is_directory=True,
+            )
+            return real_replace(*args, **kwargs)
+
+        with mock.patch.object(
+            render_module,
+            "_replace_output",
+            side_effect=retarget_and_publish,
+        ), self.assertRaisesRegex(
+            ValueError,
+            "project book link changed during render",
+        ):
+            self.render()
+
+        restored_info = existing_output.lstat()
+        self.assertEqual(existing_output.read_bytes(), b"original rendered entry\n")
+        self.assertEqual(
+            (restored_info.st_dev, restored_info.st_ino, restored_info.st_mode),
+            (original_info.st_dev, original_info.st_ino, original_info.st_mode),
+        )
+        self.assertEqual(stat.S_IMODE(restored_info.st_mode), 0o640)
+        self.assertFalse((replacement / "html" / "test.html").exists())
+        self.assertEqual(list(external_html.glob(".render-*")), [])
+
+    def test_link_change_after_publish_preserves_concurrent_output(self):
+        external = self.root / "external-book"
+        external_html = external / "html"
+        external_html.mkdir(parents=True)
+        replacement = self.root / "replacement-book"
+        replacement.mkdir()
+        existing_output = external_html / "test.html"
+        existing_output.write_bytes(b"original rendered entry\n")
+        concurrent = b"user concurrent output\n"
+        self.assets.rmdir()
+        self.project_book.rmdir()
+        self.make_symlink(
+            self.project_book,
+            external,
+            target_is_directory=True,
+        )
+        (external / "test.md").write_text(
+            book_markdown("# linked\n"),
+            encoding="utf-8",
+            newline="\n",
+        )
+        real_replace = render_module._replace_output
+
+        def publish_retarget_and_save(*args, **kwargs):
+            publication = real_replace(*args, **kwargs)
+            existing_output.write_bytes(concurrent)
+            self.project_book.unlink()
+            os.symlink(
+                replacement,
+                self.project_book,
+                target_is_directory=True,
+            )
+            return publication
+
+        with mock.patch.object(
+            render_module,
+            "_replace_output",
+            side_effect=publish_retarget_and_save,
+        ), self.assertRaisesRegex(
+            ValueError,
+            "project book link changed during render",
+        ):
+            self.render()
+
+        self.assertEqual(existing_output.read_bytes(), concurrent)
+        self.assertFalse((replacement / "html" / "test.html").exists())
+        self.assertEqual(list(external_html.glob(".render-*")), [])
 
     def test_renders_self_contained_html_with_markdown_table_mermaid_and_image(self):
         (self.assets / "pixel.png").write_bytes(PNG)
