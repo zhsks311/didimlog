@@ -47,15 +47,15 @@ def _synthetic_entry(name, info):
 
 def _write_paused_stale_index(root, snapshot_ready, release_snapshot):
     data_root = Path(root)
-    original_build_all = knowledge_index.build_all
+    original_build = knowledge_index._build_all_with_projects
 
-    def blocked_build_all(candidate_root=None):
-        outputs = original_build_all(candidate_root)
+    def blocked_build(candidate_root=None):
+        result = original_build(candidate_root)
         snapshot_ready.set()
         release_snapshot.wait(5)
-        return outputs
+        return result
 
-    knowledge_index.build_all = blocked_build_all
+    knowledge_index._build_all_with_projects = blocked_build
     knowledge_index.write_all(
         data_root=data_root,
         target=data_root / "index",
@@ -298,6 +298,33 @@ class KnowledgeIndexTests(unittest.TestCase):
         )
         self.assertNotIn(str(self.temporary), str(caught.exception))
 
+    def test_invalid_utf8_recursive_directory_without_markdown_is_ignored(self):
+        placeholder = self.write("docs/demo-api/placeholder.txt", "ignored")
+        project = placeholder.parent
+        expected = knowledge_index.build_all(self.root)
+        original_iterdir = Path.iterdir
+        image = _synthetic_entry("image.png", placeholder.lstat())
+
+        for children in ([], [image]):
+            with self.subTest(children=len(children)):
+                invalid_directory = _synthetic_entry(
+                    "assets-\udcff",
+                    project.lstat(),
+                )
+                invalid_directory.iterdir.return_value = children
+
+                def injected_entries(path):
+                    entries = list(original_iterdir(path))
+                    if path == project:
+                        return [*entries, invalid_directory]
+                    return entries
+
+                with mock.patch.object(Path, "iterdir", injected_entries):
+                    actual = knowledge_index.build_all(self.root)
+
+                self.assertEqual(actual, expected)
+
+
     def test_noncanonical_lesson_tags_are_rejected(self):
         invalid = LESSON.replace(
             "tags: [nullable, partial-update]",
@@ -517,6 +544,43 @@ body
         self.assertIn("`docs/demo-api/nested/guide.md`", output)
         self.assertIn("`book/demo-api/guide.md`", output)
         self.assertNotIn(str(external), output)
+
+    def test_project_link_change_before_publish_preserves_existing_index(self):
+        external = self.temporary / "external"
+        original = external / "original"
+        replacement = external / "replacement"
+        original.mkdir(parents=True)
+        replacement.mkdir()
+        (original / "rule.md").write_text(LESSON, encoding="utf-8")
+        logical = self.root / "lessons" / "demo-api"
+        logical.symlink_to(original, target_is_directory=True)
+        target = self.root / "index" / "demo-api.md"
+        target.write_bytes(b"user bytes\r\n")
+        original_fsync = knowledge_index.os.fsync
+        retargeted = False
+
+        def retarget_after_prepared_file_sync(descriptor):
+            nonlocal retargeted
+            original_fsync(descriptor)
+            if not retargeted:
+                retargeted = True
+                logical.unlink()
+                logical.symlink_to(replacement, target_is_directory=True)
+
+        with mock.patch.object(
+            knowledge_index.os,
+            "fsync",
+            side_effect=retarget_after_prepared_file_sync,
+        ), self.assertRaises(knowledge_index.KnowledgeSourceError) as caught:
+            knowledge_index.write_all(data_root=self.root, target=self.root / "index")
+
+        self.assertEqual(caught.exception.logical_path, "lessons/demo-api")
+        self.assertEqual(
+            caught.exception.reason,
+            "project link changed during scan",
+        )
+        self.assertNotIn(str(external), str(caught.exception))
+        self.assertEqual(target.read_bytes(), b"user bytes\r\n")
 
     def test_project_link_change_during_scan_preserves_existing_index(self):
         external = self.temporary / "external"

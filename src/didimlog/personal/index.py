@@ -284,7 +284,8 @@ def _markdown_files(
             elif stat.S_ISDIR(entry_info.st_mode):
                 if not recursive:
                     continue
-                action = "directory"
+                scan(entry, relative)
+                continue
             elif entry.suffix != ".md":
                 continue
             elif not stat.S_ISREG(entry_info.st_mode):
@@ -296,14 +297,13 @@ def _markdown_files(
             selected.append(
                 (
                     _byte_key(relative.as_posix()),
-                    entry,
                     relative,
                     logical_path,
                     action,
                 )
             )
 
-        for _, entry, relative, logical_path, action in sorted(selected):
+        for _, relative, logical_path, action in sorted(selected):
             if action == "invalid-file":
                 raise KnowledgeSourceError(
                     logical_path,
@@ -314,17 +314,29 @@ def _markdown_files(
                     logical_path,
                     "source directory must be a real directory",
                 )
-            if action == "directory":
-                scan(entry, relative)
-            else:
-                files.append(relative)
+            files.append(relative)
 
     scan(project.physical, Path())
     return sorted(files, key=lambda relative: _byte_key(relative.as_posix()))
 
 
-def collect(data_root=None) -> dict[str, list[dict[str, object]]]:
-    """선택한 Markdown을 검사하고 프로젝트별 인덱스 항목을 반환한다."""
+def _require_projects_unchanged(
+    projects: Iterable[ProjectDirectory],
+) -> None:
+    for project in projects:
+        if not project_directory_unchanged(project):
+            raise KnowledgeSourceError(
+                _logical_source_path(project),
+                "project link changed during scan",
+            )
+
+
+def _collect_with_projects(
+    data_root=None,
+) -> tuple[
+    dict[str, list[dict[str, object]]],
+    tuple[ProjectDirectory, ...],
+]:
     root = Path(data_root) if data_root is not None else lessons_dir().parent
     _validate_knowledge_root(root)
     roots = {
@@ -336,6 +348,11 @@ def collect(data_root=None) -> dict[str, list[dict[str, object]]]:
         kind: _project_directories(source_root)
         for kind, source_root in roots.items()
     }
+    snapshots = tuple(
+        project
+        for mapping in directories.values()
+        for project in mapping.values()
+    )
 
     projects = sorted(
         set().union(*(mapping.keys() for mapping in directories.values())),
@@ -348,32 +365,26 @@ def collect(data_root=None) -> dict[str, list[dict[str, object]]]:
         if lesson_project is not None:
             for relative in _markdown_files(lesson_project, recursive=False):
                 items.append(_lesson_item(lesson_project, relative))
-            if not project_directory_unchanged(lesson_project):
-                raise KnowledgeSourceError(
-                    _logical_source_path(lesson_project),
-                    "project link changed during scan",
-                )
+            _require_projects_unchanged((lesson_project,))
 
         docs_project = directories["docs"].get(project_name)
         if docs_project is not None:
             for relative in _markdown_files(docs_project, recursive=True):
                 items.append(_document_item(docs_project, relative, "docs"))
-            if not project_directory_unchanged(docs_project):
-                raise KnowledgeSourceError(
-                    _logical_source_path(docs_project),
-                    "project link changed during scan",
-                )
+            _require_projects_unchanged((docs_project,))
 
         book_project = directories["book"].get(project_name)
         if book_project is not None:
             for relative in _markdown_files(book_project, recursive=False):
                 items.append(_document_item(book_project, relative, "book"))
-            if not project_directory_unchanged(book_project):
-                raise KnowledgeSourceError(
-                    _logical_source_path(book_project),
-                    "project link changed during scan",
-                )
+            _require_projects_unchanged((book_project,))
         collected[project_name] = items
+    return collected, snapshots
+
+
+def collect(data_root=None) -> dict[str, list[dict[str, object]]]:
+    """선택한 Markdown을 검사하고 프로젝트별 인덱스 항목을 반환한다."""
+    collected, _ = _collect_with_projects(data_root)
     return collected
 
 
@@ -418,12 +429,21 @@ def render_project(project: str, items: Iterable[Mapping[str, object]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _build_all_with_projects(
+    data_root=None,
+) -> tuple[dict[str, str], tuple[ProjectDirectory, ...]]:
+    collected, projects = _collect_with_projects(data_root)
+    outputs = {
+        project: render_project(project, items)
+        for project, items in collected.items()
+    }
+    return outputs, projects
+
+
 def build_all(data_root=None) -> dict[str, str]:
     """현재 전체 원본에 대응하는 프로젝트별 출력 문자열을 만든다."""
-    return {
-        project: render_project(project, items)
-        for project, items in collect(data_root).items()
-    }
+    outputs, _ = _build_all_with_projects(data_root)
+    return outputs
 
 
 def _normalized_outputs(outputs: Mapping[str, str]) -> dict[str, str]:
@@ -517,7 +537,11 @@ def _domain_root(data_root=None, target=None) -> Path:
 
 def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
     """잠금을 보유한 호출자가 전체 인덱스를 원자적으로 교체한다."""
-    built = build_all(data_root) if outputs is None else outputs
+    if outputs is None:
+        built, source_projects = _build_all_with_projects(data_root)
+    else:
+        built = outputs
+        source_projects = ()
     normalized = _normalized_outputs(built)
     destination = Path(target) if target is not None else index_dir()
     expected = _expected_names(normalized)
@@ -557,7 +581,10 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
                     "KNOWLEDGE_INDEX_INVALID {}: cannot prepare index".format(project)
                 ) from exc
 
-        for project in sorted(prepared, key=_byte_key):
+        replacement_projects = sorted(prepared, key=_byte_key)
+        _require_projects_unchanged(source_projects)
+
+        for project in replacement_projects:
             temporary = prepared[project]
             if temporary is None:
                 continue
