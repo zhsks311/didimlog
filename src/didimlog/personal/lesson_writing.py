@@ -10,7 +10,10 @@ import secrets
 import stat
 import sys
 
-from didimlog.file_io import open_directory_path
+from didimlog.file_io import (
+    open_directory_path,
+    read_regular_file_at_with_stat,
+)
 from didimlog.locking import path_lock
 from .lesson import SLUG, parse_lesson_text
 from .paths import (
@@ -248,6 +251,98 @@ def _write_all(descriptor: int, data: bytes) -> None:
     os.fsync(descriptor)
 
 
+def _publication_revision(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_uid,
+        info.st_gid,
+        info.st_size,
+        info.st_mtime_ns,
+    )
+
+
+def _published_lesson_unchanged(
+    directory_descriptor: int,
+    name: str,
+    data: bytes,
+    published_revision: tuple[int, ...],
+) -> bool:
+    try:
+        published, published_info = read_regular_file_at_with_stat(
+            directory_descriptor,
+            name,
+            len(data),
+        )
+    except OSError:
+        return False
+    return (
+        published == data
+        and _publication_revision(published_info) == published_revision
+    )
+
+
+def _rollback_lesson_publication(
+    directory_descriptor: int,
+    name: str,
+    data: bytes,
+    published_revision: tuple[int, ...],
+) -> bool:
+    recovery_name: str | None = None
+    keep_recovery = False
+    try:
+        try:
+            recovery_name, recovery_descriptor = _temporary_file(
+                directory_descriptor
+            )
+        except (LessonError, OSError):
+            return False
+        os.close(recovery_descriptor)
+
+        try:
+            os.rename(
+                name,
+                recovery_name,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+            )
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+
+        if _published_lesson_unchanged(
+            directory_descriptor,
+            recovery_name,
+            data,
+            published_revision,
+        ):
+            return True
+
+        try:
+            os.link(
+                recovery_name,
+                name,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            keep_recovery = True
+            return False
+        except OSError:
+            keep_recovery = True
+            return False
+        return True
+    finally:
+        if recovery_name is not None and not keep_recovery:
+            try:
+                os.unlink(recovery_name, dir_fd=directory_descriptor)
+            except FileNotFoundError:
+                pass
+
+
 def _refresh_index(base: Path) -> None:
     try:
         from . import index
@@ -275,6 +370,7 @@ def _publish_lesson_locked(
     project_directory: ProjectDirectory | None = None
     temporary_name: str | None = None
     temporary_descriptor: int | None = None
+    published_revision: tuple[int, ...] | None = None
     try:
         project_descriptor, project_directory = _open_project_directory(
             base,
@@ -283,8 +379,9 @@ def _publish_lesson_locked(
         )
         temporary_name, temporary_descriptor = _temporary_file(project_descriptor)
         _write_all(temporary_descriptor, data)
-        os.close(temporary_descriptor)
-        temporary_descriptor = None
+        published_revision = _publication_revision(
+            os.fstat(temporary_descriptor)
+        )
         if (
             project_directory is None
             or not project_directory_unchanged(project_directory)
@@ -308,6 +405,41 @@ def _publish_lesson_locked(
                     (Path(base.name) / selected / name).as_posix()
                 ) from error
             raise LessonError("unable to publish lesson") from error
+        project_unchanged = (
+            project_directory is not None
+            and project_directory_unchanged(project_directory)
+        )
+        publication_unchanged = (
+            published_revision is not None
+            and _published_lesson_unchanged(
+                project_descriptor,
+                name,
+                data,
+                published_revision,
+            )
+        )
+        if not project_unchanged:
+            rollback_succeeded = False
+            if published_revision is not None:
+                try:
+                    rollback_succeeded = _rollback_lesson_publication(
+                        project_descriptor,
+                        name,
+                        data,
+                        published_revision,
+                    )
+                except OSError:
+                    pass
+            if rollback_succeeded:
+                try:
+                    os.fsync(project_descriptor)
+                except OSError:
+                    pass
+            raise LessonInvalid("project lessons link changed during write")
+        if not publication_unchanged:
+            raise LessonInvalid("project lessons link changed during write")
+        os.close(temporary_descriptor)
+        temporary_descriptor = None
         os.unlink(temporary_name, dir_fd=project_descriptor)
         temporary_name = None
         os.fsync(project_descriptor)

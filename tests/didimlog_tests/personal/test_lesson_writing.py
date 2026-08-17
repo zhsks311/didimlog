@@ -163,6 +163,132 @@ class LessonWritingTests(unittest.TestCase):
         self.assertEqual(list(replacement.glob(".lesson-*.tmp")), [])
         self.assertEqual(index.read_bytes(), original_index)
 
+    def test_link_change_after_publish_rolls_back_unchanged_lesson(self):
+        external = self.temporary / "external-lessons"
+        external.mkdir()
+        replacement = self.temporary / "replacement-lessons"
+        replacement.mkdir()
+        linked = self.lessons / "demo-api"
+        linked.symlink_to(external, target_is_directory=True)
+        index = self.data_root / "index" / "demo-api.md"
+        original_index = b"user-owned index bytes\r\n"
+        index.write_bytes(original_index)
+        text = valid_lesson("공개 직후 연결 교체")
+        original_link = os.link
+
+        def link_and_retarget(source, destination, **kwargs):
+            source_info = os.stat(
+                source,
+                dir_fd=kwargs["src_dir_fd"],
+                follow_symlinks=False,
+            )
+            original_link(source, destination, **kwargs)
+            if destination == "after-link.md":
+                published_info = os.stat(
+                    destination,
+                    dir_fd=kwargs["dst_dir_fd"],
+                    follow_symlinks=False,
+                )
+                self.assertEqual(
+                    (published_info.st_dev, published_info.st_ino),
+                    (source_info.st_dev, source_info.st_ino),
+                )
+                self.assertEqual(published_info.st_mode & 0o777, 0o600)
+                self.assertEqual(
+                    (external / destination).read_bytes(),
+                    text.encode("utf-8"),
+                )
+                linked.unlink()
+                linked.symlink_to(replacement, target_is_directory=True)
+
+        with mock.patch.object(
+            lesson_writing.os,
+            "link",
+            side_effect=link_and_retarget,
+        ):
+            with self.assertRaisesRegex(
+                lesson_writing.LessonInvalid,
+                "^project lessons link changed during write$",
+            ):
+                self.publish("after-link", text)
+
+        self.assertFalse((external / "after-link.md").exists())
+        self.assertFalse((replacement / "after-link.md").exists())
+        self.assertEqual(list(external.glob(".lesson-*.tmp")), [])
+        self.assertEqual(list(replacement.glob(".lesson-*.tmp")), [])
+        self.assertEqual(index.read_bytes(), original_index)
+
+    def test_concurrent_in_place_change_after_publish_is_preserved(self):
+        external = self.temporary / "external-lessons"
+        external.mkdir()
+        linked = self.lessons / "demo-api"
+        linked.symlink_to(external, target_is_directory=True)
+        index = self.data_root / "index" / "demo-api.md"
+        original_index = b"user-owned index bytes\r\n"
+        index.write_bytes(original_index)
+        user_bytes = b"concurrent in-place user bytes\r\n"
+        original_link = os.link
+
+        def link_and_change(source, destination, **kwargs):
+            original_link(source, destination, **kwargs)
+            if destination == "in-place.md":
+                published = external / destination
+                published.write_bytes(user_bytes)
+                published.chmod(0o640)
+
+        with mock.patch.object(
+            lesson_writing.os,
+            "link",
+            side_effect=link_and_change,
+        ):
+            with self.assertRaisesRegex(
+                lesson_writing.LessonInvalid,
+                "^project lessons link changed during write$",
+            ):
+                self.publish("in-place", valid_lesson())
+
+        published = external / "in-place.md"
+        self.assertEqual(published.read_bytes(), user_bytes)
+        self.assertEqual(published.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(list(external.glob(".lesson-*.tmp")), [])
+        self.assertEqual(index.read_bytes(), original_index)
+
+    def test_concurrent_replacement_after_publish_is_preserved(self):
+        external = self.temporary / "external-lessons"
+        external.mkdir()
+        linked = self.lessons / "demo-api"
+        linked.symlink_to(external, target_is_directory=True)
+        index = self.data_root / "index" / "demo-api.md"
+        original_index = b"user-owned index bytes\r\n"
+        index.write_bytes(original_index)
+        user_bytes = b"concurrent replacement user bytes\r\n"
+        original_link = os.link
+
+        def link_and_replace(source, destination, **kwargs):
+            original_link(source, destination, **kwargs)
+            if destination == "replaced.md":
+                published = external / destination
+                published.unlink()
+                published.write_bytes(user_bytes)
+                published.chmod(0o640)
+
+        with mock.patch.object(
+            lesson_writing.os,
+            "link",
+            side_effect=link_and_replace,
+        ):
+            with self.assertRaisesRegex(
+                lesson_writing.LessonInvalid,
+                "^project lessons link changed during write$",
+            ):
+                self.publish("replaced", valid_lesson())
+
+        published = external / "replaced.md"
+        self.assertEqual(published.read_bytes(), user_bytes)
+        self.assertEqual(published.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(list(external.glob(".lesson-*.tmp")), [])
+        self.assertEqual(index.read_bytes(), original_index)
+
     def test_explicit_global_project_is_supported_but_invalid_project_is_rejected(self):
         relative = self.publish(
             "global-rule",
