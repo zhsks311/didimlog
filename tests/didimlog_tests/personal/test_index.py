@@ -758,13 +758,23 @@ body
         recovery = [
             entry
             for entry in target.iterdir()
-            if entry.name.startswith(".index-quarantine-")
+            if (
+                entry.name.startswith(".index-quarantine-")
+                and entry.suffix == ".tmp"
+            )
         ]
         self.assertEqual(len(recovery), 1)
         self.assertEqual(recovery[0].read_bytes(), b"")
+        metadata = recovery[0].with_suffix(".name")
+        self.assertEqual(metadata.read_text(encoding="utf-8"), "z-project.md\n")
         self.assertEqual(
             {entry.name for entry in target.iterdir()},
-            {"a-project.md", "obsolete.md", recovery[0].name},
+            {
+                "a-project.md",
+                "obsolete.md",
+                recovery[0].name,
+                metadata.name,
+            },
         )
 
     def test_source_rollback_does_not_overwrite_concurrent_index_change(self):
@@ -837,14 +847,16 @@ body
         recovery = [
             entry
             for entry in target.parent.iterdir()
-            if entry.name.startswith(".index-quarantine-")
+            if (
+                entry.name.startswith(".index-quarantine-")
+                and entry.suffix == ".tmp"
+            )
         ]
         self.assertEqual(len(recovery), 1)
         self.assertEqual(recovery[0].read_bytes(), b"")
-        self.assertTrue(
-            recovery[0].name.startswith(
-                ".index-quarantine-demo-api.md-"
-            )
+        self.assertEqual(
+            recovery[0].with_suffix(".name").read_text(encoding="utf-8"),
+            "demo-api.md\n",
         )
 
     def test_rollback_cleanup_failure_does_not_skip_later_existing_index(self):
@@ -881,7 +893,10 @@ body
         recovery = [
             entry
             for entry in target.iterdir()
-            if entry.name.startswith(".index-quarantine-")
+            if (
+                entry.name.startswith(".index-quarantine-")
+                and entry.suffix == ".tmp"
+            )
         ]
         self.assertEqual(len(recovery), 1)
         self.assertEqual(recovery[0].read_bytes(), b"")
@@ -918,24 +933,20 @@ body
         recovery = [
             entry
             for entry in target.iterdir()
-            if entry.name.startswith(".index-quarantine-")
+            if (
+                entry.name.startswith(".index-quarantine-")
+                and entry.suffix == ".tmp"
+            )
         ]
         self.assertEqual(len(recovery), 2)
-        self.assertTrue(
-            any(
-                entry.name.startswith(
-                    ".index-quarantine-a-project.md-"
-                )
+        self.assertEqual(
+            {
+                entry.with_suffix(".name")
+                .read_text(encoding="utf-8")
+                .removesuffix("\n")
                 for entry in recovery
-            )
-        )
-        self.assertTrue(
-            any(
-                entry.name.startswith(
-                    ".index-quarantine-z-project.md-"
-                )
-                for entry in recovery
-            )
+            },
+            {"a-project.md", "z-project.md"},
         )
         self.assertEqual(
             [entry.read_bytes() for entry in recovery],
@@ -1047,15 +1058,17 @@ body
         recovery = [
             entry
             for entry in target.iterdir()
-            if entry.name.startswith(".index-backup-")
+            if (
+                entry.name.startswith(".index-backup-")
+                and entry.suffix == ".tmp"
+            )
         ]
         self.assertEqual(len(recovery), 1)
         self.assertEqual(recovery[0].read_bytes(), previous)
         self.assertEqual(stat.S_IMODE(recovery[0].stat().st_mode), 0o640)
-        self.assertTrue(
-            recovery[0].name.startswith(
-                ".index-backup-demo-api.md-"
-            )
+        self.assertEqual(
+            recovery[0].with_suffix(".name").read_text(encoding="utf-8"),
+            "demo-api.md\n",
         )
 
     def test_two_failed_restores_have_unambiguous_recovery_names(self):
@@ -1097,24 +1110,20 @@ body
         recovery = [
             entry
             for entry in target.iterdir()
-            if entry.name.startswith(".index-backup-")
+            if (
+                entry.name.startswith(".index-backup-")
+                and entry.suffix == ".tmp"
+            )
         ]
         self.assertEqual(len(recovery), 2)
-        self.assertTrue(
-            any(
-                entry.name.startswith(
-                    ".index-backup-a-project.md-"
-                )
+        self.assertEqual(
+            {
+                entry.with_suffix(".name")
+                .read_text(encoding="utf-8")
+                .removesuffix("\n")
                 for entry in recovery
-            )
-        )
-        self.assertTrue(
-            any(
-                entry.name.startswith(
-                    ".index-backup-z-project.md-"
-                )
-                for entry in recovery
-            )
+            },
+            {"a-project.md", "z-project.md"},
         )
         self.assertEqual(
             [entry.read_bytes() for entry in recovery],
@@ -1125,6 +1134,187 @@ body
             [0o640, 0o640],
         )
         self.assertEqual(knowledge_index.build_all(self.root), {})
+    def test_long_project_second_write_uses_bounded_recovery_names(self):
+        project = "a" * 240
+        self.write("lessons/{}/rule.md".format(project), LESSON)
+        target = self.root / "index"
+
+        knowledge_index.write_all(data_root=self.root, target=target)
+        knowledge_index.write_all(data_root=self.root, target=target)
+
+        self.assertTrue((target / (project + ".md")).is_file())
+        self.assertEqual(
+            [
+                entry.name
+                for entry in target.iterdir()
+                if entry.name.startswith(".index-")
+            ],
+            [],
+        )
+
+    def test_recovery_name_collision_does_not_remove_existing_artifact(self):
+        target = self.root / "index"
+        current = target / "demo-api.md"
+        previous = b"previous public bytes\r\n"
+        current.write_bytes(previous)
+        collision = target / ".index-backup-collision.tmp"
+        collision.write_bytes(b"user artifact bytes\n")
+
+        with mock.patch.object(
+            knowledge_index,
+            "_recovery_pair_names",
+            return_value=(
+                collision.name,
+                ".index-backup-collision.name",
+            ),
+        ), self.assertRaisesRegex(
+            knowledge_index.KnowledgeIndexError,
+            "cannot allocate index recovery metadata",
+        ):
+            knowledge_index._create_index_backup(
+                target,
+                "demo-api.md",
+                previous,
+                0o640,
+            )
+
+        self.assertEqual(current.read_bytes(), previous)
+        self.assertEqual(collision.read_bytes(), b"user artifact bytes\n")
+        self.assertFalse(
+            (target / ".index-backup-collision.name").exists()
+        )
+
+    def test_partial_recovery_metadata_failure_preserves_public_index(self):
+        target = self.root / "index"
+        current = target / "demo-api.md"
+        previous = b"previous public bytes\r\n"
+        current.write_bytes(previous)
+        original_open = knowledge_index.os.open
+
+        def fail_backup_artifact_open(path, flags, *args, **kwargs):
+            name = Path(os.fspath(path)).name
+            if (
+                name.startswith(".index-backup-")
+                and name.endswith(".tmp")
+            ):
+                raise OSError("synthetic artifact creation failure")
+            return original_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(
+            knowledge_index.os,
+            "open",
+            side_effect=fail_backup_artifact_open,
+        ), self.assertRaisesRegex(
+            knowledge_index.KnowledgeIndexError,
+            "cannot prepare index recovery metadata",
+        ) as caught:
+            knowledge_index.write_all(
+                outputs={
+                    "demo-api": GENERATED_NOTICE + "\n# replacement\n",
+                },
+                data_root=self.root,
+                target=target,
+            )
+
+        self.assertNotIn(str(self.temporary), str(caught.exception))
+        self.assertEqual(current.read_bytes(), previous)
+        self.assertEqual(
+            [
+                entry.name
+                for entry in target.iterdir()
+                if entry.name.startswith(".index-")
+            ],
+            [],
+        )
+
+    def test_long_project_recovery_sidecars_map_backup_and_quarantine(self):
+        existing_project = "a" * 240
+        absent_project = "z" * 240
+        target = self.root / "index"
+        previous = b"previous long project bytes\r\n"
+        existing = target / (existing_project + ".md")
+        existing.write_bytes(previous)
+        existing.chmod(0o640)
+        outputs = {
+            existing_project: GENERATED_NOTICE + "\n# replacement a\n",
+            absent_project: GENERATED_NOTICE + "\n# replacement z\n",
+        }
+        original_replace = (
+            knowledge_index.replace_regular_file_at_if_unchanged_with_info
+        )
+
+        def fail_existing_restore(parent_descriptor, name, *args, **kwargs):
+            if name == existing_project + ".md":
+                raise OSError("synthetic rollback restore failure")
+            return original_replace(
+                parent_descriptor,
+                name,
+                *args,
+                **kwargs,
+            )
+
+
+        with mock.patch.object(
+            knowledge_index,
+            "_require_projects_unchanged",
+            side_effect=[
+                None,
+                knowledge_index.KnowledgeIndexError(
+                    "forced postcheck failure"
+                ),
+            ],
+        ), mock.patch.object(
+            knowledge_index,
+            "replace_regular_file_at_if_unchanged_with_info",
+            side_effect=fail_existing_restore,
+        ), self.assertRaisesRegex(
+            knowledge_index.KnowledgeIndexError,
+            "KNOWLEDGE_INDEX_ROLLBACK_FAILED",
+        ) as caught:
+            knowledge_index.write_all(
+                outputs=outputs,
+                data_root=self.root,
+                target=target,
+            )
+
+        self.assertNotIn(str(self.temporary), str(caught.exception))
+        metadata = [
+            entry
+            for entry in target.iterdir()
+            if entry.suffix == ".name"
+        ]
+        self.assertEqual(len(metadata), 2)
+        mapping = {}
+        for sidecar in metadata:
+            artifact = sidecar.with_suffix(".tmp")
+            self.assertTrue(artifact.is_file())
+            self.assertLessEqual(len(os.fsencode(artifact.name)), 255)
+            self.assertLessEqual(len(os.fsencode(sidecar.name)), 255)
+            mapping[sidecar.read_text(encoding="utf-8").removesuffix("\n")] = (
+                artifact
+            )
+        self.assertEqual(
+            set(mapping),
+            {
+                existing_project + ".md",
+                absent_project + ".md",
+            },
+        )
+        self.assertTrue(
+            mapping[existing_project + ".md"].name.startswith(
+                ".index-backup-"
+            )
+        )
+        self.assertTrue(
+            mapping[absent_project + ".md"].name.startswith(
+                ".index-quarantine-"
+            )
+        )
+        self.assertEqual(
+            mapping[existing_project + ".md"].read_bytes(),
+            previous,
+        )
+
 
     def test_stale_index_removal_preserves_concurrent_writer(self):
         self.write("lessons/demo-api/rule.md", LESSON)

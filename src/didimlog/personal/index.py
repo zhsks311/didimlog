@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
+import hashlib
 import os
 import secrets
 import stat
@@ -577,9 +578,94 @@ def _cleanup_index_temporaries(paths: Iterable[str]) -> None:
             pass
 
 
+def _recovery_pair_names(kind: str, logical_name: str) -> tuple[str, str]:
+    digest = hashlib.sha256(logical_name.encode("utf-8")).hexdigest()[:16]
+    identifier = "{}-{}".format(digest, secrets.token_hex(12))
+    base = ".index-{}-{}".format(kind, identifier)
+    return base + ".tmp", base + ".name"
+
+
+def _create_index_backup(
+    destination: Path,
+    logical_name: str,
+    data: bytes,
+    mode: int,
+) -> tuple[str, str]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    for _ in range(32):
+        artifact_name, metadata_name = _recovery_pair_names(
+            "backup",
+            logical_name,
+        )
+        artifact = destination / artifact_name
+        metadata = destination / metadata_name
+        artifact_descriptor = None
+        metadata_descriptor = None
+        created: list[str] = []
+        try:
+            metadata_descriptor = os.open(metadata, flags, 0o600)
+            created.append(str(metadata))
+            artifact_descriptor = os.open(artifact, flags, 0o600)
+            created.append(str(artifact))
+        except FileExistsError:
+            if artifact_descriptor is not None:
+                os.close(artifact_descriptor)
+            if metadata_descriptor is not None:
+                os.close(metadata_descriptor)
+            _cleanup_index_temporaries(created)
+            continue
+        except OSError as exc:
+            if artifact_descriptor is not None:
+                os.close(artifact_descriptor)
+            if metadata_descriptor is not None:
+                os.close(metadata_descriptor)
+            _cleanup_index_temporaries(created)
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_INVALID: "
+                "cannot prepare index recovery metadata"
+            ) from exc
+
+        try:
+            metadata_handle = os.fdopen(
+                metadata_descriptor,
+                "w",
+                encoding="utf-8",
+                newline="\n",
+            )
+            metadata_descriptor = None
+            with metadata_handle:
+                metadata_handle.write(logical_name + "\n")
+                metadata_handle.flush()
+                os.fsync(metadata_handle.fileno())
+
+            artifact_handle = os.fdopen(artifact_descriptor, "wb")
+            artifact_descriptor = None
+            with artifact_handle:
+                os.fchmod(artifact_handle.fileno(), mode)
+                artifact_handle.write(data)
+                artifact_handle.flush()
+                os.fsync(artifact_handle.fileno())
+        except OSError as exc:
+            if artifact_descriptor is not None:
+                os.close(artifact_descriptor)
+            if metadata_descriptor is not None:
+                os.close(metadata_descriptor)
+            _cleanup_index_temporaries(created)
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_INVALID: "
+                "cannot prepare index recovery metadata"
+            ) from exc
+        return str(artifact), str(metadata)
+
+    raise KnowledgeIndexError(
+        "KNOWLEDGE_INDEX_INVALID: "
+        "cannot allocate index recovery metadata"
+    )
+
+
 def _prepare_index_backups(
     destination: Path,
-) -> dict[str, tuple[str, bytes, int, os.stat_result]]:
+) -> dict[str, tuple[str, str, bytes, int, os.stat_result]]:
     backups = {}
     try:
         for entry in sorted(destination.iterdir(), key=lambda path: _byte_key(path.name)):
@@ -600,28 +686,55 @@ def _prepare_index_backups(
                     )
                 )
 
-            descriptor, temporary = tempfile.mkstemp(
-                prefix=".index-backup-{}-".format(entry.name),
-                suffix=".tmp",
-                dir=destination,
+            mode = stat.S_IMODE(linked_info.st_mode)
+            artifact, metadata = _create_index_backup(
+                destination,
+                entry.name,
+                data,
+                mode,
             )
             backups[entry.name] = (
-                temporary,
+                artifact,
+                metadata,
                 data,
-                stat.S_IMODE(linked_info.st_mode),
+                mode,
                 linked_info,
             )
-            with os.fdopen(descriptor, "wb") as handle:
-                os.fchmod(handle.fileno(), stat.S_IMODE(linked_info.st_mode))
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
-    except Exception:
+
+        directory_descriptor = open_directory_path(destination)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except Exception as exc:
         _cleanup_index_temporaries(
-            temporary for temporary, _, _, _ in backups.values()
+            path
+            for artifact, metadata, _, _, _ in backups.values()
+            for path in (artifact, metadata)
         )
+        if isinstance(exc, KnowledgeIndexError):
+            raise
+        if isinstance(exc, OSError):
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_INVALID: "
+                "cannot prepare index recovery metadata"
+            ) from exc
         raise
     return backups
+
+
+def _remove_recovery_metadata(
+    directory_descriptor: int,
+    metadata_name: str,
+) -> None:
+    try:
+        os.unlink(metadata_name, dir_fd=directory_descriptor)
+        os.fsync(directory_descriptor)
+    except OSError as exc:
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
+            "cannot clean recovery metadata"
+        ) from exc
 
 
 def _quarantine_index_entry(
@@ -636,11 +749,49 @@ def _quarantine_index_entry(
     from .render import _rename_entry_no_replace
 
     quarantine_name = None
+    metadata_name = None
+    metadata_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     for _ in range(32):
-        candidate = ".index-quarantine-{}-{}.tmp".format(
+        candidate, candidate_metadata = _recovery_pair_names(
+            "quarantine",
             name,
-            secrets.token_hex(12),
         )
+        metadata_descriptor = None
+        try:
+            metadata_descriptor = os.open(
+                candidate_metadata,
+                metadata_flags,
+                0o600,
+                dir_fd=directory_descriptor,
+            )
+            metadata_handle = os.fdopen(
+                metadata_descriptor,
+                "w",
+                encoding="utf-8",
+                newline="\n",
+            )
+            metadata_descriptor = None
+            with metadata_handle:
+                metadata_handle.write(name + "\n")
+                metadata_handle.flush()
+                os.fsync(metadata_handle.fileno())
+            os.fsync(directory_descriptor)
+        except FileExistsError:
+            if metadata_descriptor is not None:
+                os.close(metadata_descriptor)
+            continue
+        except OSError as exc:
+            if metadata_descriptor is not None:
+                os.close(metadata_descriptor)
+            try:
+                os.unlink(candidate_metadata, dir_fd=directory_descriptor)
+            except OSError:
+                pass
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
+                "cannot prepare recovery metadata"
+            ) from exc
+
         try:
             _rename_entry_no_replace(
                 directory_descriptor,
@@ -648,17 +799,33 @@ def _quarantine_index_entry(
                 candidate,
             )
         except FileExistsError:
+            _remove_recovery_metadata(
+                directory_descriptor,
+                candidate_metadata,
+            )
             continue
         except FileNotFoundError:
+            _remove_recovery_metadata(
+                directory_descriptor,
+                candidate_metadata,
+            )
             return _QuarantineResult.MISSING
         except OSError as exc:
+            try:
+                _remove_recovery_metadata(
+                    directory_descriptor,
+                    candidate_metadata,
+                )
+            except KnowledgeIndexError:
+                pass
             raise KnowledgeIndexError(
                 "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
                 "atomic quarantine unavailable"
             ) from exc
         quarantine_name = candidate
+        metadata_name = candidate_metadata
         break
-    if quarantine_name is None:
+    if quarantine_name is None or metadata_name is None:
         raise KnowledgeIndexError(
             "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
             "cannot allocate quarantine name"
@@ -686,7 +853,11 @@ def _quarantine_index_entry(
                 quarantine_name,
                 name,
             )
-        except OSError:
+            _remove_recovery_metadata(
+                directory_descriptor,
+                metadata_name,
+            )
+        except (KnowledgeIndexError, OSError):
             pass
         raise KnowledgeIndexError(
             "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
@@ -722,6 +893,10 @@ def _quarantine_index_entry(
                 "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
                 "cannot persist restored index"
             ) from exc
+        _remove_recovery_metadata(
+            directory_descriptor,
+            metadata_name,
+        )
         return _QuarantineResult.RESTORED
 
     state = "owned" if entry_owned else "changed"
@@ -762,7 +937,7 @@ def _rollback_index_namespace(
     destination: Path,
     backups: Mapping[
         str,
-        tuple[str, bytes, int, os.stat_result],
+        tuple[str, str, bytes, int, os.stat_result],
     ],
     published: Mapping[str, tuple[bytes, os.stat_result]],
     deleted: set[str],
@@ -772,7 +947,9 @@ def _rollback_index_namespace(
         directory_descriptor = open_directory_path(destination)
     except UnsafePathError as exc:
         retained_backups.update(
-            temporary for temporary, _, _, _ in backups.values()
+            path
+            for artifact, metadata, _, _, _ in backups.values()
+            for path in (artifact, metadata)
         )
         raise KnowledgeIndexError(
             "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
@@ -796,7 +973,7 @@ def _rollback_index_namespace(
                     failures.append("published entry cleanup failed")
                 continue
 
-            _, previous_data, previous_mode, _ = backup
+            _, _, previous_data, previous_mode, _ = backup
             try:
                 replace_regular_file_at_if_unchanged_with_info(
                     directory_descriptor,
@@ -808,13 +985,13 @@ def _rollback_index_namespace(
                 )
             except (KnowledgeIndexError, OSError):
                 failures.append("published entry restore failed")
-                retained_backups.add(backup[0])
+                retained_backups.update(backup[:2])
 
         for name in deleted:
             backup = backups.get(name)
             if backup is None:
                 continue
-            temporary, _, _, _ = backup
+            temporary, metadata, _, _, _ = backup
             try:
                 os.link(
                     temporary,
@@ -823,14 +1000,16 @@ def _rollback_index_namespace(
                 )
             except OSError:
                 failures.append("stale entry restore failed")
-                retained_backups.add(temporary)
+                retained_backups.update((temporary, metadata))
 
         try:
             os.fsync(directory_descriptor)
         except OSError:
             failures.append("namespace persistence failed")
             retained_backups.update(
-                temporary for temporary, _, _, _ in backups.values()
+                path
+                for artifact, metadata, _, _, _ in backups.values()
+                for path in (artifact, metadata)
             )
     finally:
         os.close(directory_descriptor)
@@ -932,7 +1111,7 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
             stale_descriptor = open_directory_path(destination)
             try:
                 for name in sorted(set(backups) - expected, key=_byte_key):
-                    _, stale_data, _, stale_info = backups[name]
+                    _, _, stale_data, _, stale_info = backups[name]
                     quarantine_result = _quarantine_index_entry(
                         stale_descriptor,
                         destination,
@@ -973,9 +1152,10 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
             if temporary is not None
         )
         _cleanup_index_temporaries(
-            temporary
-            for temporary, _, _, _ in backups.values()
-            if temporary not in retained_backups
+            path
+            for artifact, metadata, _, _, _ in backups.values()
+            for path in (artifact, metadata)
+            if path not in retained_backups
         )
 
     _validate_index_directory(destination, expected)
