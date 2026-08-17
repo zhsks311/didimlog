@@ -623,6 +623,8 @@ def _quarantine_index_entry(
     name: str,
     expected_data: bytes,
     expected_info: os.stat_result,
+    *,
+    restore: bool,
 ) -> bool:
     from .render import _rename_entry_no_replace
 
@@ -653,6 +655,13 @@ def _quarantine_index_entry(
             "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
             "cannot allocate quarantine name"
         )
+    try:
+        os.fsync(directory_descriptor)
+    except OSError as exc:
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
+            "cannot persist quarantined index"
+        ) from exc
 
     quarantine = destination / quarantine_name
     try:
@@ -681,43 +690,37 @@ def _quarantine_index_entry(
         and _index_publication_revision(quarantined_info)
         == _index_publication_revision(expected_info)
     )
-    if entry_owned:
+    if restore:
         try:
-            os.unlink(quarantine_name, dir_fd=directory_descriptor)
+            _rename_entry_no_replace(
+                directory_descriptor,
+                quarantine_name,
+                name,
+            )
+        except FileExistsError as exc:
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
+                "concurrent index preserved in quarantine"
+            ) from exc
         except OSError as exc:
             raise KnowledgeIndexError(
                 "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-                "cannot remove quarantined entry"
+                "cannot restore quarantined index"
             ) from exc
         try:
-            os.stat(
-                name,
-                dir_fd=directory_descriptor,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            return True
-        except OSError:
-            return False
+            os.fsync(directory_descriptor)
+        except OSError as exc:
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
+                "cannot persist restored index"
+            ) from exc
         return False
 
-    try:
-        _rename_entry_no_replace(
-            directory_descriptor,
-            quarantine_name,
-            name,
-        )
-    except FileExistsError as exc:
-        raise KnowledgeIndexError(
-            "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-            "concurrent index preserved in quarantine"
-        ) from exc
-    except OSError as exc:
-        raise KnowledgeIndexError(
-            "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-            "cannot restore concurrent index"
-        ) from exc
-    return False
+    state = "owned" if entry_owned else "changed"
+    raise KnowledgeIndexError(
+        "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
+        "{} quarantined index requires recovery".format(state)
+    )
 
 
 def _unlink_published_index_if_unchanged(
@@ -743,6 +746,7 @@ def _unlink_published_index_if_unchanged(
         name,
         b"",
         marker_info,
+        restore=False,
     )
 
 
@@ -898,6 +902,7 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
                         name,
                         stale_data,
                         stale_info,
+                        restore=True,
                     )
                     if not removed:
                         raise KnowledgeIndexError(

@@ -742,17 +742,28 @@ body
             knowledge_index.os,
             "replace",
             side_effect=retarget_after_first_replace,
-        ), self.assertRaises(knowledge_index.KnowledgeSourceError):
+        ), self.assertRaisesRegex(
+            knowledge_index.KnowledgeIndexError,
+            "KNOWLEDGE_INDEX_ROLLBACK_FAILED",
+        ) as caught:
             knowledge_index.write_all(data_root=self.root, target=target)
 
+        self.assertNotIn(str(external), str(caught.exception))
         self.assertEqual(first_index.read_bytes(), b"first previous\r\n")
         self.assertEqual(stat.S_IMODE(first_index.stat().st_mode), 0o640)
         self.assertFalse((target / "z-project.md").exists())
         self.assertEqual(stale.read_bytes(), stale_bytes)
         self.assertEqual(stat.S_IMODE(stale.stat().st_mode), 0o604)
+        recovery = [
+            entry
+            for entry in target.iterdir()
+            if entry.name.startswith(".index-quarantine-")
+        ]
+        self.assertEqual(len(recovery), 1)
+        self.assertEqual(recovery[0].read_bytes(), b"")
         self.assertEqual(
             {entry.name for entry in target.iterdir()},
-            {"a-project.md", "obsolete.md"},
+            {"a-project.md", "obsolete.md", recovery[0].name},
         )
 
     def test_source_rollback_does_not_overwrite_concurrent_index_change(self):
@@ -788,7 +799,7 @@ body
 
         self.assertEqual(target.read_bytes(), b"concurrent user bytes\n")
 
-    def test_absent_index_rollback_preserves_writer_at_unlink_boundary(self):
+    def test_absent_index_rollback_leaves_recovery_artifact_without_unlinking(self):
         external = self.temporary / "external"
         original = external / "original"
         replacement = external / "replacement"
@@ -798,12 +809,8 @@ body
         logical = self.root / "lessons" / "demo-api"
         logical.symlink_to(original, target_is_directory=True)
         target = self.root / "index" / "demo-api.md"
-        concurrent = self.temporary / "concurrent-index"
-        concurrent.write_bytes(b"concurrent writer bytes\n")
         original_replace = knowledge_index.os.replace
-        original_unlink = knowledge_index.os.unlink
         retargeted = False
-        writer_published = False
 
         def retarget_after_publish(source, destination):
             nonlocal retargeted
@@ -814,34 +821,25 @@ body
                 logical.symlink_to(replacement, target_is_directory=True)
             return result
 
-        def publish_writer_at_unlink(path, *args, **kwargs):
-            nonlocal writer_published
-            name = os.fspath(path)
-            dir_fd = kwargs.get("dir_fd")
-            old_public_unlink = dir_fd is None and Path(name) == target
-            quarantine_unlink = (
-                dir_fd is not None
-                and isinstance(name, str)
-                and name.startswith(".index-quarantine-")
-            )
-            if not writer_published and (old_public_unlink or quarantine_unlink):
-                writer_published = True
-                original_replace(concurrent, target)
-            return original_unlink(path, *args, **kwargs)
-
         with mock.patch.object(
             knowledge_index.os,
             "replace",
             side_effect=retarget_after_publish,
-        ), mock.patch.object(
-            knowledge_index.os,
-            "unlink",
-            side_effect=publish_writer_at_unlink,
-        ), self.assertRaises(knowledge_index.KnowledgeSourceError):
+        ), self.assertRaisesRegex(
+            knowledge_index.KnowledgeIndexError,
+            "KNOWLEDGE_INDEX_ROLLBACK_FAILED",
+        ) as caught:
             knowledge_index.write_all(data_root=self.root, target=self.root / "index")
 
-        self.assertTrue(writer_published)
-        self.assertEqual(target.read_bytes(), b"concurrent writer bytes\n")
+        self.assertNotIn(str(external), str(caught.exception))
+        self.assertFalse(target.exists())
+        recovery = [
+            entry
+            for entry in target.parent.iterdir()
+            if entry.name.startswith(".index-quarantine-")
+        ]
+        self.assertEqual(len(recovery), 1)
+        self.assertEqual(recovery[0].read_bytes(), b"")
 
     def test_stale_index_removal_preserves_concurrent_writer(self):
         self.write("lessons/demo-api/rule.md", LESSON)
@@ -853,34 +851,104 @@ body
         )
         concurrent = self.temporary / "concurrent-stale"
         concurrent.write_bytes(b"concurrent stale bytes\n")
-        original_replace = knowledge_index.os.replace
-        original_unlink = knowledge_index.os.unlink
+        original_read = knowledge_index.read_regular_file_beneath
         writer_published = False
 
-        def publish_writer_at_stale_unlink(path, *args, **kwargs):
+        def publish_writer_after_quarantine_read(parent, name, maximum_bytes):
             nonlocal writer_published
-            name = os.fspath(path)
-            dir_fd = kwargs.get("dir_fd")
-            old_public_unlink = dir_fd is None and Path(name) == stale
-            quarantine_unlink = (
-                dir_fd is not None
-                and isinstance(name, str)
-                and name.startswith(".index-quarantine-")
-            )
-            if not writer_published and (old_public_unlink or quarantine_unlink):
+            data = original_read(parent, name, maximum_bytes)
+            if not writer_published and name.startswith(".index-quarantine-"):
+                os.replace(concurrent, stale)
                 writer_published = True
-                original_replace(concurrent, stale)
-            return original_unlink(path, *args, **kwargs)
+            return data
 
         with mock.patch.object(
-            knowledge_index.os,
-            "unlink",
-            side_effect=publish_writer_at_stale_unlink,
-        ), self.assertRaises(knowledge_index.KnowledgeIndexError):
+            knowledge_index,
+            "read_regular_file_beneath",
+            side_effect=publish_writer_after_quarantine_read,
+        ), self.assertRaisesRegex(
+            knowledge_index.KnowledgeIndexError,
+            "KNOWLEDGE_INDEX_ROLLBACK_FAILED",
+        ):
             knowledge_index.write_all(data_root=self.root, target=target)
 
         self.assertTrue(writer_published)
         self.assertEqual(stale.read_bytes(), b"concurrent stale bytes\n")
+        self.assertFalse((target / "demo-api.md").exists())
+
+    def test_stale_quarantine_open_descriptor_write_is_preserved(self):
+        self.write("lessons/demo-api/rule.md", LESSON)
+        target = self.root / "index"
+        stale = target / "obsolete.md"
+        stale.write_text(
+            GENERATED_NOTICE + "\n# obsolete\n",
+            encoding="utf-8",
+        )
+        original_read = knowledge_index.read_regular_file_beneath
+        mutated = False
+
+        def mutate_renamed_inode_after_read(parent, name, maximum_bytes):
+            nonlocal mutated
+            if not mutated and name.startswith(".index-quarantine-"):
+                descriptor = os.open(parent / name, os.O_WRONLY)
+                try:
+                    data = original_read(parent, name, maximum_bytes)
+                    os.write(descriptor, b"open descriptor bytes\n")
+                    os.ftruncate(descriptor, len(b"open descriptor bytes\n"))
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                mutated = True
+                return data
+            return original_read(parent, name, maximum_bytes)
+
+        with mock.patch.object(
+            knowledge_index,
+            "read_regular_file_beneath",
+            side_effect=mutate_renamed_inode_after_read,
+        ), self.assertRaisesRegex(
+            knowledge_index.KnowledgeIndexError,
+            "KNOWLEDGE_INDEX_ROLLBACK_FAILED",
+        ):
+            knowledge_index.write_all(data_root=self.root, target=target)
+
+        self.assertTrue(mutated)
+        self.assertEqual(stale.read_bytes(), b"open descriptor bytes\n")
+        self.assertFalse((target / "demo-api.md").exists())
+
+    def test_stale_quarantine_path_replacement_is_preserved(self):
+        self.write("lessons/demo-api/rule.md", LESSON)
+        target = self.root / "index"
+        stale = target / "obsolete.md"
+        stale.write_text(
+            GENERATED_NOTICE + "\n# obsolete\n",
+            encoding="utf-8",
+        )
+        concurrent = self.temporary / "concurrent-quarantine"
+        concurrent.write_bytes(b"quarantine replacement bytes\n")
+        original_read = knowledge_index.read_regular_file_beneath
+        replaced = False
+
+        def replace_quarantine_after_read(parent, name, maximum_bytes):
+            nonlocal replaced
+            data = original_read(parent, name, maximum_bytes)
+            if not replaced and name.startswith(".index-quarantine-"):
+                os.replace(concurrent, parent / name)
+                replaced = True
+            return data
+
+        with mock.patch.object(
+            knowledge_index,
+            "read_regular_file_beneath",
+            side_effect=replace_quarantine_after_read,
+        ), self.assertRaisesRegex(
+            knowledge_index.KnowledgeIndexError,
+            "KNOWLEDGE_INDEX_ROLLBACK_FAILED",
+        ):
+            knowledge_index.write_all(data_root=self.root, target=target)
+
+        self.assertTrue(replaced)
+        self.assertEqual(stale.read_bytes(), b"quarantine replacement bytes\n")
         self.assertFalse((target / "demo-api.md").exists())
 
     def test_project_link_change_during_scan_preserves_existing_index(self):
@@ -1002,18 +1070,23 @@ body
         self.assertEqual((target / "demo-api.md").read_bytes(), outputs["demo-api"].encode("utf-8"))
         self.assertEqual((target / "_global.md").read_bytes(), outputs["_global"].encode("utf-8"))
 
-    def test_write_check_and_generator_owned_stale_removal(self):
+    def test_generator_owned_stale_removal_fails_without_unlinking(self):
         self.write("lessons/demo-api/one.md", LESSON)
         target = self.root / "index"
         knowledge_index.write_all(data_root=self.root, target=target)
         self.assertEqual(knowledge_index.check(self.root, target), 0)
-        self.assertTrue((target / "demo-api.md").exists())
+        original = (target / "demo-api.md").read_bytes()
 
         shutil.rmtree(self.root / "lessons" / "demo-api")
-        knowledge_index.write_all(data_root=self.root, target=target)
+        with self.assertRaisesRegex(
+            knowledge_index.KnowledgeIndexError,
+            "index changed during publish",
+        ):
+            knowledge_index.write_all(data_root=self.root, target=target)
 
-        self.assertFalse((target / "demo-api.md").exists())
-        self.assertEqual(knowledge_index.check(self.root, target), 0)
+        self.assertEqual((target / "demo-api.md").read_bytes(), original)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(knowledge_index.check(self.root, target), 1)
 
     def test_lesson_publish_cannot_be_overwritten_by_an_older_index_snapshot(self):
         project_lessons = self.root / "lessons" / "demo-api"
