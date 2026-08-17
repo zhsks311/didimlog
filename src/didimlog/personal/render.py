@@ -250,6 +250,80 @@ def _entry_revision(info: os.stat_result) -> tuple[int, ...]:
         info.st_mtime_ns,
     )
 
+@dataclass(frozen=True)
+class _EntrySnapshot:
+    revision: tuple[int, ...]
+    digest: bytes | None = None
+    link_target: bytes | None = None
+
+
+def _snapshot_output_entry(
+    output_descriptor: int,
+    name: str,
+) -> _EntrySnapshot:
+    linked = os.stat(
+        name,
+        dir_fd=output_descriptor,
+        follow_symlinks=False,
+    )
+    revision = _entry_revision(linked)
+    if stat.S_ISREG(linked.st_mode):
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        descriptor = os.open(
+            name,
+            flags,
+            dir_fd=output_descriptor,
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or _entry_revision(opened) != revision
+            ):
+                raise ValueError("book output changed during render")
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            if _entry_revision(os.fstat(descriptor)) != revision:
+                raise ValueError("book output changed during render")
+            return _EntrySnapshot(
+                revision=revision,
+                digest=digest.digest(),
+            )
+        finally:
+            os.close(descriptor)
+    if stat.S_ISLNK(linked.st_mode):
+        target = os.readlink(
+            os.fsencode(name),
+            dir_fd=output_descriptor,
+        )
+        if not isinstance(target, bytes):
+            raise ValueError("book output changed during render")
+        if (
+            _entry_revision(
+                os.stat(
+                    name,
+                    dir_fd=output_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+            != revision
+        ):
+            raise ValueError("book output changed during render")
+        return _EntrySnapshot(
+            revision=revision,
+            link_target=target,
+        )
+    return _EntrySnapshot(revision=revision)
+
 
 def _project_directory_is_current(directory, descriptor: int) -> bool:
     try:
@@ -351,7 +425,7 @@ def _entry_name_bytes(name: str) -> bytes:
     return os.fsencode(name)
 
 
-def _rename_directory_no_replace(
+def _rename_entry_no_replace(
     directory_descriptor: int,
     source_name: str,
     destination_name: str,
@@ -426,33 +500,14 @@ def _restore_entry_no_clobber(
     source_name: str,
     destination_name: str,
 ) -> bool:
-    source = os.stat(
-        source_name,
-        dir_fd=output_descriptor,
-        follow_symlinks=False,
-    )
-    if stat.S_ISDIR(source.st_mode):
-        try:
-            _rename_directory_no_replace(
-                output_descriptor,
-                source_name,
-                destination_name,
-            )
-        except FileExistsError:
-            return False
-        return True
-
     try:
-        os.link(
+        _rename_entry_no_replace(
+            output_descriptor,
             source_name,
             destination_name,
-            src_dir_fd=output_descriptor,
-            dst_dir_fd=output_descriptor,
-            follow_symlinks=False,
         )
     except FileExistsError:
         return False
-    os.unlink(source_name, dir_fd=output_descriptor)
     return True
 
 
@@ -461,7 +516,6 @@ class _OutputPublication:
     name: str
     descriptor: int
     revision: tuple[int, ...]
-    temporary_name: str
     backup_name: str | None
 
 
@@ -470,18 +524,17 @@ def _replace_output(
     output_name: str,
     document: str,
 ) -> _OutputPublication:
-    existing: os.stat_result | None
+    existing: _EntrySnapshot | None
     try:
-        existing = os.stat(
+        existing = _snapshot_output_entry(
+            output_descriptor,
             output_name,
-            dir_fd=output_descriptor,
-            follow_symlinks=False,
         )
     except FileNotFoundError:
         existing = None
     except OSError as error:
         raise ValueError("book output could not be inspected") from error
-    if existing is not None and stat.S_ISDIR(existing.st_mode):
+    if existing is not None and stat.S_ISDIR(existing.revision[2]):
         raise ValueError("book output must not be a directory")
 
     temporary_name: str | None = None
@@ -490,6 +543,7 @@ def _replace_output(
     backup_moved = False
     publication: _OutputPublication | None = None
     completed = False
+    restore_error: OSError | None = None
     try:
         temporary_name, temporary_descriptor = _temporary_output(
             output_descriptor,
@@ -503,12 +557,11 @@ def _replace_output(
                 ".bak",
             )
             os.close(backup_descriptor)
-            current = os.stat(
+            current = _snapshot_output_entry(
+                output_descriptor,
                 output_name,
-                dir_fd=output_descriptor,
-                follow_symlinks=False,
             )
-            if _entry_revision(current) != _entry_revision(existing):
+            if current != existing:
                 raise ValueError("book output changed during render")
             try:
                 os.rename(
@@ -520,35 +573,31 @@ def _replace_output(
             except FileNotFoundError:
                 raise ValueError("book output changed during render") from None
             backup_moved = True
-            moved = os.stat(
+            moved = _snapshot_output_entry(
+                output_descriptor,
                 backup_name,
-                dir_fd=output_descriptor,
-                follow_symlinks=False,
             )
-            if _entry_revision(moved) != _entry_revision(existing):
+            if moved != existing:
                 raise ValueError("book output changed during render")
 
         revision = _entry_revision(os.fstat(temporary_descriptor))
         try:
-            os.link(
+            _rename_entry_no_replace(
+                output_descriptor,
                 temporary_name,
                 output_name,
-                src_dir_fd=output_descriptor,
-                dst_dir_fd=output_descriptor,
-                follow_symlinks=False,
             )
         except FileExistsError:
             raise ValueError("book output changed during render") from None
+        temporary_name = None
 
         publication = _OutputPublication(
             name=output_name,
             descriptor=temporary_descriptor,
             revision=revision,
-            temporary_name=temporary_name,
             backup_name=backup_name if backup_moved else None,
         )
         temporary_descriptor = None
-        temporary_name = None
         backup_name = None
         backup_moved = False
         linked = os.stat(
@@ -588,19 +637,29 @@ def _replace_output(
                         backup_name,
                         output_name,
                     )
+                except OSError as error:
+                    restore_error = error
+                else:
                     if restored:
                         backup_name = None
-                except OSError:
-                    pass
-            if backup_name is not None:
+                    else:
+                        restore_error = FileExistsError(
+                            errno.EEXIST,
+                            "book output backup destination exists",
+                            output_name,
+                        )
+            elif backup_name is not None:
                 try:
                     os.unlink(backup_name, dir_fd=output_descriptor)
+                    backup_name = None
                 except OSError:
                     pass
         try:
             os.fsync(output_descriptor)
         except OSError:
             pass
+        if restore_error is not None:
+            raise ValueError("book output backup could not be restored") from restore_error
 
 
 def _finish_output(
@@ -680,12 +739,25 @@ def _finish_output(
             )
             if publication_unchanged:
                 if publication.backup_name is not None:
-                    if _restore_entry_no_clobber(
-                        output_descriptor,
-                        publication.backup_name,
-                        publication.name,
-                    ):
-                        publication.backup_name = None
+                    try:
+                        restored = _restore_entry_no_clobber(
+                            output_descriptor,
+                            publication.backup_name,
+                            publication.name,
+                        )
+                    except OSError:
+                        os.unlink(recovery_name, dir_fd=output_descriptor)
+                        recovery_name = None
+                        raise
+                    if not restored:
+                        os.unlink(recovery_name, dir_fd=output_descriptor)
+                        recovery_name = None
+                        raise FileExistsError(
+                            errno.EEXIST,
+                            "book output backup destination exists",
+                            publication.name,
+                        )
+                    publication.backup_name = None
                 os.unlink(recovery_name, dir_fd=output_descriptor)
                 recovery_name = None
             else:
@@ -703,17 +775,22 @@ def _finish_output(
                         os.unlink(recovery_name, dir_fd=output_descriptor)
                     recovery_name = None
         elif rollback and publication.backup_name is not None:
-            if _restore_entry_no_clobber(
+            restored = _restore_entry_no_clobber(
                 output_descriptor,
                 publication.backup_name,
                 publication.name,
-            ):
-                publication.backup_name = None
+            )
+            if not restored:
+                raise FileExistsError(
+                    errno.EEXIST,
+                    "book output backup destination exists",
+                    publication.name,
+                )
+            publication.backup_name = None
 
         if publication.backup_name is not None:
             os.unlink(publication.backup_name, dir_fd=output_descriptor)
             publication.backup_name = None
-        os.unlink(publication.temporary_name, dir_fd=output_descriptor)
         os.fsync(output_descriptor)
         if recovery_name is not None:
             raise ValueError("book output cleanup could not preserve concurrent output")
