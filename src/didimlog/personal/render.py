@@ -349,23 +349,38 @@ def _restore_entry_no_clobber(
     )
     if stat.S_ISDIR(source.st_mode):
         try:
-            os.stat(
+            os.mkdir(
                 destination_name,
+                0o700,
                 dir_fd=output_descriptor,
-                follow_symlinks=False,
             )
-        except FileNotFoundError:
+        except FileExistsError:
+            return False
+        reservation = os.stat(
+            destination_name,
+            dir_fd=output_descriptor,
+            follow_symlinks=False,
+        )
+        try:
+            os.rename(
+                source_name,
+                destination_name,
+                src_dir_fd=output_descriptor,
+                dst_dir_fd=output_descriptor,
+            )
+        except OSError:
             try:
-                os.rename(
-                    source_name,
+                current = os.stat(
                     destination_name,
-                    src_dir_fd=output_descriptor,
-                    dst_dir_fd=output_descriptor,
+                    dir_fd=output_descriptor,
+                    follow_symlinks=False,
                 )
-            except (FileExistsError, IsADirectoryError, NotADirectoryError):
-                return False
-            return True
-        return False
+                if _entry_revision(current) == _entry_revision(reservation):
+                    os.rmdir(destination_name, dir_fd=output_descriptor)
+            except OSError:
+                pass
+            return False
+        return True
 
     try:
         os.link(
@@ -613,12 +628,20 @@ def _finish_output(
                         publication.backup_name = None
                 os.unlink(recovery_name, dir_fd=output_descriptor)
                 recovery_name = None
-            elif _restore_entry_no_clobber(
-                output_descriptor,
-                recovery_name,
-                publication.name,
-            ):
-                recovery_name = None
+            else:
+                restored = _restore_entry_no_clobber(
+                    output_descriptor,
+                    recovery_name,
+                    publication.name,
+                )
+                if restored:
+                    recovery_name = None
+                else:
+                    if stat.S_ISDIR(recovered.st_mode):
+                        os.rmdir(recovery_name, dir_fd=output_descriptor)
+                    else:
+                        os.unlink(recovery_name, dir_fd=output_descriptor)
+                    recovery_name = None
         elif rollback and publication.backup_name is not None:
             if _restore_entry_no_clobber(
                 output_descriptor,

@@ -584,6 +584,176 @@ class RenderBookTests(unittest.TestCase):
         self.assertFalse((replacement / "html" / "test.html").exists())
         self.assertEqual(list(external_html.glob(".render-*")), [])
 
+    def test_rollback_restores_directory_replacing_output_after_current_stat(self):
+        external = self.root / "external-book"
+        (external / "assets").mkdir(parents=True)
+        replacement = self.root / "replacement-book"
+        replacement.mkdir()
+        self.assets.rmdir()
+        self.project_book.rmdir()
+        self.make_symlink(
+            self.project_book,
+            external,
+            target_is_directory=True,
+        )
+        (external / "test.md").write_text(
+            book_markdown("# linked\n"),
+            encoding="utf-8",
+            newline="\n",
+        )
+        concurrent_output = external / "html" / "test.html"
+        real_replace = render_module._replace_output
+        real_stat = render_module.os.stat
+        retargeted = False
+        replaced = False
+
+        def publish_and_retarget(*args, **kwargs):
+            nonlocal retargeted
+            publication = real_replace(*args, **kwargs)
+            self.project_book.unlink()
+            os.symlink(
+                replacement,
+                self.project_book,
+                target_is_directory=True,
+            )
+            retargeted = True
+            return publication
+
+        def stat_and_replace_with_directory(path, *args, **kwargs):
+            nonlocal replaced
+            info = real_stat(path, *args, **kwargs)
+            if (
+                retargeted
+                and not replaced
+                and path == "test.html"
+                and kwargs.get("dir_fd") is not None
+            ):
+                concurrent_output.unlink()
+                concurrent_output.mkdir()
+                replaced = True
+            return info
+
+        with mock.patch.object(
+            render_module,
+            "_replace_output",
+            side_effect=publish_and_retarget,
+        ), mock.patch.object(
+            render_module.os,
+            "stat",
+            side_effect=stat_and_replace_with_directory,
+        ), self.assertRaisesRegex(
+            ValueError,
+            "project book link changed during render",
+        ):
+            self.render()
+
+        self.assertTrue(concurrent_output.is_dir())
+        self.assertEqual(list(concurrent_output.iterdir()), [])
+        self.assertFalse((replacement / "html" / "test.html").exists())
+        self.assertEqual(list((external / "html").glob(".render-*")), [])
+
+    def test_rollback_does_not_replace_directory_created_during_restore(self):
+        external = self.root / "external-book"
+        (external / "assets").mkdir(parents=True)
+        replacement = self.root / "replacement-book"
+        replacement.mkdir()
+        self.assets.rmdir()
+        self.project_book.rmdir()
+        self.make_symlink(
+            self.project_book,
+            external,
+            target_is_directory=True,
+        )
+        (external / "test.md").write_text(
+            book_markdown("# linked\n"),
+            encoding="utf-8",
+            newline="\n",
+        )
+        concurrent_output = external / "html" / "test.html"
+        real_replace = render_module._replace_output
+        real_stat = render_module.os.stat
+        real_mkdir = render_module.os.mkdir
+        retargeted = False
+        replaced = False
+        competed = False
+        competitor_identity = None
+
+        def publish_and_retarget(*args, **kwargs):
+            nonlocal retargeted
+            publication = real_replace(*args, **kwargs)
+            self.project_book.unlink()
+            os.symlink(
+                replacement,
+                self.project_book,
+                target_is_directory=True,
+            )
+            retargeted = True
+            return publication
+
+        def stat_and_replace_with_directory(path, *args, **kwargs):
+            nonlocal replaced
+            info = real_stat(path, *args, **kwargs)
+            if (
+                retargeted
+                and not replaced
+                and path == "test.html"
+                and kwargs.get("dir_fd") is not None
+            ):
+                concurrent_output.unlink()
+                concurrent_output.mkdir()
+                replaced = True
+            return info
+
+        def mkdir_and_compete(path, *args, **kwargs):
+            nonlocal competed, competitor_identity
+            if (
+                replaced
+                and not competed
+                and path == "test.html"
+                and kwargs.get("dir_fd") is not None
+            ):
+                real_mkdir(path, *args, **kwargs)
+                competitor = real_stat(
+                    path,
+                    dir_fd=kwargs["dir_fd"],
+                    follow_symlinks=False,
+                )
+                competitor_identity = (
+                    competitor.st_dev,
+                    competitor.st_ino,
+                    competitor.st_mode,
+                )
+                competed = True
+            return real_mkdir(path, *args, **kwargs)
+
+        with mock.patch.object(
+            render_module,
+            "_replace_output",
+            side_effect=publish_and_retarget,
+        ), mock.patch.object(
+            render_module.os,
+            "stat",
+            side_effect=stat_and_replace_with_directory,
+        ), mock.patch.object(
+            render_module.os,
+            "mkdir",
+            side_effect=mkdir_and_compete,
+        ), self.assertRaisesRegex(
+            ValueError,
+            "project book link changed during render",
+        ):
+            self.render()
+
+        current = concurrent_output.lstat()
+        self.assertEqual(
+            (current.st_dev, current.st_ino, current.st_mode),
+            competitor_identity,
+        )
+        self.assertTrue(concurrent_output.is_dir())
+        self.assertEqual(list(concurrent_output.iterdir()), [])
+        self.assertFalse((replacement / "html" / "test.html").exists())
+        self.assertEqual(list((external / "html").glob(".render-*")), [])
+
     def test_backup_move_failure_after_concurrent_delete_does_not_restore_placeholder(
         self,
     ):
