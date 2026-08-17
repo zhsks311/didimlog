@@ -607,6 +607,56 @@ body
         self.assertIn("원래 문서", output)
         self.assertNotIn("바뀐 문서", output)
 
+    def test_recursive_docs_read_from_the_directory_inode_that_was_scanned(self):
+        project = self.root / "docs" / "demo-api"
+        active = project / "nested"
+        saved = self.temporary / "nested-saved"
+        replacement = self.temporary / "nested-replacement"
+        active.mkdir(parents=True)
+        replacement.mkdir()
+        original_text = (
+            "---\n"
+            "title: 원래 중첩 문서\n"
+            "find_when: [원래 중첩 자료]\n"
+            "---\n"
+        )
+        replacement_text = (
+            "---\n"
+            "title: 바뀐 중첩 문서\n"
+            "find_when: [바뀐 중첩 자료]\n"
+            "---\n"
+        )
+        (active / "guide.md").write_text(original_text, encoding="utf-8")
+        (replacement / "guide.md").write_text(
+            replacement_text,
+            encoding="utf-8",
+        )
+        original_markdown_files = knowledge_index._markdown_files
+        swapped = False
+
+        def swap_nested_after_scan(*args, **kwargs):
+            nonlocal swapped
+            files = original_markdown_files(*args, **kwargs)
+            active.rename(saved)
+            replacement.rename(active)
+            swapped = True
+            return files
+
+        try:
+            with mock.patch.object(
+                knowledge_index,
+                "_markdown_files",
+                side_effect=swap_nested_after_scan,
+            ):
+                output = knowledge_index.build_all(self.root)["demo-api"]
+        finally:
+            if swapped:
+                active.rename(replacement)
+                saved.rename(active)
+
+        self.assertIn("원래 중첩 문서", output)
+        self.assertNotIn("바뀐 중첩 문서", output)
+
     def test_collect_rechecks_all_links_after_later_project_scan(self):
         external = self.temporary / "external"
         first = external / "first"
@@ -627,11 +677,13 @@ body
             *,
             recursive,
             root_descriptor,
+            item_reader=None,
         ):
             files = original_markdown_files(
                 project,
                 recursive=recursive,
                 root_descriptor=root_descriptor,
+                item_reader=item_reader,
             )
             if project.logical.name == "z-project":
                 first_link.unlink()
@@ -696,6 +748,84 @@ body
         )
         self.assertNotIn(str(external), str(caught.exception))
 
+    def test_index_directory_swap_never_writes_the_replacement_namespace(self):
+        outputs = {
+            "demo-api": GENERATED_NOTICE + "\n# replacement\n",
+        }
+        boundaries = (
+            "_reconcile_index_recovery",
+            "_validate_index_directory",
+            "_prepare_index_backups",
+            "_require_projects_unchanged",
+            "os.replace",
+        )
+
+        for boundary in boundaries:
+            with self.subTest(boundary=boundary):
+                target = self.root / ("index-" + boundary.replace(".", "-"))
+                target.mkdir()
+                current = target / "demo-api.md"
+                previous = (GENERATED_NOTICE + "\n# previous\n").encode("utf-8")
+                current.write_bytes(previous)
+                current.chmod(0o640)
+                saved = self.temporary / (target.name + "-saved")
+                swapped = False
+
+                def swap_destination():
+                    nonlocal swapped
+                    if swapped:
+                        return
+                    target.rename(saved)
+                    target.mkdir()
+                    swapped = True
+
+                if boundary == "os.replace":
+                    original = knowledge_index.os.replace
+
+                    def swap_at_boundary(*args, **kwargs):
+                        result = original(*args, **kwargs)
+                        swap_destination()
+                        return result
+
+                    patcher = mock.patch.object(
+                        knowledge_index.os,
+                        "replace",
+                        side_effect=swap_at_boundary,
+                    )
+                else:
+                    original = getattr(knowledge_index, boundary)
+
+                    def swap_at_boundary(*args, _original=original, **kwargs):
+                        swap_destination()
+                        return _original(*args, **kwargs)
+
+                    patcher = mock.patch.object(
+                        knowledge_index,
+                        boundary,
+                        side_effect=swap_at_boundary,
+                    )
+
+                with patcher, self.assertRaises(
+                    knowledge_index.KnowledgeIndexError
+                ) as caught:
+                    knowledge_index.write_all(
+                        outputs=outputs,
+                        data_root=self.root,
+                        target=target,
+                    )
+
+                self.assertTrue(swapped)
+                self.assertNotIn(str(self.temporary), str(caught.exception))
+                self.assertEqual(list(target.iterdir()), [])
+                self.assertEqual(
+                    (saved / "demo-api.md").read_bytes(),
+                    previous,
+                )
+                self.assertEqual(
+                    stat.S_IMODE((saved / "demo-api.md").stat().st_mode),
+                    0o640,
+                )
+
     def test_project_link_change_before_publish_preserves_existing_index(self):
         external = self.temporary / "external"
         original = external / "original"
@@ -748,14 +878,13 @@ body
         original_replace = knowledge_index.os.replace
         retargeted = False
 
-        def retarget_before_first_replace(source, destination):
+        def retarget_before_first_replace(source, destination, **kwargs):
             nonlocal retargeted
             if not retargeted:
                 retargeted = True
                 logical.unlink()
                 logical.symlink_to(replacement, target_is_directory=True)
-            return original_replace(source, destination)
-
+            return original_replace(source, destination, **kwargs)
         with mock.patch.object(
             knowledge_index.os,
             "replace",
@@ -796,9 +925,9 @@ body
         original_replace = knowledge_index.os.replace
         replacements = 0
 
-        def retarget_after_first_replace(source, destination):
+        def retarget_after_first_replace(source, destination, **kwargs):
             nonlocal replacements
-            result = original_replace(source, destination)
+            result = original_replace(source, destination, **kwargs)
             replacements += 1
             if replacements == 1:
                 first_link.unlink()
@@ -986,16 +1115,15 @@ body
         original_replace = knowledge_index.os.replace
         changed = False
 
-        def change_index_after_publish(source, destination):
+        def change_index_after_publish(source, destination, **kwargs):
             nonlocal changed
-            result = original_replace(source, destination)
+            result = original_replace(source, destination, **kwargs)
             if not changed:
                 changed = True
-                Path(destination).write_bytes(b"concurrent user bytes\n")
+                target.write_bytes(b"concurrent user bytes\n")
                 logical.unlink()
                 logical.symlink_to(replacement, target_is_directory=True)
             return result
-
         with mock.patch.object(
             knowledge_index.os,
             "replace",
@@ -1040,9 +1168,9 @@ body
         original_replace = knowledge_index.os.replace
         retargeted = False
 
-        def retarget_after_publish(source, destination):
+        def retarget_after_publish(source, destination, **kwargs):
             nonlocal retargeted
-            result = original_replace(source, destination)
+            result = original_replace(source, destination, **kwargs)
             if not retargeted:
                 retargeted = True
                 logical.unlink()
@@ -1908,20 +2036,20 @@ body
         )
         concurrent = self.temporary / "concurrent-stale"
         concurrent.write_bytes(b"concurrent stale bytes\n")
-        original_read = knowledge_index.read_regular_file_beneath
+        original_read = knowledge_index.read_regular_file_at
         writer_published = False
 
         def publish_writer_after_quarantine_read(parent, name, maximum_bytes):
             nonlocal writer_published
             data = original_read(parent, name, maximum_bytes)
             if not writer_published and name.startswith(".index-retired-"):
-                os.replace(concurrent, stale)
+                os.replace(concurrent, stale.name, dst_dir_fd=parent)
                 writer_published = True
             return data
 
         with mock.patch.object(
             knowledge_index,
-            "read_regular_file_beneath",
+            "read_regular_file_at",
             side_effect=publish_writer_after_quarantine_read,
         ), self.assertRaisesRegex(
             knowledge_index.KnowledgeIndexError,
@@ -1941,13 +2069,13 @@ body
             GENERATED_NOTICE + "\n# obsolete\n",
             encoding="utf-8",
         )
-        original_read = knowledge_index.read_regular_file_beneath
+        original_read = knowledge_index.read_regular_file_at
         mutated = False
 
         def mutate_renamed_inode_after_read(parent, name, maximum_bytes):
             nonlocal mutated
             if not mutated and name.startswith(".index-retired-"):
-                descriptor = os.open(parent / name, os.O_WRONLY)
+                descriptor = os.open(name, os.O_WRONLY, dir_fd=parent)
                 try:
                     data = original_read(parent, name, maximum_bytes)
                     os.write(descriptor, b"open descriptor bytes\n")
@@ -1961,7 +2089,7 @@ body
 
         with mock.patch.object(
             knowledge_index,
-            "read_regular_file_beneath",
+            "read_regular_file_at",
             side_effect=mutate_renamed_inode_after_read,
         ), self.assertRaisesRegex(
             knowledge_index.KnowledgeIndexError,
@@ -1983,20 +2111,20 @@ body
         )
         concurrent = self.temporary / "concurrent-quarantine"
         concurrent.write_bytes(b"quarantine replacement bytes\n")
-        original_read = knowledge_index.read_regular_file_beneath
+        original_read = knowledge_index.read_regular_file_at
         replaced = False
 
         def replace_quarantine_after_read(parent, name, maximum_bytes):
             nonlocal replaced
             data = original_read(parent, name, maximum_bytes)
             if not replaced and name.startswith(".index-retired-"):
-                os.replace(concurrent, parent / name)
+                os.replace(concurrent, name, dst_dir_fd=parent)
                 replaced = True
             return data
 
         with mock.patch.object(
             knowledge_index,
-            "read_regular_file_beneath",
+            "read_regular_file_at",
             side_effect=replace_quarantine_after_read,
         ), self.assertRaisesRegex(
             knowledge_index.KnowledgeIndexError,
@@ -2182,6 +2310,38 @@ body
         output = (target / "demo-api.md").read_text(encoding="utf-8")
         self.assertIn("작업 규칙", output)
         self.assertNotIn("작업 문서", output)
+
+    def test_check_accepts_valid_resolved_and_retired_history(self):
+        self.write("lessons/demo-api/one.md", LESSON)
+        target = self.root / "index"
+        knowledge_index.write_all(data_root=self.root, target=target)
+        current = target / "demo-api.md"
+        current_data = current.read_bytes()
+        current_mode = stat.S_IMODE(current.stat().st_mode)
+        resolved_name = knowledge_index._recovery_name(
+            "resolved",
+            current.name,
+            ".json",
+        )
+        (target / resolved_name).write_bytes(
+            knowledge_index._recovery_record_bytes(
+                current.name,
+                current_data,
+                current_mode,
+            )
+        )
+        retired_name = knowledge_index._recovery_name(
+            "retired",
+            current.name,
+            ".tmp",
+        )
+        (target / retired_name).write_bytes(b"retired history\n")
+        (target / retired_name).with_suffix(".name").write_text(
+            current.name + "\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(knowledge_index.check(self.root, target), 0)
 
     def test_check_rejects_missing_outdated_extra_and_non_lf_index_bytes(self):
         self.write("lessons/demo-api/one.md", LESSON)
