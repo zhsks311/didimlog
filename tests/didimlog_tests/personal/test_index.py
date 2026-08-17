@@ -841,6 +841,11 @@ body
         ]
         self.assertEqual(len(recovery), 1)
         self.assertEqual(recovery[0].read_bytes(), b"")
+        self.assertTrue(
+            recovery[0].name.startswith(
+                ".index-quarantine-demo-api.md-"
+            )
+        )
 
     def test_rollback_cleanup_failure_does_not_skip_later_existing_index(self):
         target = self.root / "index"
@@ -916,6 +921,22 @@ body
             if entry.name.startswith(".index-quarantine-")
         ]
         self.assertEqual(len(recovery), 2)
+        self.assertTrue(
+            any(
+                entry.name.startswith(
+                    ".index-quarantine-a-project.md-"
+                )
+                for entry in recovery
+            )
+        )
+        self.assertTrue(
+            any(
+                entry.name.startswith(
+                    ".index-quarantine-z-project.md-"
+                )
+                for entry in recovery
+            )
+        )
         self.assertEqual(
             [entry.read_bytes() for entry in recovery],
             [b"", b""],
@@ -1031,6 +1052,79 @@ body
         self.assertEqual(len(recovery), 1)
         self.assertEqual(recovery[0].read_bytes(), previous)
         self.assertEqual(stat.S_IMODE(recovery[0].stat().st_mode), 0o640)
+        self.assertTrue(
+            recovery[0].name.startswith(
+                ".index-backup-demo-api.md-"
+            )
+        )
+
+    def test_two_failed_restores_have_unambiguous_recovery_names(self):
+        target = self.root / "index"
+        previous = b"identical previous bytes\r\n"
+        for name in ("a-project.md", "z-project.md"):
+            entry = target / name
+            entry.write_bytes(previous)
+            entry.chmod(0o640)
+        outputs = {
+            "a-project": GENERATED_NOTICE + "\n# replacement a\n",
+            "z-project": GENERATED_NOTICE + "\n# replacement z\n",
+        }
+
+        with mock.patch.object(
+            knowledge_index,
+            "_require_projects_unchanged",
+            side_effect=[
+                None,
+                knowledge_index.KnowledgeIndexError(
+                    "forced postcheck failure"
+                ),
+            ],
+        ), mock.patch.object(
+            knowledge_index,
+            "replace_regular_file_at_if_unchanged_with_info",
+            side_effect=OSError("synthetic rollback restore failure"),
+        ), self.assertRaisesRegex(
+            knowledge_index.KnowledgeIndexError,
+            "published entry restore failed",
+        ) as caught:
+            knowledge_index.write_all(
+                outputs=outputs,
+                data_root=self.root,
+                target=target,
+            )
+
+        self.assertNotIn(str(self.temporary), str(caught.exception))
+        recovery = [
+            entry
+            for entry in target.iterdir()
+            if entry.name.startswith(".index-backup-")
+        ]
+        self.assertEqual(len(recovery), 2)
+        self.assertTrue(
+            any(
+                entry.name.startswith(
+                    ".index-backup-a-project.md-"
+                )
+                for entry in recovery
+            )
+        )
+        self.assertTrue(
+            any(
+                entry.name.startswith(
+                    ".index-backup-z-project.md-"
+                )
+                for entry in recovery
+            )
+        )
+        self.assertEqual(
+            [entry.read_bytes() for entry in recovery],
+            [previous, previous],
+        )
+        self.assertEqual(
+            [stat.S_IMODE(entry.stat().st_mode) for entry in recovery],
+            [0o640, 0o640],
+        )
+        self.assertEqual(knowledge_index.build_all(self.root), {})
 
     def test_stale_index_removal_preserves_concurrent_writer(self):
         self.write("lessons/demo-api/rule.md", LESSON)

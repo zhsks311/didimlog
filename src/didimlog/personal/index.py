@@ -601,7 +601,7 @@ def _prepare_index_backups(
                 )
 
             descriptor, temporary = tempfile.mkstemp(
-                prefix=".index-backup-",
+                prefix=".index-backup-{}-".format(entry.name),
                 suffix=".tmp",
                 dir=destination,
             )
@@ -637,8 +637,9 @@ def _quarantine_index_entry(
 
     quarantine_name = None
     for _ in range(32):
-        candidate = ".index-quarantine-{}.tmp".format(
-            secrets.token_hex(12)
+        candidate = ".index-quarantine-{}-{}.tmp".format(
+            name,
+            secrets.token_hex(12),
         )
         try:
             _rename_entry_no_replace(
