@@ -342,6 +342,31 @@ def _restore_entry_no_clobber(
     source_name: str,
     destination_name: str,
 ) -> bool:
+    source = os.stat(
+        source_name,
+        dir_fd=output_descriptor,
+        follow_symlinks=False,
+    )
+    if stat.S_ISDIR(source.st_mode):
+        try:
+            os.stat(
+                destination_name,
+                dir_fd=output_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            try:
+                os.rename(
+                    source_name,
+                    destination_name,
+                    src_dir_fd=output_descriptor,
+                    dst_dir_fd=output_descriptor,
+                )
+            except (FileExistsError, IsADirectoryError, NotADirectoryError):
+                return False
+            return True
+        return False
+
     try:
         os.link(
             source_name,
@@ -522,12 +547,22 @@ def _finish_output(
         except FileNotFoundError:
             current = None
 
-        if rollback and current is not None:
+        publication_descriptor_unchanged = (
+            _entry_revision(os.fstat(publication.descriptor))
+            == publication.revision
+        )
+        current_was_publication = (
+            current is not None
+            and _entry_revision(current) == publication.revision
+            and publication_descriptor_unchanged
+        )
+        if rollback and current_was_publication:
             recovery_name, recovery_descriptor = _temporary_output(
                 output_descriptor,
                 ".recover",
             )
             os.close(recovery_descriptor)
+            os.unlink(recovery_name, dir_fd=output_descriptor)
             try:
                 os.rename(
                     publication.name,
@@ -536,8 +571,24 @@ def _finish_output(
                     dst_dir_fd=output_descriptor,
                 )
             except FileNotFoundError:
-                os.unlink(recovery_name, dir_fd=output_descriptor)
                 recovery_name = None
+            except OSError:
+                recovery_name = None
+                try:
+                    remaining = os.stat(
+                        publication.name,
+                        dir_fd=output_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    remaining = None
+                if (
+                    remaining is not None
+                    and _entry_revision(remaining) == publication.revision
+                    and _entry_revision(os.fstat(publication.descriptor))
+                    == publication.revision
+                ):
+                    raise
             else:
                 recovery_moved = True
 

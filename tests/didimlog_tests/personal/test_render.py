@@ -535,6 +535,55 @@ class RenderBookTests(unittest.TestCase):
         self.assertFalse((replacement / "html" / "test.html").exists())
         self.assertEqual(list(external_html.glob(".render-*")), [])
 
+    def test_rollback_preserves_directory_replacing_published_output(self):
+        external = self.root / "external-book"
+        external_html = external / "html"
+        external_html.mkdir(parents=True)
+        existing_output = external_html / "test.html"
+        existing_output.write_bytes(b"original rendered entry\n")
+        replacement = self.root / "replacement-book"
+        replacement.mkdir()
+        self.assets.rmdir()
+        self.project_book.rmdir()
+        self.make_symlink(
+            self.project_book,
+            external,
+            target_is_directory=True,
+        )
+        (external / "test.md").write_text(
+            book_markdown("# linked\n"),
+            encoding="utf-8",
+            newline="\n",
+        )
+        real_replace = render_module._replace_output
+
+        def publish_directory_and_retarget(*args, **kwargs):
+            publication = real_replace(*args, **kwargs)
+            existing_output.unlink()
+            existing_output.mkdir()
+            self.project_book.unlink()
+            os.symlink(
+                replacement,
+                self.project_book,
+                target_is_directory=True,
+            )
+            return publication
+
+        with mock.patch.object(
+            render_module,
+            "_replace_output",
+            side_effect=publish_directory_and_retarget,
+        ), self.assertRaisesRegex(
+            ValueError,
+            "project book link changed during render",
+        ):
+            self.render()
+
+        self.assertTrue(existing_output.is_dir())
+        self.assertEqual(list(existing_output.iterdir()), [])
+        self.assertFalse((replacement / "html" / "test.html").exists())
+        self.assertEqual(list(external_html.glob(".render-*")), [])
+
     def test_backup_move_failure_after_concurrent_delete_does_not_restore_placeholder(
         self,
     ):
