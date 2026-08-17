@@ -1,6 +1,8 @@
+import base64
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
 import io
+import json
 import multiprocessing
 import os
 import shutil
@@ -805,10 +807,32 @@ body
             knowledge_index.os,
             "replace",
             side_effect=change_index_after_publish,
-        ), self.assertRaises(knowledge_index.KnowledgeSourceError):
-            knowledge_index.write_all(data_root=self.root, target=self.root / "index")
+        ), self.assertRaisesRegex(
+            knowledge_index.KnowledgeIndexError,
+            "published entry restore failed",
+        ) as caught:
+            knowledge_index.write_all(
+                data_root=self.root,
+                target=self.root / "index",
+            )
 
+        self.assertNotIn(str(external), str(caught.exception))
         self.assertEqual(target.read_bytes(), b"concurrent user bytes\n")
+        recovery = [
+            entry
+            for entry in target.parent.iterdir()
+            if (
+                entry.name.startswith(".index-recovery-")
+                and entry.suffix == ".json"
+            )
+        ]
+        self.assertEqual(len(recovery), 1)
+        record = json.loads(recovery[0].read_text(encoding="utf-8"))
+        self.assertEqual(record["logical_name"], "demo-api.md")
+        self.assertEqual(
+            base64.b64decode(record["data_base64"]),
+            b"previous bytes\r\n",
+        )
 
     def test_absent_index_rollback_leaves_recovery_artifact_without_unlinking(self):
         external = self.temporary / "external"
@@ -858,6 +882,49 @@ body
             recovery[0].with_suffix(".name").read_text(encoding="utf-8"),
             "demo-api.md\n",
         )
+
+    def test_quarantine_metadata_failure_returns_path_safe_aggregate(self):
+        target = self.root / "index"
+        output = GENERATED_NOTICE + "\n# replacement\n"
+
+        with mock.patch.object(
+            knowledge_index,
+            "_require_projects_unchanged",
+            side_effect=[
+                None,
+                knowledge_index.KnowledgeIndexError(
+                    "forced postcheck failure"
+                ),
+            ],
+        ), mock.patch.object(
+            knowledge_index,
+            "_persist_quarantine_metadata",
+            side_effect=knowledge_index.KnowledgeIndexError(
+                "synthetic metadata failure"
+            ),
+        ), self.assertRaisesRegex(
+            knowledge_index.KnowledgeIndexError,
+            "published entry cleanup failed",
+        ) as caught:
+            knowledge_index.write_all(
+                outputs={"demo-api": output},
+                data_root=self.root,
+                target=target,
+            )
+
+        self.assertNotIn(str(self.temporary), str(caught.exception))
+        self.assertFalse((target / "demo-api.md").exists())
+        quarantine = [
+            entry
+            for entry in target.iterdir()
+            if (
+                entry.name.startswith(".index-quarantine-")
+                and entry.suffix == ".tmp"
+            )
+        ]
+        self.assertEqual(len(quarantine), 1)
+        self.assertEqual(quarantine[0].read_bytes(), b"")
+        self.assertFalse(quarantine[0].with_suffix(".name").exists())
 
     def test_rollback_cleanup_failure_does_not_skip_later_existing_index(self):
         target = self.root / "index"
@@ -1059,17 +1126,20 @@ body
             entry
             for entry in target.iterdir()
             if (
-                entry.name.startswith(".index-backup-")
-                and entry.suffix == ".tmp"
+                entry.name.startswith(".index-recovery-")
+                and entry.suffix == ".json"
             )
         ]
         self.assertEqual(len(recovery), 1)
-        self.assertEqual(recovery[0].read_bytes(), previous)
-        self.assertEqual(stat.S_IMODE(recovery[0].stat().st_mode), 0o640)
+        record = json.loads(recovery[0].read_text(encoding="utf-8"))
+        self.assertEqual(record["version"], 1)
+        self.assertEqual(record["logical_name"], "demo-api.md")
+        self.assertEqual(record["mode"], 0o640)
         self.assertEqual(
-            recovery[0].with_suffix(".name").read_text(encoding="utf-8"),
-            "demo-api.md\n",
+            base64.b64decode(record["data_base64"]),
+            previous,
         )
+        self.assertEqual(stat.S_IMODE(recovery[0].stat().st_mode), 0o600)
 
     def test_two_failed_restores_have_unambiguous_recovery_names(self):
         target = self.root / "index"
@@ -1111,29 +1181,33 @@ body
             entry
             for entry in target.iterdir()
             if (
-                entry.name.startswith(".index-backup-")
-                and entry.suffix == ".tmp"
+                entry.name.startswith(".index-recovery-")
+                and entry.suffix == ".json"
             )
         ]
         self.assertEqual(len(recovery), 2)
+        records = [
+            json.loads(entry.read_text(encoding="utf-8"))
+            for entry in recovery
+        ]
         self.assertEqual(
-            {
-                entry.with_suffix(".name")
-                .read_text(encoding="utf-8")
-                .removesuffix("\n")
-                for entry in recovery
-            },
+            {record["logical_name"] for record in records},
             {"a-project.md", "z-project.md"},
         )
         self.assertEqual(
-            [entry.read_bytes() for entry in recovery],
+            [base64.b64decode(record["data_base64"]) for record in records],
             [previous, previous],
         )
         self.assertEqual(
-            [stat.S_IMODE(entry.stat().st_mode) for entry in recovery],
+            [record["mode"] for record in records],
             [0o640, 0o640],
         )
+        self.assertEqual(
+            [stat.S_IMODE(entry.stat().st_mode) for entry in recovery],
+            [0o600, 0o600],
+        )
         self.assertEqual(knowledge_index.build_all(self.root), {})
+
     def test_long_project_second_write_uses_bounded_recovery_names(self):
         project = "a" * 240
         self.write("lessons/{}/rule.md".format(project), LESSON)
@@ -1152,62 +1226,36 @@ body
             [],
         )
 
-    def test_recovery_name_collision_does_not_remove_existing_artifact(self):
+    def test_backup_metadata_path_replacement_is_never_unlinked(self):
         target = self.root / "index"
         current = target / "demo-api.md"
-        previous = b"previous public bytes\r\n"
-        current.write_bytes(previous)
-        collision = target / ".index-backup-collision.tmp"
-        collision.write_bytes(b"user artifact bytes\n")
+        current.write_bytes(b"previous public bytes\r\n")
+        user_file = self.temporary / "user-metadata"
+        user_file.write_bytes(b"user replacement bytes\n")
+        replaced_path = None
+
+        def replace_metadata_path(_projects):
+            nonlocal replaced_path
+            if replaced_path is not None:
+                return
+            metadata = next(
+                (
+                    entry
+                    for entry in target.iterdir()
+                    if entry.name.startswith(".index-backup-")
+                    and entry.suffix == ".name"
+                ),
+                None,
+            )
+            if metadata is not None:
+                os.replace(user_file, metadata)
+                replaced_path = metadata
 
         with mock.patch.object(
             knowledge_index,
-            "_recovery_pair_names",
-            return_value=(
-                collision.name,
-                ".index-backup-collision.name",
-            ),
-        ), self.assertRaisesRegex(
-            knowledge_index.KnowledgeIndexError,
-            "cannot allocate index recovery metadata",
+            "_require_projects_unchanged",
+            side_effect=replace_metadata_path,
         ):
-            knowledge_index._create_index_backup(
-                target,
-                "demo-api.md",
-                previous,
-                0o640,
-            )
-
-        self.assertEqual(current.read_bytes(), previous)
-        self.assertEqual(collision.read_bytes(), b"user artifact bytes\n")
-        self.assertFalse(
-            (target / ".index-backup-collision.name").exists()
-        )
-
-    def test_partial_recovery_metadata_failure_preserves_public_index(self):
-        target = self.root / "index"
-        current = target / "demo-api.md"
-        previous = b"previous public bytes\r\n"
-        current.write_bytes(previous)
-        original_open = knowledge_index.os.open
-
-        def fail_backup_artifact_open(path, flags, *args, **kwargs):
-            name = Path(os.fspath(path)).name
-            if (
-                name.startswith(".index-backup-")
-                and name.endswith(".tmp")
-            ):
-                raise OSError("synthetic artifact creation failure")
-            return original_open(path, flags, *args, **kwargs)
-
-        with mock.patch.object(
-            knowledge_index.os,
-            "open",
-            side_effect=fail_backup_artifact_open,
-        ), self.assertRaisesRegex(
-            knowledge_index.KnowledgeIndexError,
-            "cannot prepare index recovery metadata",
-        ) as caught:
             knowledge_index.write_all(
                 outputs={
                     "demo-api": GENERATED_NOTICE + "\n# replacement\n",
@@ -1216,8 +1264,109 @@ body
                 target=target,
             )
 
-        self.assertNotIn(str(self.temporary), str(caught.exception))
-        self.assertEqual(current.read_bytes(), previous)
+        preserved = user_file if user_file.exists() else replaced_path
+        self.assertIsNotNone(preserved)
+        self.assertTrue(preserved.exists())
+        self.assertEqual(preserved.read_bytes(), b"user replacement bytes\n")
+
+    def test_backup_metadata_open_descriptor_write_is_never_unlinked(self):
+        target = self.root / "index"
+        current = target / "demo-api.md"
+        current.write_bytes(b"previous public bytes\r\n")
+        mutated_path = None
+
+        def mutate_metadata_inode(_projects):
+            nonlocal mutated_path
+            if mutated_path is not None:
+                return
+            metadata = next(
+                (
+                    entry
+                    for entry in target.iterdir()
+                    if entry.name.startswith(".index-backup-")
+                    and entry.suffix == ".name"
+                ),
+                None,
+            )
+            if metadata is None:
+                return
+            descriptor = os.open(metadata, os.O_WRONLY | os.O_TRUNC)
+            try:
+                os.write(descriptor, b"user descriptor bytes\n")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            mutated_path = metadata
+
+        with mock.patch.object(
+            knowledge_index,
+            "_require_projects_unchanged",
+            side_effect=mutate_metadata_inode,
+        ):
+            knowledge_index.write_all(
+                outputs={
+                    "demo-api": GENERATED_NOTICE + "\n# replacement\n",
+                },
+                data_root=self.root,
+                target=target,
+            )
+
+        if mutated_path is not None:
+            self.assertTrue(mutated_path.exists())
+            self.assertEqual(
+                mutated_path.read_bytes(),
+                b"user descriptor bytes\n",
+            )
+
+    def test_recovery_name_collision_does_not_remove_existing_artifact(self):
+        target = self.root / "index"
+        collision = target / ".index-recovery-collision.json"
+        collision.write_bytes(b"user artifact bytes\n")
+        directory_descriptor = knowledge_index.open_directory_path(target)
+        try:
+            with mock.patch.object(
+                knowledge_index,
+                "_recovery_name",
+                return_value=collision.name,
+            ), self.assertRaisesRegex(
+                knowledge_index.KnowledgeIndexError,
+                "cannot allocate index recovery record",
+            ):
+                knowledge_index._persist_index_recovery_record(
+                    directory_descriptor,
+                    "demo-api.md",
+                    b"previous public bytes\r\n",
+                    0o640,
+                )
+        finally:
+            os.close(directory_descriptor)
+
+        self.assertEqual(collision.read_bytes(), b"user artifact bytes\n")
+
+    def test_normal_write_does_not_materialize_recovery_records(self):
+        target = self.root / "index"
+        current = target / "demo-api.md"
+        current.write_bytes(b"previous public bytes\r\n")
+        replacement = GENERATED_NOTICE + "\n# replacement\n"
+        original_open = knowledge_index.os.open
+
+        def reject_recovery_record(path, flags, *args, **kwargs):
+            if Path(os.fspath(path)).name.startswith(".index-recovery-"):
+                raise OSError("unexpected recovery record creation")
+            return original_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(
+            knowledge_index.os,
+            "open",
+            side_effect=reject_recovery_record,
+        ):
+            knowledge_index.write_all(
+                outputs={"demo-api": replacement},
+                data_root=self.root,
+                target=target,
+            )
+
+        self.assertEqual(current.read_bytes(), replacement.encode("utf-8"))
         self.assertEqual(
             [
                 entry.name
@@ -1283,35 +1432,32 @@ body
             for entry in target.iterdir()
             if entry.suffix == ".name"
         ]
-        self.assertEqual(len(metadata), 2)
-        mapping = {}
-        for sidecar in metadata:
-            artifact = sidecar.with_suffix(".tmp")
-            self.assertTrue(artifact.is_file())
-            self.assertLessEqual(len(os.fsencode(artifact.name)), 255)
-            self.assertLessEqual(len(os.fsencode(sidecar.name)), 255)
-            mapping[sidecar.read_text(encoding="utf-8").removesuffix("\n")] = (
-                artifact
-            )
+        self.assertEqual(len(metadata), 1)
+        quarantine = metadata[0].with_suffix(".tmp")
+        self.assertTrue(quarantine.is_file())
+        self.assertLessEqual(len(os.fsencode(quarantine.name)), 255)
+        self.assertLessEqual(len(os.fsencode(metadata[0].name)), 255)
         self.assertEqual(
-            set(mapping),
-            {
-                existing_project + ".md",
-                absent_project + ".md",
-            },
+            metadata[0].read_text(encoding="utf-8"),
+            absent_project + ".md\n",
         )
-        self.assertTrue(
-            mapping[existing_project + ".md"].name.startswith(
-                ".index-backup-"
+        self.assertTrue(quarantine.name.startswith(".index-quarantine-"))
+
+        recovery = [
+            entry
+            for entry in target.iterdir()
+            if (
+                entry.name.startswith(".index-recovery-")
+                and entry.suffix == ".json"
             )
-        )
-        self.assertTrue(
-            mapping[absent_project + ".md"].name.startswith(
-                ".index-quarantine-"
-            )
-        )
+        ]
+        self.assertEqual(len(recovery), 1)
+        self.assertLessEqual(len(os.fsencode(recovery[0].name)), 255)
+        record = json.loads(recovery[0].read_text(encoding="utf-8"))
+        self.assertEqual(record["logical_name"], existing_project + ".md")
+        self.assertEqual(record["mode"], 0o640)
         self.assertEqual(
-            mapping[existing_project + ".md"].read_bytes(),
+            base64.b64decode(record["data_base64"]),
             previous,
         )
 
