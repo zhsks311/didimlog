@@ -166,28 +166,39 @@ def _file_revision(info: os.stat_result) -> tuple[int, ...]:
 def _mark_booked_locked(values, directory: ProjectDirectory):
     selected = []
     skipped = []
+    valid = []
+    for slug in values:
+        if not isinstance(slug, str) or SLUG.fullmatch(slug) is None:
+            skipped.append(slug)
+            continue
+        valid.append(slug)
+
+    if not valid:
+        return {"marked": [], "skipped": skipped}
+
+    descriptor: int | None = None
     try:
-        for slug in values:
-            if not isinstance(slug, str) or SLUG.fullmatch(slug) is None:
-                skipped.append(slug)
-                continue
+        if not project_directory_unchanged(directory):
+            skipped.extend(valid)
+            return {"marked": [], "skipped": skipped}
+        try:
+            descriptor = file_io.open_directory_path(directory.physical)
+            if (
+                _directory_identity(os.fstat(descriptor))
+                != directory.target_identity
+                or not project_directory_unchanged(directory)
+            ):
+                skipped.extend(valid)
+                return {"marked": [], "skipped": skipped}
+        except (OSError, file_io.UnsafePathError):
+            skipped.extend(valid)
+            return {"marked": [], "skipped": skipped}
+
+        for slug in valid:
             if not project_directory_unchanged(directory):
                 skipped.append(slug)
                 continue
-
-            descriptor: int | None = None
             try:
-                descriptor = file_io.open_directory_path(directory.physical)
-                if (
-                    _directory_identity(os.fstat(descriptor))
-                    != directory.target_identity
-                ):
-                    skipped.append(slug)
-                    continue
-                if not project_directory_unchanged(directory):
-                    skipped.append(slug)
-                    continue
-
                 name = f"{slug}.md"
                 entry = os.stat(
                     name,
@@ -209,16 +220,12 @@ def _mark_booked_locked(values, directory: ProjectDirectory):
                 if parsed is None:
                     skipped.append(slug)
                     continue
-                selected.append((slug, name, descriptor, entry, data, parsed))
-                descriptor = None
+                selected.append((slug, name, entry, data, parsed))
             except (OSError, file_io.UnsafePathError):
                 skipped.append(slug)
-            finally:
-                if descriptor is not None:
-                    os.close(descriptor)
 
         marked = []
-        for slug, name, descriptor, entry, data, parsed in selected:
+        for slug, name, entry, data, parsed in selected:
             if not project_directory_unchanged(directory):
                 skipped.append(slug)
                 continue
@@ -255,7 +262,7 @@ def _mark_booked_locked(values, directory: ProjectDirectory):
             marked.append(str(directory.logical / name))
         return {"marked": marked, "skipped": skipped}
     finally:
-        for _, _, descriptor, _, _, _ in selected:
+        if descriptor is not None:
             os.close(descriptor)
 
 

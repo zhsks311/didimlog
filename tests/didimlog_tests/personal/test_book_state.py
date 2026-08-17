@@ -1,3 +1,4 @@
+import errno
 import os
 import shutil
 import subprocess
@@ -166,6 +167,53 @@ class BookStateTests(unittest.TestCase):
             external_path.read_bytes(),
             original.replace(b"\n---\n", b"\nbooked: [kafka]\n---\n", 1),
         )
+
+    def test_mark_booked_reuses_one_project_descriptor_for_multiple_lessons(self):
+        external = self.temporary_root / "external-lessons"
+        external.mkdir()
+        first_original = lesson_bytes(title="첫 번째")
+        second_original = lesson_bytes(title="두 번째")
+        first_path = external / "one.md"
+        second_path = external / "two.md"
+        first_path.write_bytes(first_original)
+        second_path.write_bytes(second_original)
+        logical = self.lessons_root / "app"
+        logical.rmdir()
+        logical.symlink_to(external, target_is_directory=True)
+        real_open = file_io.open_directory_path
+        open_calls = 0
+
+        def fail_on_second_open(path):
+            nonlocal open_calls
+            open_calls += 1
+            if open_calls > 1:
+                raise OSError(errno.EMFILE, os.strerror(errno.EMFILE))
+            return real_open(path)
+
+        with mock.patch.object(
+            file_io,
+            "open_directory_path",
+            side_effect=fail_on_second_open,
+        ):
+            result = book_state.mark_booked(
+                ["one", "two"],
+                project="app",
+                root=self.lessons_root,
+            )
+
+        self.assertEqual(open_calls, 1)
+        self.assertEqual(
+            result,
+            {
+                "marked": [
+                    str(logical / "one.md"),
+                    str(logical / "two.md"),
+                ],
+                "skipped": [],
+            },
+        )
+        self.assertIn(b"booked: [kafka]", first_path.read_bytes())
+        self.assertIn(b"booked: [kafka]", second_path.read_bytes())
 
     def test_mark_booked_skips_target_replaced_before_descriptor_open(self):
         external = self.temporary_root / "external-lessons"
