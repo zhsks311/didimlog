@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import stat
 import sys
 import tempfile
@@ -571,7 +572,7 @@ def _cleanup_index_temporaries(paths: Iterable[str]) -> None:
 
 def _prepare_index_backups(
     destination: Path,
-) -> dict[str, tuple[str, bytes, int]]:
+) -> dict[str, tuple[str, bytes, int, os.stat_result]]:
     backups = {}
     try:
         for entry in sorted(destination.iterdir(), key=lambda path: _byte_key(path.name)):
@@ -601,6 +602,7 @@ def _prepare_index_backups(
                 temporary,
                 data,
                 stat.S_IMODE(linked_info.st_mode),
+                linked_info,
             )
             with os.fdopen(descriptor, "wb") as handle:
                 os.fchmod(handle.fileno(), stat.S_IMODE(linked_info.st_mode))
@@ -609,10 +611,113 @@ def _prepare_index_backups(
                 os.fsync(handle.fileno())
     except Exception:
         _cleanup_index_temporaries(
-            temporary for temporary, _, _ in backups.values()
+            temporary for temporary, _, _, _ in backups.values()
         )
         raise
     return backups
+
+
+def _quarantine_index_entry(
+    directory_descriptor: int,
+    destination: Path,
+    name: str,
+    expected_data: bytes,
+    expected_info: os.stat_result,
+) -> bool:
+    from .render import _rename_entry_no_replace
+
+    quarantine_name = None
+    for _ in range(32):
+        candidate = ".index-quarantine-{}.tmp".format(
+            secrets.token_hex(12)
+        )
+        try:
+            _rename_entry_no_replace(
+                directory_descriptor,
+                name,
+                candidate,
+            )
+        except FileExistsError:
+            continue
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
+                "atomic quarantine unavailable"
+            ) from exc
+        quarantine_name = candidate
+        break
+    if quarantine_name is None:
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
+            "cannot allocate quarantine name"
+        )
+
+    quarantine = destination / quarantine_name
+    try:
+        quarantined_info = quarantine.lstat()
+        quarantined_data = read_regular_file_beneath(
+            destination,
+            quarantine_name,
+            len(expected_data),
+        )
+    except (OSError, UnsafePathError) as exc:
+        try:
+            _rename_entry_no_replace(
+                directory_descriptor,
+                quarantine_name,
+                name,
+            )
+        except OSError:
+            pass
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
+            "cannot inspect quarantined index"
+        ) from exc
+
+    entry_owned = (
+        quarantined_data == expected_data
+        and _index_publication_revision(quarantined_info)
+        == _index_publication_revision(expected_info)
+    )
+    if entry_owned:
+        try:
+            os.unlink(quarantine_name, dir_fd=directory_descriptor)
+        except OSError as exc:
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
+                "cannot remove quarantined entry"
+            ) from exc
+        try:
+            os.stat(
+                name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        return False
+
+    try:
+        _rename_entry_no_replace(
+            directory_descriptor,
+            quarantine_name,
+            name,
+        )
+    except FileExistsError as exc:
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
+            "concurrent index preserved in quarantine"
+        ) from exc
+    except OSError as exc:
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
+            "cannot restore concurrent index"
+        ) from exc
+    return False
 
 
 def _unlink_published_index_if_unchanged(
@@ -632,32 +737,21 @@ def _unlink_published_index_if_unchanged(
     )
     if marker_info is None:
         return
-
-    path = destination / name
-    try:
-        current_info = path.lstat()
-        current_data = read_regular_file_beneath(destination, name, 0)
-    except (OSError, UnsafePathError):
-        return
-    if (
-        current_data != b""
-        or _index_publication_revision(current_info)
-        != _index_publication_revision(marker_info)
-    ):
-        return
-    try:
-        latest_info = path.lstat()
-        if _index_publication_revision(
-            latest_info
-        ) == _index_publication_revision(marker_info):
-            path.unlink()
-    except OSError:
-        pass
+    _quarantine_index_entry(
+        directory_descriptor,
+        destination,
+        name,
+        b"",
+        marker_info,
+    )
 
 
 def _rollback_index_namespace(
     destination: Path,
-    backups: Mapping[str, tuple[str, bytes, int]],
+    backups: Mapping[
+        str,
+        tuple[str, bytes, int, os.stat_result],
+    ],
     published: Mapping[str, tuple[bytes, os.stat_result]],
     deleted: set[str],
 ) -> None:
@@ -677,7 +771,7 @@ def _rollback_index_namespace(
                     published_info,
                 )
                 continue
-            _, previous_data, previous_mode = backup
+            _, previous_data, previous_mode, _ = backup
             try:
                 replace_regular_file_at_if_unchanged_with_info(
                     directory_descriptor,
@@ -694,7 +788,7 @@ def _rollback_index_namespace(
             backup = backups.get(name)
             if backup is None:
                 continue
-            temporary, _, _ = backup
+            temporary, _, _, _ = backup
             try:
                 os.link(
                     temporary,
@@ -794,17 +888,25 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
                     published_info,
                 )
 
-            for name in sorted(set(backups) - expected, key=_byte_key):
-                entry = destination / name
-                try:
-                    entry.unlink()
-                except OSError as exc:
-                    raise KnowledgeIndexError(
-                        "KNOWLEDGE_INDEX_INVALID {}: cannot remove stale index".format(
-                            entry
+            stale_descriptor = open_directory_path(destination)
+            try:
+                for name in sorted(set(backups) - expected, key=_byte_key):
+                    _, stale_data, _, stale_info = backups[name]
+                    removed = _quarantine_index_entry(
+                        stale_descriptor,
+                        destination,
+                        name,
+                        stale_data,
+                        stale_info,
+                    )
+                    if not removed:
+                        raise KnowledgeIndexError(
+                            "KNOWLEDGE_INDEX_INVALID {}: "
+                            "index changed during publish".format(name)
                         )
-                    ) from exc
-                deleted.add(name)
+                    deleted.add(name)
+            finally:
+                os.close(stale_descriptor)
 
             _require_projects_unchanged(source_projects)
         except Exception:
@@ -822,7 +924,7 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
             if temporary is not None
         )
         _cleanup_index_temporaries(
-            temporary for temporary, _, _ in backups.values()
+            temporary for temporary, _, _, _ in backups.values()
         )
 
     _validate_index_directory(destination, expected)

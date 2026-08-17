@@ -788,6 +788,101 @@ body
 
         self.assertEqual(target.read_bytes(), b"concurrent user bytes\n")
 
+    def test_absent_index_rollback_preserves_writer_at_unlink_boundary(self):
+        external = self.temporary / "external"
+        original = external / "original"
+        replacement = external / "replacement"
+        original.mkdir(parents=True)
+        replacement.mkdir()
+        (original / "rule.md").write_text(LESSON, encoding="utf-8")
+        logical = self.root / "lessons" / "demo-api"
+        logical.symlink_to(original, target_is_directory=True)
+        target = self.root / "index" / "demo-api.md"
+        concurrent = self.temporary / "concurrent-index"
+        concurrent.write_bytes(b"concurrent writer bytes\n")
+        original_replace = knowledge_index.os.replace
+        original_unlink = knowledge_index.os.unlink
+        retargeted = False
+        writer_published = False
+
+        def retarget_after_publish(source, destination):
+            nonlocal retargeted
+            result = original_replace(source, destination)
+            if not retargeted:
+                retargeted = True
+                logical.unlink()
+                logical.symlink_to(replacement, target_is_directory=True)
+            return result
+
+        def publish_writer_at_unlink(path, *args, **kwargs):
+            nonlocal writer_published
+            name = os.fspath(path)
+            dir_fd = kwargs.get("dir_fd")
+            old_public_unlink = dir_fd is None and Path(name) == target
+            quarantine_unlink = (
+                dir_fd is not None
+                and isinstance(name, str)
+                and name.startswith(".index-quarantine-")
+            )
+            if not writer_published and (old_public_unlink or quarantine_unlink):
+                writer_published = True
+                original_replace(concurrent, target)
+            return original_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(
+            knowledge_index.os,
+            "replace",
+            side_effect=retarget_after_publish,
+        ), mock.patch.object(
+            knowledge_index.os,
+            "unlink",
+            side_effect=publish_writer_at_unlink,
+        ), self.assertRaises(knowledge_index.KnowledgeSourceError):
+            knowledge_index.write_all(data_root=self.root, target=self.root / "index")
+
+        self.assertTrue(writer_published)
+        self.assertEqual(target.read_bytes(), b"concurrent writer bytes\n")
+
+    def test_stale_index_removal_preserves_concurrent_writer(self):
+        self.write("lessons/demo-api/rule.md", LESSON)
+        target = self.root / "index"
+        stale = target / "obsolete.md"
+        stale.write_text(
+            GENERATED_NOTICE + "\n# obsolete\n",
+            encoding="utf-8",
+        )
+        concurrent = self.temporary / "concurrent-stale"
+        concurrent.write_bytes(b"concurrent stale bytes\n")
+        original_replace = knowledge_index.os.replace
+        original_unlink = knowledge_index.os.unlink
+        writer_published = False
+
+        def publish_writer_at_stale_unlink(path, *args, **kwargs):
+            nonlocal writer_published
+            name = os.fspath(path)
+            dir_fd = kwargs.get("dir_fd")
+            old_public_unlink = dir_fd is None and Path(name) == stale
+            quarantine_unlink = (
+                dir_fd is not None
+                and isinstance(name, str)
+                and name.startswith(".index-quarantine-")
+            )
+            if not writer_published and (old_public_unlink or quarantine_unlink):
+                writer_published = True
+                original_replace(concurrent, stale)
+            return original_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(
+            knowledge_index.os,
+            "unlink",
+            side_effect=publish_writer_at_stale_unlink,
+        ), self.assertRaises(knowledge_index.KnowledgeIndexError):
+            knowledge_index.write_all(data_root=self.root, target=target)
+
+        self.assertTrue(writer_published)
+        self.assertEqual(stale.read_bytes(), b"concurrent stale bytes\n")
+        self.assertFalse((target / "demo-api.md").exists())
+
     def test_project_link_change_during_scan_preserves_existing_index(self):
         external = self.temporary / "external"
         external.mkdir()
