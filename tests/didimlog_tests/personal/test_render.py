@@ -280,6 +280,251 @@ class RenderBookTests(unittest.TestCase):
         self.assertFalse((replacement / "html" / "test.html").exists())
         self.assertEqual(list(external_html.glob(".render-*")), [])
 
+    def test_publish_preserves_output_created_after_absent_check(self):
+        external = self.root / "external-book"
+        (external / "assets").mkdir(parents=True)
+        self.assets.rmdir()
+        self.project_book.rmdir()
+        self.make_symlink(
+            self.project_book,
+            external,
+            target_is_directory=True,
+        )
+        (external / "test.md").write_text(
+            book_markdown("# linked\n"),
+            encoding="utf-8",
+            newline="\n",
+        )
+        concurrent_output = external / "html" / "test.html"
+        concurrent = b"user created output\n"
+        real_write_all = render_module._write_all
+
+        def write_and_create_output(descriptor, data):
+            real_write_all(descriptor, data)
+            concurrent_output.write_bytes(concurrent)
+
+        with mock.patch.object(
+            render_module,
+            "_write_all",
+            side_effect=write_and_create_output,
+        ), self.assertRaisesRegex(ValueError, "book output"):
+            self.render()
+
+        self.assertEqual(concurrent_output.read_bytes(), concurrent)
+        self.assertEqual(list((external / "html").glob(".render-*")), [])
+
+    def test_publish_preserves_output_created_after_existing_entry_is_backed_up(self):
+        external = self.root / "external-book"
+        external_html = external / "html"
+        external_html.mkdir(parents=True)
+        existing_output = external_html / "test.html"
+        existing_output.write_bytes(b"original rendered entry\n")
+        concurrent = b"user replacement output\n"
+        self.assets.rmdir()
+        self.project_book.rmdir()
+        self.make_symlink(
+            self.project_book,
+            external,
+            target_is_directory=True,
+        )
+        (external / "test.md").write_text(
+            book_markdown("# linked\n"),
+            encoding="utf-8",
+            newline="\n",
+        )
+        real_rename = render_module.os.rename
+
+        def backup_and_create_output(source, destination, *args, **kwargs):
+            result = real_rename(source, destination, *args, **kwargs)
+            if source == "test.html" and str(destination).endswith(".bak"):
+                existing_output.write_bytes(concurrent)
+            return result
+
+        with mock.patch.object(
+            render_module.os,
+            "rename",
+            side_effect=backup_and_create_output,
+        ), self.assertRaisesRegex(ValueError, "book output"):
+            self.render()
+
+        self.assertEqual(existing_output.read_bytes(), concurrent)
+        self.assertEqual(list(external_html.glob(".render-*")), [])
+
+    def test_rollback_preserves_output_created_after_current_entry_check(self):
+        external = self.root / "external-book"
+        (external / "assets").mkdir(parents=True)
+        replacement = self.root / "replacement-book"
+        replacement.mkdir()
+        self.assets.rmdir()
+        self.project_book.rmdir()
+        self.make_symlink(
+            self.project_book,
+            external,
+            target_is_directory=True,
+        )
+        (external / "test.md").write_text(
+            book_markdown("# linked\n"),
+            encoding="utf-8",
+            newline="\n",
+        )
+        concurrent_output = external / "html" / "test.html"
+        concurrent = b"user created during rollback\n"
+        real_replace = render_module._replace_output
+        real_stat = render_module.os.stat
+        retargeted = False
+        replaced = False
+
+        def publish_and_retarget(*args, **kwargs):
+            nonlocal retargeted
+            publication = real_replace(*args, **kwargs)
+            self.project_book.unlink()
+            os.symlink(
+                replacement,
+                self.project_book,
+                target_is_directory=True,
+            )
+            retargeted = True
+            return publication
+
+        def stat_and_replace_output(path, *args, **kwargs):
+            nonlocal replaced
+            info = real_stat(path, *args, **kwargs)
+            if (
+                retargeted
+                and not replaced
+                and path == "test.html"
+                and kwargs.get("dir_fd") is not None
+            ):
+                concurrent_output.unlink()
+                concurrent_output.write_bytes(concurrent)
+                replaced = True
+            return info
+
+        with mock.patch.object(
+            render_module,
+            "_replace_output",
+            side_effect=publish_and_retarget,
+        ), mock.patch.object(
+            render_module.os,
+            "stat",
+            side_effect=stat_and_replace_output,
+        ), self.assertRaisesRegex(
+            ValueError,
+            "project book link changed during render",
+        ):
+            self.render()
+
+        self.assertEqual(concurrent_output.read_bytes(), concurrent)
+        self.assertFalse((replacement / "html" / "test.html").exists())
+        self.assertEqual(list((external / "html").glob(".render-*")), [])
+
+    def test_rollback_preserves_output_replaced_after_current_entry_check(self):
+        external = self.root / "external-book"
+        external_html = external / "html"
+        external_html.mkdir(parents=True)
+        existing_output = external_html / "test.html"
+        existing_output.write_bytes(b"original rendered entry\n")
+        replacement = self.root / "replacement-book"
+        replacement.mkdir()
+        concurrent = b"user replaced during rollback\n"
+        self.assets.rmdir()
+        self.project_book.rmdir()
+        self.make_symlink(
+            self.project_book,
+            external,
+            target_is_directory=True,
+        )
+        (external / "test.md").write_text(
+            book_markdown("# linked\n"),
+            encoding="utf-8",
+            newline="\n",
+        )
+        real_replace = render_module._replace_output
+        real_stat = render_module.os.stat
+        retargeted = False
+        replaced = False
+
+        def publish_and_retarget(*args, **kwargs):
+            nonlocal retargeted
+            publication = real_replace(*args, **kwargs)
+            self.project_book.unlink()
+            os.symlink(
+                replacement,
+                self.project_book,
+                target_is_directory=True,
+            )
+            retargeted = True
+            return publication
+
+        def stat_and_replace_output(path, *args, **kwargs):
+            nonlocal replaced
+            info = real_stat(path, *args, **kwargs)
+            if (
+                retargeted
+                and not replaced
+                and path == "test.html"
+                and kwargs.get("dir_fd") is not None
+            ):
+                existing_output.unlink()
+                existing_output.write_bytes(concurrent)
+                replaced = True
+            return info
+
+        with mock.patch.object(
+            render_module,
+            "_replace_output",
+            side_effect=publish_and_retarget,
+        ), mock.patch.object(
+            render_module.os,
+            "stat",
+            side_effect=stat_and_replace_output,
+        ), self.assertRaisesRegex(
+            ValueError,
+            "project book link changed during render",
+        ):
+            self.render()
+
+        self.assertEqual(existing_output.read_bytes(), concurrent)
+        self.assertFalse((replacement / "html" / "test.html").exists())
+        self.assertEqual(list(external_html.glob(".render-*")), [])
+
+    def test_backup_move_failure_after_concurrent_delete_does_not_restore_placeholder(
+        self,
+    ):
+        external = self.root / "external-book"
+        external_html = external / "html"
+        external_html.mkdir(parents=True)
+        existing_output = external_html / "test.html"
+        existing_output.write_bytes(b"original rendered entry\n")
+        self.assets.rmdir()
+        self.project_book.rmdir()
+        self.make_symlink(
+            self.project_book,
+            external,
+            target_is_directory=True,
+        )
+        (external / "test.md").write_text(
+            book_markdown("# linked\n"),
+            encoding="utf-8",
+            newline="\n",
+        )
+        real_rename = render_module.os.rename
+
+        def delete_before_backup_move(source, destination, *args, **kwargs):
+            if source == "test.html" and str(destination).endswith(".bak"):
+                os.unlink(source, dir_fd=kwargs["src_dir_fd"])
+            return real_rename(source, destination, *args, **kwargs)
+
+        with mock.patch.object(
+            render_module.os,
+            "rename",
+            side_effect=delete_before_backup_move,
+        ), self.assertRaisesRegex(ValueError, "book output"):
+            self.render()
+
+        self.assertFalse(existing_output.exists())
+        self.assertEqual(list(external_html.glob(".render-*")), [])
+
     def test_renders_self_contained_html_with_markdown_table_mermaid_and_image(self):
         (self.assets / "pixel.png").write_bytes(PNG)
         self.write_source(
