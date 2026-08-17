@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import errno
 import os
 from pathlib import Path
@@ -283,64 +284,116 @@ def _published_lesson_unchanged(
     )
 
 
+def _entry_name_bytes(name: str) -> bytes:
+    if (
+        not isinstance(name, str)
+        or name in ("", ".", "..")
+        or "/" in name
+        or "\x00" in name
+    ):
+        raise LessonError("unsafe lesson recovery entry")
+    return os.fsencode(name)
+
+
+def _rename_entry_no_replace(
+    directory_descriptor: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    source = _entry_name_bytes(source_name)
+    destination = _entry_name_bytes(destination_name)
+    if sys.platform == "darwin":
+        symbol_name = "renameatx_np"
+        flags = 0x4
+    elif sys.platform.startswith("linux"):
+        symbol_name = "renameat2"
+        flags = 1
+    else:
+        raise OSError(
+            errno.ENOTSUP,
+            "atomic no-replace lesson recovery unavailable",
+        )
+
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        rename = getattr(library, symbol_name)
+    except AttributeError as error:
+        raise OSError(
+            errno.ENOSYS,
+            "atomic no-replace lesson recovery unavailable",
+        ) from error
+    rename.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    rename.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = rename(
+        directory_descriptor,
+        source,
+        directory_descriptor,
+        destination,
+        flags,
+    )
+    if result == 0:
+        return
+
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise FileExistsError(
+            error_number,
+            os.strerror(error_number),
+            destination_name,
+        )
+    raise OSError(
+        error_number,
+        os.strerror(error_number),
+        destination_name,
+    )
+
+
 def _rollback_lesson_publication(
     directory_descriptor: int,
     name: str,
+    recovery_name: str,
     data: bytes,
     published_revision: tuple[int, ...],
 ) -> bool:
-    recovery_name: str | None = None
-    keep_recovery = False
     try:
-        try:
-            recovery_name, recovery_descriptor = _temporary_file(
-                directory_descriptor
-            )
-        except (LessonError, OSError):
-            return False
-        os.close(recovery_descriptor)
+        os.rename(
+            name,
+            recovery_name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+    except FileNotFoundError:
+        os.unlink(recovery_name, dir_fd=directory_descriptor)
+        return True
+    except OSError:
+        os.unlink(recovery_name, dir_fd=directory_descriptor)
+        return False
 
-        try:
-            os.rename(
-                name,
-                recovery_name,
-                src_dir_fd=directory_descriptor,
-                dst_dir_fd=directory_descriptor,
-            )
-        except FileNotFoundError:
-            return True
-        except OSError:
-            return False
+    if _published_lesson_unchanged(
+        directory_descriptor,
+        recovery_name,
+        data,
+        published_revision,
+    ):
+        os.unlink(recovery_name, dir_fd=directory_descriptor)
+        return True
 
-        if _published_lesson_unchanged(
+    try:
+        _rename_entry_no_replace(
             directory_descriptor,
             recovery_name,
-            data,
-            published_revision,
-        ):
-            return True
-
-        try:
-            os.link(
-                recovery_name,
-                name,
-                src_dir_fd=directory_descriptor,
-                dst_dir_fd=directory_descriptor,
-                follow_symlinks=False,
-            )
-        except FileExistsError:
-            keep_recovery = True
-            return False
-        except OSError:
-            keep_recovery = True
-            return False
-        return True
-    finally:
-        if recovery_name is not None and not keep_recovery:
-            try:
-                os.unlink(recovery_name, dir_fd=directory_descriptor)
-            except FileNotFoundError:
-                pass
+            name,
+        )
+    except OSError:
+        return False
+    return True
 
 
 def _refresh_index(base: Path) -> None:
@@ -371,6 +424,8 @@ def _publish_lesson_locked(
     temporary_name: str | None = None
     temporary_descriptor: int | None = None
     published_revision: tuple[int, ...] | None = None
+    recovery_name: str | None = None
+    recovery_descriptor: int | None = None
     try:
         project_descriptor, project_directory = _open_project_directory(
             base,
@@ -387,6 +442,11 @@ def _publish_lesson_locked(
             or not project_directory_unchanged(project_directory)
         ):
             raise LessonInvalid("project lessons link changed during write")
+        recovery_name, recovery_descriptor = _temporary_file(
+            project_descriptor
+        )
+        os.close(recovery_descriptor)
+        recovery_descriptor = None
         try:
             os.link(
                 temporary_name,
@@ -420,11 +480,14 @@ def _publish_lesson_locked(
         )
         if not project_unchanged:
             rollback_succeeded = False
-            if published_revision is not None:
+            if published_revision is not None and recovery_name is not None:
+                reserved_recovery = recovery_name
+                recovery_name = None
                 try:
                     rollback_succeeded = _rollback_lesson_publication(
                         project_descriptor,
                         name,
+                        reserved_recovery,
                         data,
                         published_revision,
                     )
@@ -438,6 +501,9 @@ def _publish_lesson_locked(
             raise LessonInvalid("project lessons link changed during write")
         if not publication_unchanged:
             raise LessonInvalid("project lessons link changed during write")
+        if recovery_name is not None:
+            os.unlink(recovery_name, dir_fd=project_descriptor)
+            recovery_name = None
         os.close(temporary_descriptor)
         temporary_descriptor = None
         os.unlink(temporary_name, dir_fd=project_descriptor)
@@ -448,6 +514,13 @@ def _publish_lesson_locked(
     except OSError as error:
         raise LessonError("unable to store lesson") from error
     finally:
+        if recovery_descriptor is not None:
+            os.close(recovery_descriptor)
+        if recovery_name is not None and project_descriptor is not None:
+            try:
+                os.unlink(recovery_name, dir_fd=project_descriptor)
+            except OSError:
+                pass
         if temporary_descriptor is not None:
             os.close(temporary_descriptor)
         if temporary_name is not None and project_descriptor is not None:
