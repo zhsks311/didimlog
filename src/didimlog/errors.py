@@ -25,17 +25,21 @@ class DidimError(Exception):
         *,
         exit_code: int,
         help_text: str | None = None,
+        details: tuple[str, ...] = (),
     ) -> None:
         super().__init__(token)
         self.token = token
         self.exit_code = exit_code
         self.help_text = help_text
+        self.details = tuple(details)
 
 
 def emit_error(error: DidimError, *, explain: bool, tty: bool) -> int:
     """Write the stable token first and an explanation only when requested."""
     print(error.token, file=sys.stderr)
     if explain or tty:
+        for detail in error.details:
+            print(detail, file=sys.stderr)
         help_text = error.help_text or _DEFAULT_HELP.get(
             error.exit_code,
             "첫 번째 오류 줄을 확인한 뒤 입력을 고치세요.",

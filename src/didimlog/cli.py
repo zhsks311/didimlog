@@ -35,6 +35,7 @@ from didimlog.indexing import (
     PROJECT_NOT_CONFIGURED,
     run_index,
 )
+from didimlog.personal.index import KnowledgeSourceError
 from didimlog.personal.lesson import parse_lesson_text
 from didimlog.personal.lesson_writing import (
     LessonError,
@@ -464,6 +465,16 @@ def _session_start(args) -> int:
 def _as_didim_error(error: Exception) -> DidimError:
     if isinstance(error, DidimError):
         return error
+    if isinstance(error, KnowledgeSourceError):
+        return DidimError(
+            "PERSONAL_INDEX_INVALID_SOURCE",
+            exit_code=EXIT_POLICY,
+            details=(
+                "무엇: " + _safe_output_text(error.logical_path),
+                "이유: " + _safe_output_text(error.reason),
+            ),
+            help_text="표시된 개인 지식 원본을 고친 뒤 didim index를 다시 실행하세요.",
+        )
     if isinstance(error, LessonSecret):
         return DidimError("LESSON_SECRET", exit_code=EXIT_SECRET)
     if isinstance(error, LessonExists):
