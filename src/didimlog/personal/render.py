@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import base64
+import ctypes
 from dataclasses import dataclass
+import errno
 import hashlib
 import html
 from html.parser import HTMLParser
@@ -15,6 +17,7 @@ from pathlib import Path
 import re
 import secrets
 import stat
+import sys
 
 import markdown
 from markdown.extensions.fenced_code import FencedBlockPreprocessor
@@ -337,6 +340,87 @@ def _write_all(descriptor: int, data: bytes) -> None:
     os.fsync(descriptor)
 
 
+def _entry_name_bytes(name: str) -> bytes:
+    if (
+        not isinstance(name, str)
+        or name in ("", ".", "..")
+        or "/" in name
+        or "\x00" in name
+    ):
+        raise ValueError("unsafe render output entry")
+    return os.fsencode(name)
+
+
+def _rename_directory_no_replace(
+    directory_descriptor: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    source = _entry_name_bytes(source_name)
+    destination = _entry_name_bytes(destination_name)
+    if sys.platform == "darwin":
+        symbol_name = "renameatx_np"
+        flags = 0x4
+    elif sys.platform.startswith("linux"):
+        symbol_name = "renameat2"
+        flags = 1
+    else:
+        raise OSError(
+            errno.ENOTSUP,
+            "atomic no-replace directory rename unavailable",
+        )
+
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        rename = getattr(library, symbol_name)
+    except AttributeError as error:
+        raise OSError(
+            errno.ENOSYS,
+            "atomic no-replace directory rename unavailable",
+        ) from error
+    rename.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    rename.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = rename(
+        directory_descriptor,
+        source,
+        directory_descriptor,
+        destination,
+        flags,
+    )
+    if result == 0:
+        return
+
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise FileExistsError(
+            error_number,
+            os.strerror(error_number),
+            destination_name,
+        )
+    unavailable = {
+        errno.EINVAL,
+        errno.ENOSYS,
+        getattr(errno, "ENOTSUP", errno.EINVAL),
+    }
+    if error_number in unavailable:
+        raise OSError(
+            error_number,
+            "atomic no-replace directory rename unavailable",
+        )
+    raise OSError(
+        error_number,
+        os.strerror(error_number),
+        destination_name,
+    )
+
+
 def _restore_entry_no_clobber(
     output_descriptor: int,
     source_name: str,
@@ -349,36 +433,12 @@ def _restore_entry_no_clobber(
     )
     if stat.S_ISDIR(source.st_mode):
         try:
-            os.mkdir(
-                destination_name,
-                0o700,
-                dir_fd=output_descriptor,
-            )
-        except FileExistsError:
-            return False
-        reservation = os.stat(
-            destination_name,
-            dir_fd=output_descriptor,
-            follow_symlinks=False,
-        )
-        try:
-            os.rename(
+            _rename_directory_no_replace(
+                output_descriptor,
                 source_name,
                 destination_name,
-                src_dir_fd=output_descriptor,
-                dst_dir_fd=output_descriptor,
             )
-        except OSError:
-            try:
-                current = os.stat(
-                    destination_name,
-                    dir_fd=output_descriptor,
-                    follow_symlinks=False,
-                )
-                if _entry_revision(current) == _entry_revision(reservation):
-                    os.rmdir(destination_name, dir_fd=output_descriptor)
-            except OSError:
-                pass
+        except FileExistsError:
             return False
         return True
 

@@ -672,7 +672,7 @@ class RenderBookTests(unittest.TestCase):
         concurrent_output = external / "html" / "test.html"
         real_replace = render_module._replace_output
         real_stat = render_module.os.stat
-        real_mkdir = render_module.os.mkdir
+        real_restore = render_module._restore_entry_no_clobber
         retargeted = False
         replaced = False
         competed = False
@@ -704,18 +704,17 @@ class RenderBookTests(unittest.TestCase):
                 replaced = True
             return info
 
-        def mkdir_and_compete(path, *args, **kwargs):
+        def restore_after_competing_directory(
+            descriptor,
+            source,
+            destination,
+        ):
             nonlocal competed, competitor_identity
-            if (
-                replaced
-                and not competed
-                and path == "test.html"
-                and kwargs.get("dir_fd") is not None
-            ):
-                real_mkdir(path, *args, **kwargs)
+            if replaced and not competed and destination == "test.html":
+                os.mkdir(destination, 0o700, dir_fd=descriptor)
                 competitor = real_stat(
-                    path,
-                    dir_fd=kwargs["dir_fd"],
+                    destination,
+                    dir_fd=descriptor,
                     follow_symlinks=False,
                 )
                 competitor_identity = (
@@ -724,7 +723,11 @@ class RenderBookTests(unittest.TestCase):
                     competitor.st_mode,
                 )
                 competed = True
-            return real_mkdir(path, *args, **kwargs)
+            return real_restore(
+                descriptor,
+                source,
+                destination,
+            )
 
         with mock.patch.object(
             render_module,
@@ -735,9 +738,9 @@ class RenderBookTests(unittest.TestCase):
             "stat",
             side_effect=stat_and_replace_with_directory,
         ), mock.patch.object(
-            render_module.os,
-            "mkdir",
-            side_effect=mkdir_and_compete,
+            render_module,
+            "_restore_entry_no_clobber",
+            side_effect=restore_after_competing_directory,
         ), self.assertRaisesRegex(
             ValueError,
             "project book link changed during render",
@@ -748,6 +751,151 @@ class RenderBookTests(unittest.TestCase):
         self.assertEqual(
             (current.st_dev, current.st_ino, current.st_mode),
             competitor_identity,
+        )
+        self.assertTrue(concurrent_output.is_dir())
+        self.assertEqual(list(concurrent_output.iterdir()), [])
+        self.assertFalse((replacement / "html" / "test.html").exists())
+        self.assertEqual(list((external / "html").glob(".render-*")), [])
+
+    def test_atomic_directory_rename_moves_to_absent_and_rejects_existing(self):
+        parent = self.root / "atomic-directory-rename"
+        parent.mkdir()
+        (parent / "source").mkdir()
+        descriptor = os.open(
+            parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            render_module._rename_directory_no_replace(
+                descriptor,
+                "source",
+                "destination",
+            )
+            self.assertFalse((parent / "source").exists())
+            self.assertTrue((parent / "destination").is_dir())
+
+            (parent / "second-source").mkdir()
+            (parent / "existing").mkdir()
+            source_info = (parent / "second-source").lstat()
+            existing_info = (parent / "existing").lstat()
+            with self.assertRaises(FileExistsError):
+                render_module._rename_directory_no_replace(
+                    descriptor,
+                    "second-source",
+                    "existing",
+                )
+            current_source = (parent / "second-source").lstat()
+            current_existing = (parent / "existing").lstat()
+            self.assertEqual(
+                (current_source.st_dev, current_source.st_ino),
+                (source_info.st_dev, source_info.st_ino),
+            )
+            self.assertEqual(
+                (current_existing.st_dev, current_existing.st_ino),
+                (existing_info.st_dev, existing_info.st_ino),
+            )
+        finally:
+            os.close(descriptor)
+
+    def test_rollback_does_not_replace_directory_swapped_after_reservation_stat(self):
+        external = self.root / "external-book"
+        (external / "assets").mkdir(parents=True)
+        replacement = self.root / "replacement-book"
+        replacement.mkdir()
+        self.assets.rmdir()
+        self.project_book.rmdir()
+        self.make_symlink(
+            self.project_book,
+            external,
+            target_is_directory=True,
+        )
+        (external / "test.md").write_text(
+            book_markdown("# linked\n"),
+            encoding="utf-8",
+            newline="\n",
+        )
+        concurrent_output = external / "html" / "test.html"
+        real_replace = render_module._replace_output
+        real_stat = render_module.os.stat
+        real_atomic_rename = render_module._rename_directory_no_replace
+        retargeted = False
+        replaced = False
+        swapped = False
+        swapped_identity = None
+
+        def publish_and_retarget(*args, **kwargs):
+            nonlocal retargeted
+            publication = real_replace(*args, **kwargs)
+            self.project_book.unlink()
+            os.symlink(
+                replacement,
+                self.project_book,
+                target_is_directory=True,
+            )
+            retargeted = True
+            return publication
+
+        def stat_and_replace_with_directory(path, *args, **kwargs):
+            nonlocal replaced
+            info = real_stat(path, *args, **kwargs)
+            if (
+                retargeted
+                and not replaced
+                and path == "test.html"
+                and kwargs.get("dir_fd") is not None
+            ):
+                concurrent_output.unlink()
+                concurrent_output.mkdir()
+                replaced = True
+            return info
+
+        def atomic_rename_after_destination_swap(
+            descriptor,
+            source,
+            destination,
+        ):
+            nonlocal swapped, swapped_identity
+            if not swapped:
+                os.mkdir(destination, 0o700, dir_fd=descriptor)
+                current = real_stat(
+                    destination,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                swapped_identity = (
+                    current.st_dev,
+                    current.st_ino,
+                    current.st_mode,
+                )
+                swapped = True
+            return real_atomic_rename(
+                descriptor,
+                source,
+                destination,
+            )
+
+        with mock.patch.object(
+            render_module,
+            "_replace_output",
+            side_effect=publish_and_retarget,
+        ), mock.patch.object(
+            render_module.os,
+            "stat",
+            side_effect=stat_and_replace_with_directory,
+        ), mock.patch.object(
+            render_module,
+            "_rename_directory_no_replace",
+            side_effect=atomic_rename_after_destination_swap,
+        ), self.assertRaisesRegex(
+            ValueError,
+            "project book link changed during render",
+        ):
+            self.render()
+
+        current = concurrent_output.lstat()
+        self.assertEqual(
+            (current.st_dev, current.st_ino, current.st_mode),
+            swapped_identity,
         )
         self.assertTrue(concurrent_output.is_dir())
         self.assertEqual(list(concurrent_output.iterdir()), [])
