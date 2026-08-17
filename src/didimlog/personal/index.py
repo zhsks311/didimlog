@@ -24,6 +24,7 @@ from didimlog.file_io import (
 from didimlog.locking import path_lock
 
 from .lesson import (
+    LESSON_MAX_BYTES,
     parse_frontmatter_text,
     parse_inline_list,
     parse_lesson_text,
@@ -216,6 +217,7 @@ def _open_project_directory(project: ProjectDirectory) -> int:
 def _read_pinned_markdown(
     root_descriptor: int,
     relative: Path,
+    maximum_bytes: int,
 ) -> bytes:
     if relative.is_absolute() or any(
         part in ("", ".", "..") for part in relative.parts
@@ -234,7 +236,7 @@ def _read_pinned_markdown(
         return read_regular_file_at(
             descriptors[-1],
             relative.name,
-            SOURCE_MAX_BYTES,
+            maximum_bytes,
         )
     except UnsafePathError:
         raise
@@ -252,8 +254,12 @@ def _lesson_item(
 ) -> dict[str, object]:
     logical_path = _logical_source_path(project, relative)
     try:
-        data = _read_pinned_markdown(root_descriptor, relative)
-        if len(data) > SOURCE_MAX_BYTES:
+        data = _read_pinned_markdown(
+            root_descriptor,
+            relative,
+            LESSON_MAX_BYTES,
+        )
+        if len(data) > LESSON_MAX_BYTES:
             raise UnsafePathError("source exceeds read limit")
         text = data.decode("utf-8")
         parsed = parse_lesson_text(relative.name, text)
@@ -288,7 +294,11 @@ def _document_item(
 ) -> dict[str, object]:
     logical_path = _logical_source_path(project, relative)
     try:
-        data = _read_pinned_markdown(root_descriptor, relative)
+        data = _read_pinned_markdown(
+            root_descriptor,
+            relative,
+            SOURCE_MAX_BYTES,
+        )
         if len(data) > SOURCE_MAX_BYTES:
             raise UnsafePathError("source exceeds read limit")
         text = data.decode("utf-8")
@@ -661,7 +671,7 @@ def _decode_recovery_record(entry: Path) -> tuple[str, bytes, int]:
             or not isinstance(record["mode"], int)
             or isinstance(record["mode"], bool)
             or record["mode"] < 0
-            or record["mode"] > 0o777
+            or record["mode"] > 0o7777
         ):
             raise ValueError("invalid recovery record")
         logical_name = record["logical_name"]
@@ -1113,7 +1123,6 @@ def _quarantine_index_entry(
     *,
     restore: bool,
     retire_owned: bool = False,
-    retired_artifacts: dict[str, tuple[str, str]] | None = None,
 ) -> _QuarantineResult:
     from .render import _rename_entry_no_replace
 
@@ -1209,7 +1218,7 @@ def _quarantine_index_entry(
         == _index_revision(quarantined_info)
     )
     if restore and retire_owned and entry_owned:
-        metadata_name = _persist_quarantine_metadata(
+        _persist_quarantine_metadata(
             directory_descriptor,
             quarantine_name,
             name,
@@ -1221,11 +1230,6 @@ def _quarantine_index_entry(
                 follow_symlinks=False,
             )
         except FileNotFoundError:
-            if retired_artifacts is not None:
-                retired_artifacts[name] = (
-                    quarantine_name,
-                    metadata_name,
-                )
             return _QuarantineResult.REMOVED_BY_US
         except OSError as exc:
             raise KnowledgeIndexError(
@@ -1334,9 +1338,9 @@ def _restore_missing_index(
         handle = os.fdopen(descriptor, "wb")
         descriptor = None
         with handle:
-            os.fchmod(handle.fileno(), mode)
             handle.write(data)
             handle.flush()
+            os.fchmod(handle.fileno(), mode)
             os.fsync(handle.fileno())
     except OSError:
         if descriptor is not None:
@@ -1349,7 +1353,6 @@ def _rollback_index_namespace(
     backups: Mapping[str, tuple[bytes, int, os.stat_result]],
     published: Mapping[str, tuple[bytes, os.stat_result]],
     deleted: set[str],
-    retired_artifacts: Mapping[str, tuple[str, str]],
 ) -> None:
     try:
         directory_descriptor = open_directory_path(destination)
@@ -1414,12 +1417,6 @@ def _rollback_index_namespace(
                     previous_data,
                     previous_mode,
                 )
-                artifact_names = retired_artifacts.get(name)
-                if artifact_names is not None:
-                    _cleanup_index_temporaries(
-                        str(destination / artifact_name)
-                        for artifact_name in artifact_names
-                    )
             except OSError:
                 failures.append("stale entry restore failed")
                 try:
@@ -1476,7 +1473,6 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
     prepared: dict[str, str | None] = {}
     published: dict[str, tuple[bytes, os.stat_result]] = {}
     deleted = set()
-    retired_artifacts: dict[str, tuple[str, str]] = {}
     try:
         for project, text in normalized.items():
             name = project + ".md"
@@ -1553,7 +1549,6 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
                         stale_info,
                         restore=True,
                         retire_owned=True,
-                        retired_artifacts=retired_artifacts,
                     )
                     if quarantine_result is _QuarantineResult.MISSING:
                         continue
@@ -1577,7 +1572,6 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
                 backups,
                 published,
                 deleted,
-                retired_artifacts,
             )
             raise
     finally:

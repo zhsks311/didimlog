@@ -419,6 +419,25 @@ body
                     )
                 self.assertEqual(target.read_bytes(), b"user bytes\r\n")
 
+    def test_lesson_keeps_its_64_kib_source_limit(self):
+        frontmatter = LESSON.split("## 교훈", 1)[0]
+        oversized = frontmatter + ("x" * (64 * 1024))
+        self.write("lessons/demo-api/oversized.md", oversized)
+
+        with self.assertRaises(
+            knowledge_index.KnowledgeSourceError
+        ) as caught:
+            knowledge_index.build_all(self.root)
+
+        self.assertEqual(
+            caught.exception.logical_path,
+            "lessons/demo-api/oversized.md",
+        )
+        self.assertEqual(
+            caught.exception.reason,
+            "invalid lesson metadata",
+        )
+
     def test_crlf_lesson_metadata_is_rejected(self):
         self.write("lessons/demo-api/crlf.md", LESSON.replace("\n", "\r\n"))
 
@@ -816,6 +835,21 @@ body
         self.assertEqual(recovery[0].read_bytes(), b"")
         metadata = recovery[0].with_suffix(".name")
         self.assertEqual(metadata.read_text(encoding="utf-8"), "z-project.md\n")
+        retired = [
+            entry
+            for entry in target.iterdir()
+            if (
+                entry.name.startswith(".index-retired-")
+                and entry.suffix == ".tmp"
+            )
+        ]
+        self.assertEqual(len(retired), 1)
+        retired_metadata = retired[0].with_suffix(".name")
+        self.assertEqual(retired[0].read_bytes(), stale_bytes)
+        self.assertEqual(
+            retired_metadata.read_text(encoding="utf-8"),
+            "obsolete.md\n",
+        )
         self.assertEqual(
             {entry.name for entry in target.iterdir()},
             {
@@ -823,8 +857,119 @@ body
                 "obsolete.md",
                 recovery[0].name,
                 metadata.name,
+                retired[0].name,
+                retired_metadata.name,
             },
         )
+
+    def test_rollback_keeps_open_fd_mutation_of_retired_index(self):
+        target = self.root / "index"
+        stale = target / "obsolete.md"
+        stale_bytes = (GENERATED_NOTICE + "\n# obsolete\n").encode("utf-8")
+        stale.write_bytes(stale_bytes)
+        original_restore = knowledge_index._restore_missing_index
+
+        def mutate_retired_then_restore(*args, **kwargs):
+            retired = next(
+                entry
+                for entry in target.iterdir()
+                if entry.name.startswith(".index-retired-")
+                and entry.suffix == ".tmp"
+            )
+            descriptor = os.open(retired, os.O_WRONLY)
+            try:
+                os.write(descriptor, b"user open-fd bytes\n")
+                os.ftruncate(descriptor, len(b"user open-fd bytes\n"))
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            return original_restore(*args, **kwargs)
+
+        with mock.patch.object(
+            knowledge_index,
+            "_require_projects_unchanged",
+            side_effect=[
+                None,
+                knowledge_index.KnowledgeIndexError("forced postcheck failure"),
+            ],
+        ), mock.patch.object(
+            knowledge_index,
+            "_restore_missing_index",
+            side_effect=mutate_retired_then_restore,
+        ), self.assertRaises(knowledge_index.KnowledgeIndexError):
+            knowledge_index.write_all(
+                outputs={},
+                data_root=self.root,
+                target=target,
+            )
+
+        self.assertEqual(stale.read_bytes(), stale_bytes)
+        retired = [
+            entry
+            for entry in target.iterdir()
+            if entry.name.startswith(".index-retired-")
+            and entry.suffix == ".tmp"
+        ]
+        self.assertEqual(len(retired), 1)
+        self.assertEqual(retired[0].read_bytes(), b"user open-fd bytes\n")
+        self.assertTrue(retired[0].with_suffix(".name").is_file())
+        knowledge_index.write_all(
+            outputs={"obsolete": stale_bytes.decode("utf-8")},
+            data_root=self.root,
+            target=target,
+        )
+        self.assertEqual(retired[0].read_bytes(), b"user open-fd bytes\n")
+        self.assertTrue(retired[0].with_suffix(".name").is_file())
+
+
+    def test_rollback_keeps_path_replacement_of_retired_index(self):
+        target = self.root / "index"
+        stale = target / "obsolete.md"
+        stale_bytes = (GENERATED_NOTICE + "\n# obsolete\n").encode("utf-8")
+        stale.write_bytes(stale_bytes)
+        replacement = self.temporary / "retired-replacement"
+        replacement.write_bytes(b"user replacement bytes\n")
+        original_restore = knowledge_index._restore_missing_index
+
+        def replace_retired_then_restore(*args, **kwargs):
+            retired = next(
+                entry
+                for entry in target.iterdir()
+                if entry.name.startswith(".index-retired-")
+                and entry.suffix == ".tmp"
+            )
+            os.replace(replacement, retired)
+            return original_restore(*args, **kwargs)
+
+        with mock.patch.object(
+            knowledge_index,
+            "_require_projects_unchanged",
+            side_effect=[
+                None,
+                knowledge_index.KnowledgeIndexError("forced postcheck failure"),
+            ],
+        ), mock.patch.object(
+            knowledge_index,
+            "_restore_missing_index",
+            side_effect=replace_retired_then_restore,
+        ), self.assertRaises(knowledge_index.KnowledgeIndexError):
+            knowledge_index.write_all(
+                outputs={},
+                data_root=self.root,
+                target=target,
+            )
+
+        self.assertEqual(stale.read_bytes(), stale_bytes)
+        retired = [
+            entry
+            for entry in target.iterdir()
+            if entry.name.startswith(".index-retired-")
+            and entry.suffix == ".tmp"
+        ]
+        self.assertEqual(len(retired), 1)
+        self.assertEqual(retired[0].read_bytes(), b"user replacement bytes\n")
+        self.assertTrue(retired[0].with_suffix(".name").is_file())
+
 
     def test_source_rollback_does_not_overwrite_concurrent_index_change(self):
         external = self.temporary / "external"
@@ -1394,6 +1539,45 @@ body
             current.read_bytes(),
             (GENERATED_NOTICE + "\n# replacement\n").encode("utf-8"),
         )
+
+    def test_recovery_record_restores_exact_special_mode_bits(self):
+        target = self.root / "index"
+        previous = (GENERATED_NOTICE + "\n# previous\n").encode("utf-8")
+        current = target / "demo-api.md"
+        current.write_bytes(previous)
+        current.chmod(0o7640)
+
+        with mock.patch.object(
+            knowledge_index,
+            "_require_projects_unchanged",
+            side_effect=[
+                None,
+                knowledge_index.KnowledgeIndexError(
+                    "forced postcheck failure"
+                ),
+            ],
+        ), mock.patch.object(
+            knowledge_index,
+            "replace_regular_file_at_if_unchanged_with_info",
+            side_effect=OSError("synthetic rollback restore failure"),
+        ), self.assertRaises(knowledge_index.KnowledgeIndexError):
+            knowledge_index.write_all(
+                outputs={
+                    "demo-api": GENERATED_NOTICE + "\n# replacement\n",
+                },
+                data_root=self.root,
+                target=target,
+            )
+
+        current.unlink()
+        knowledge_index.write_all(
+            outputs={"demo-api": previous.decode("utf-8")},
+            data_root=self.root,
+            target=target,
+        )
+
+        self.assertEqual(current.read_bytes(), previous)
+        self.assertEqual(stat.S_IMODE(current.stat().st_mode), 0o7640)
 
 
     def test_long_project_second_write_uses_bounded_recovery_names(self):
