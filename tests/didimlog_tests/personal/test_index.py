@@ -4,6 +4,7 @@ import io
 import multiprocessing
 import os
 import shutil
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -545,6 +546,86 @@ body
         self.assertIn("`book/demo-api/guide.md`", output)
         self.assertNotIn(str(external), output)
 
+    def test_collect_rechecks_all_links_after_later_project_scan(self):
+        external = self.temporary / "external"
+        first = external / "first"
+        first_replacement = external / "first-replacement"
+        last = external / "last"
+        for directory in (first, first_replacement, last):
+            directory.mkdir(parents=True)
+        (first / "rule.md").write_text(LESSON, encoding="utf-8")
+        (last / "rule.md").write_text(LESSON, encoding="utf-8")
+        first_link = self.root / "lessons" / "a-project"
+        last_link = self.root / "lessons" / "z-project"
+        first_link.symlink_to(first, target_is_directory=True)
+        last_link.symlink_to(last, target_is_directory=True)
+        original_markdown_files = knowledge_index._markdown_files
+
+        def retarget_first_during_last_scan(project, *, recursive):
+            files = original_markdown_files(project, recursive=recursive)
+            if project.logical.name == "z-project":
+                first_link.unlink()
+                first_link.symlink_to(
+                    first_replacement,
+                    target_is_directory=True,
+                )
+            return files
+
+        with mock.patch.object(
+            knowledge_index,
+            "_markdown_files",
+            side_effect=retarget_first_during_last_scan,
+        ), self.assertRaises(knowledge_index.KnowledgeSourceError) as caught:
+            knowledge_index.collect(self.root)
+
+        self.assertEqual(caught.exception.logical_path, "lessons/a-project")
+        self.assertEqual(
+            caught.exception.reason,
+            "project link changed during scan",
+        )
+        self.assertNotIn(str(external), str(caught.exception))
+
+    def test_build_all_rechecks_all_links_after_rendering(self):
+        external = self.temporary / "external"
+        first = external / "first"
+        first_replacement = external / "first-replacement"
+        last = external / "last"
+        for directory in (first, first_replacement, last):
+            directory.mkdir(parents=True)
+        (first / "rule.md").write_text(LESSON, encoding="utf-8")
+        (last / "rule.md").write_text(LESSON, encoding="utf-8")
+        first_link = self.root / "lessons" / "a-project"
+        first_link.symlink_to(first, target_is_directory=True)
+        (self.root / "lessons" / "z-project").symlink_to(
+            last,
+            target_is_directory=True,
+        )
+        original_render = knowledge_index.render_project
+
+        def retarget_first_after_last_render(project, items):
+            output = original_render(project, items)
+            if project == "z-project":
+                first_link.unlink()
+                first_link.symlink_to(
+                    first_replacement,
+                    target_is_directory=True,
+                )
+            return output
+
+        with mock.patch.object(
+            knowledge_index,
+            "render_project",
+            side_effect=retarget_first_after_last_render,
+        ), self.assertRaises(knowledge_index.KnowledgeSourceError) as caught:
+            knowledge_index.build_all(self.root)
+
+        self.assertEqual(caught.exception.logical_path, "lessons/a-project")
+        self.assertEqual(
+            caught.exception.reason,
+            "project link changed during scan",
+        )
+        self.assertNotIn(str(external), str(caught.exception))
+
     def test_project_link_change_before_publish_preserves_existing_index(self):
         external = self.temporary / "external"
         original = external / "original"
@@ -581,6 +662,131 @@ body
         )
         self.assertNotIn(str(external), str(caught.exception))
         self.assertEqual(target.read_bytes(), b"user bytes\r\n")
+
+    def test_source_retarget_after_publish_precheck_rolls_back_index(self):
+        external = self.temporary / "external"
+        original = external / "original"
+        replacement = external / "replacement"
+        original.mkdir(parents=True)
+        replacement.mkdir()
+        (original / "rule.md").write_text(LESSON, encoding="utf-8")
+        logical = self.root / "lessons" / "demo-api"
+        logical.symlink_to(original, target_is_directory=True)
+        target = self.root / "index" / "demo-api.md"
+        target.write_bytes(b"previous bytes\r\n")
+        target.chmod(0o640)
+        original_replace = knowledge_index.os.replace
+        retargeted = False
+
+        def retarget_before_first_replace(source, destination):
+            nonlocal retargeted
+            if not retargeted:
+                retargeted = True
+                logical.unlink()
+                logical.symlink_to(replacement, target_is_directory=True)
+            return original_replace(source, destination)
+
+        with mock.patch.object(
+            knowledge_index.os,
+            "replace",
+            side_effect=retarget_before_first_replace,
+        ), self.assertRaises(knowledge_index.KnowledgeSourceError):
+            knowledge_index.write_all(data_root=self.root, target=self.root / "index")
+
+        self.assertEqual(target.read_bytes(), b"previous bytes\r\n")
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
+        self.assertEqual(
+            {entry.name for entry in (self.root / "index").iterdir()},
+            {"demo-api.md"},
+        )
+
+    def test_source_retarget_during_multi_index_publish_rolls_back_namespace(self):
+        external = self.temporary / "external"
+        first = external / "first"
+        first_replacement = external / "first-replacement"
+        last = external / "last"
+        for directory in (first, first_replacement, last):
+            directory.mkdir(parents=True)
+        (first / "rule.md").write_text(LESSON, encoding="utf-8")
+        (last / "rule.md").write_text(LESSON, encoding="utf-8")
+        first_link = self.root / "lessons" / "a-project"
+        first_link.symlink_to(first, target_is_directory=True)
+        (self.root / "lessons" / "z-project").symlink_to(
+            last,
+            target_is_directory=True,
+        )
+        target = self.root / "index"
+        first_index = target / "a-project.md"
+        first_index.write_bytes(b"first previous\r\n")
+        first_index.chmod(0o640)
+        stale = target / "obsolete.md"
+        stale_bytes = (GENERATED_NOTICE + "\n# obsolete\n").encode("utf-8")
+        stale.write_bytes(stale_bytes)
+        stale.chmod(0o604)
+        original_replace = knowledge_index.os.replace
+        replacements = 0
+
+        def retarget_after_first_replace(source, destination):
+            nonlocal replacements
+            result = original_replace(source, destination)
+            replacements += 1
+            if replacements == 1:
+                first_link.unlink()
+                first_link.symlink_to(
+                    first_replacement,
+                    target_is_directory=True,
+                )
+            return result
+
+        with mock.patch.object(
+            knowledge_index.os,
+            "replace",
+            side_effect=retarget_after_first_replace,
+        ), self.assertRaises(knowledge_index.KnowledgeSourceError):
+            knowledge_index.write_all(data_root=self.root, target=target)
+
+        self.assertEqual(first_index.read_bytes(), b"first previous\r\n")
+        self.assertEqual(stat.S_IMODE(first_index.stat().st_mode), 0o640)
+        self.assertFalse((target / "z-project.md").exists())
+        self.assertEqual(stale.read_bytes(), stale_bytes)
+        self.assertEqual(stat.S_IMODE(stale.stat().st_mode), 0o604)
+        self.assertEqual(
+            {entry.name for entry in target.iterdir()},
+            {"a-project.md", "obsolete.md"},
+        )
+
+    def test_source_rollback_does_not_overwrite_concurrent_index_change(self):
+        external = self.temporary / "external"
+        original = external / "original"
+        replacement = external / "replacement"
+        original.mkdir(parents=True)
+        replacement.mkdir()
+        (original / "rule.md").write_text(LESSON, encoding="utf-8")
+        logical = self.root / "lessons" / "demo-api"
+        logical.symlink_to(original, target_is_directory=True)
+        target = self.root / "index" / "demo-api.md"
+        target.write_bytes(b"previous bytes\r\n")
+        original_replace = knowledge_index.os.replace
+        changed = False
+
+        def change_index_after_publish(source, destination):
+            nonlocal changed
+            result = original_replace(source, destination)
+            if not changed:
+                changed = True
+                Path(destination).write_bytes(b"concurrent user bytes\n")
+                logical.unlink()
+                logical.symlink_to(replacement, target_is_directory=True)
+            return result
+
+        with mock.patch.object(
+            knowledge_index.os,
+            "replace",
+            side_effect=change_index_after_publish,
+        ), self.assertRaises(knowledge_index.KnowledgeSourceError):
+            knowledge_index.write_all(data_root=self.root, target=self.root / "index")
+
+        self.assertEqual(target.read_bytes(), b"concurrent user bytes\n")
 
     def test_project_link_change_during_scan_preserves_existing_index(self):
         external = self.temporary / "external"

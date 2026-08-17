@@ -12,6 +12,7 @@ from didimlog.file_io import (
     UnsafePathError,
     open_directory_path,
     read_regular_file_beneath,
+    replace_regular_file_at_if_unchanged_with_info,
 )
 from didimlog.locking import path_lock
 
@@ -379,6 +380,7 @@ def _collect_with_projects(
                 items.append(_document_item(book_project, relative, "book"))
             _require_projects_unchanged((book_project,))
         collected[project_name] = items
+    _require_projects_unchanged(snapshots)
     return collected, snapshots
 
 
@@ -437,6 +439,7 @@ def _build_all_with_projects(
         project: render_project(project, items)
         for project, items in collected.items()
     }
+    _require_projects_unchanged(projects)
     return outputs, projects
 
 
@@ -535,6 +538,179 @@ def _domain_root(data_root=None, target=None) -> Path:
     return lessons_dir().parent
 
 
+def _index_revision(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _index_publication_revision(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_uid,
+        info.st_gid,
+        info.st_size,
+        info.st_mtime_ns,
+    )
+
+
+def _cleanup_index_temporaries(paths: Iterable[str]) -> None:
+    for temporary in paths:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+
+
+def _prepare_index_backups(
+    destination: Path,
+) -> dict[str, tuple[str, bytes, int]]:
+    backups = {}
+    try:
+        for entry in sorted(destination.iterdir(), key=lambda path: _byte_key(path.name)):
+            linked_info = entry.lstat()
+            data = read_regular_file_beneath(
+                destination,
+                entry.name,
+                linked_info.st_size,
+            )
+            current_info = entry.lstat()
+            if (
+                len(data) != linked_info.st_size
+                or _index_revision(current_info) != _index_revision(linked_info)
+            ):
+                raise KnowledgeIndexError(
+                    "KNOWLEDGE_INDEX_INVALID {}: index changed before publish".format(
+                        entry
+                    )
+                )
+
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=".index-backup-",
+                suffix=".tmp",
+                dir=destination,
+            )
+            backups[entry.name] = (
+                temporary,
+                data,
+                stat.S_IMODE(linked_info.st_mode),
+            )
+            with os.fdopen(descriptor, "wb") as handle:
+                os.fchmod(handle.fileno(), stat.S_IMODE(linked_info.st_mode))
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+    except Exception:
+        _cleanup_index_temporaries(
+            temporary for temporary, _, _ in backups.values()
+        )
+        raise
+    return backups
+
+
+def _unlink_published_index_if_unchanged(
+    directory_descriptor: int,
+    destination: Path,
+    name: str,
+    published_data: bytes,
+    published_info: os.stat_result,
+) -> None:
+    marker_info = replace_regular_file_at_if_unchanged_with_info(
+        directory_descriptor,
+        name,
+        published_data,
+        b"",
+        0o600,
+        expected_info=published_info,
+    )
+    if marker_info is None:
+        return
+
+    path = destination / name
+    try:
+        current_info = path.lstat()
+        current_data = read_regular_file_beneath(destination, name, 0)
+    except (OSError, UnsafePathError):
+        return
+    if (
+        current_data != b""
+        or _index_publication_revision(current_info)
+        != _index_publication_revision(marker_info)
+    ):
+        return
+    try:
+        latest_info = path.lstat()
+        if _index_publication_revision(
+            latest_info
+        ) == _index_publication_revision(marker_info):
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _rollback_index_namespace(
+    destination: Path,
+    backups: Mapping[str, tuple[str, bytes, int]],
+    published: Mapping[str, tuple[bytes, os.stat_result]],
+    deleted: set[str],
+) -> None:
+    try:
+        directory_descriptor = open_directory_path(destination)
+    except UnsafePathError:
+        return
+    try:
+        for name, (published_data, published_info) in published.items():
+            backup = backups.get(name)
+            if backup is None:
+                _unlink_published_index_if_unchanged(
+                    directory_descriptor,
+                    destination,
+                    name,
+                    published_data,
+                    published_info,
+                )
+                continue
+            _, previous_data, previous_mode = backup
+            try:
+                replace_regular_file_at_if_unchanged_with_info(
+                    directory_descriptor,
+                    name,
+                    published_data,
+                    previous_data,
+                    previous_mode,
+                    expected_info=published_info,
+                )
+            except UnsafePathError:
+                pass
+
+        for name in deleted:
+            backup = backups.get(name)
+            if backup is None:
+                continue
+            temporary, _, _ = backup
+            try:
+                os.link(
+                    temporary,
+                    destination / name,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                pass
+        try:
+            os.fsync(directory_descriptor)
+        except OSError:
+            pass
+    finally:
+        os.close(directory_descriptor)
+
+
 def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
     """잠금을 보유한 호출자가 전체 인덱스를 원자적으로 교체한다."""
     if outputs is None:
@@ -556,18 +732,26 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
         ) from exc
     _validate_index_directory(destination, expected)
 
+    backups = _prepare_index_backups(destination)
     prepared: dict[str, str | None] = {}
+    published: dict[str, tuple[bytes, os.stat_result]] = {}
+    deleted = set()
     try:
         for project, text in normalized.items():
             descriptor = None
             try:
                 descriptor, temporary = tempfile.mkstemp(
-                    prefix=".index-", suffix=".tmp", dir=destination
+                    prefix=".index-",
+                    suffix=".tmp",
+                    dir=destination,
                 )
                 prepared[project] = temporary
                 os.fchmod(descriptor, 0o600)
                 handle = os.fdopen(
-                    descriptor, "w", encoding="utf-8", newline="\n"
+                    descriptor,
+                    "w",
+                    encoding="utf-8",
+                    newline="\n",
                 )
                 descriptor = None
                 with handle:
@@ -578,27 +762,40 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
                 if descriptor is not None:
                     os.close(descriptor)
                 raise KnowledgeIndexError(
-                    "KNOWLEDGE_INDEX_INVALID {}: cannot prepare index".format(project)
+                    "KNOWLEDGE_INDEX_INVALID {}: cannot prepare index".format(
+                        project
+                    )
                 ) from exc
 
         replacement_projects = sorted(prepared, key=_byte_key)
         _require_projects_unchanged(source_projects)
 
-        for project in replacement_projects:
-            temporary = prepared[project]
-            if temporary is None:
-                continue
-            try:
-                os.replace(temporary, destination / (project + ".md"))
-            except OSError as exc:
-                raise KnowledgeIndexError(
-                    "KNOWLEDGE_INDEX_INVALID {}: cannot replace index".format(project)
-                ) from exc
-            prepared[project] = None
+        try:
+            for project in replacement_projects:
+                temporary = prepared[project]
+                if temporary is None:
+                    continue
+                published_info = Path(temporary).lstat()
+                published_data = normalized[project].encode("utf-8")
+                try:
+                    os.replace(
+                        temporary,
+                        destination / (project + ".md"),
+                    )
+                except OSError as exc:
+                    raise KnowledgeIndexError(
+                        "KNOWLEDGE_INDEX_INVALID {}: cannot replace index".format(
+                            project
+                        )
+                    ) from exc
+                prepared[project] = None
+                published[project + ".md"] = (
+                    published_data,
+                    published_info,
+                )
 
-        _validate_index_directory(destination, expected)
-        for entry in destination.iterdir():
-            if entry.suffix == ".md" and entry.name not in expected:
+            for name in sorted(set(backups) - expected, key=_byte_key):
+                entry = destination / name
                 try:
                     entry.unlink()
                 except OSError as exc:
@@ -607,18 +804,33 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
                             entry
                         )
                     ) from exc
-        directory_descriptor = open_directory_path(destination)
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
+                deleted.add(name)
+
+            _require_projects_unchanged(source_projects)
+        except Exception:
+            _rollback_index_namespace(
+                destination,
+                backups,
+                published,
+                deleted,
+            )
+            raise
     finally:
-        for temporary in prepared.values():
-            if temporary is not None:
-                try:
-                    os.unlink(temporary)
-                except OSError:
-                    pass
+        _cleanup_index_temporaries(
+            temporary
+            for temporary in prepared.values()
+            if temporary is not None
+        )
+        _cleanup_index_temporaries(
+            temporary for temporary, _, _ in backups.values()
+        )
+
+    _validate_index_directory(destination, expected)
+    directory_descriptor = open_directory_path(destination)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
     return destination
 
 
