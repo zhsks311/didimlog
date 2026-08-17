@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from enum import Enum
 import os
 import secrets
 import stat
@@ -54,6 +55,12 @@ class KnowledgeSourceError(KnowledgeIndexError):
         super().__init__(
             "KNOWLEDGE_INDEX_INVALID {}: {}".format(logical_path, reason)
         )
+
+
+class _QuarantineResult(Enum):
+    MISSING = "missing"
+    REMOVED_BY_US = "removed-by-us"
+    RESTORED = "restored"
 
 
 def _byte_key(value: str) -> bytes:
@@ -625,7 +632,7 @@ def _quarantine_index_entry(
     expected_info: os.stat_result,
     *,
     restore: bool,
-) -> bool:
+) -> _QuarantineResult:
     from .render import _rename_entry_no_replace
 
     quarantine_name = None
@@ -642,7 +649,7 @@ def _quarantine_index_entry(
         except FileExistsError:
             continue
         except FileNotFoundError:
-            return True
+            return _QuarantineResult.MISSING
         except OSError as exc:
             raise KnowledgeIndexError(
                 "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
@@ -714,7 +721,7 @@ def _quarantine_index_entry(
                 "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
                 "cannot persist restored index"
             ) from exc
-        return False
+        return _QuarantineResult.RESTORED
 
     state = "owned" if entry_owned else "changed"
     raise KnowledgeIndexError(
@@ -758,10 +765,14 @@ def _rollback_index_namespace(
     ],
     published: Mapping[str, tuple[bytes, os.stat_result]],
     deleted: set[str],
+    retained_backups: set[str],
 ) -> None:
     try:
         directory_descriptor = open_directory_path(destination)
     except UnsafePathError as exc:
+        retained_backups.update(
+            temporary for temporary, _, _, _ in backups.values()
+        )
         raise KnowledgeIndexError(
             "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
             "cannot access index namespace"
@@ -796,6 +807,7 @@ def _rollback_index_namespace(
                 )
             except (KnowledgeIndexError, OSError):
                 failures.append("published entry restore failed")
+                retained_backups.add(backup[0])
 
         for name in deleted:
             backup = backups.get(name)
@@ -810,11 +822,15 @@ def _rollback_index_namespace(
                 )
             except OSError:
                 failures.append("stale entry restore failed")
+                retained_backups.add(temporary)
 
         try:
             os.fsync(directory_descriptor)
         except OSError:
             failures.append("namespace persistence failed")
+            retained_backups.update(
+                temporary for temporary, _, _, _ in backups.values()
+            )
     finally:
         os.close(directory_descriptor)
 
@@ -853,6 +869,7 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
     prepared: dict[str, str | None] = {}
     published: dict[str, tuple[bytes, os.stat_result]] = {}
     deleted = set()
+    retained_backups = set()
     try:
         for project, text in normalized.items():
             descriptor = None
@@ -915,7 +932,7 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
             try:
                 for name in sorted(set(backups) - expected, key=_byte_key):
                     _, stale_data, _, stale_info = backups[name]
-                    removed = _quarantine_index_entry(
+                    quarantine_result = _quarantine_index_entry(
                         stale_descriptor,
                         destination,
                         name,
@@ -923,12 +940,18 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
                         stale_info,
                         restore=True,
                     )
-                    if not removed:
-                        raise KnowledgeIndexError(
-                            "KNOWLEDGE_INDEX_INVALID {}: "
-                            "index changed during publish".format(name)
-                        )
-                    deleted.add(name)
+                    if quarantine_result is _QuarantineResult.MISSING:
+                        continue
+                    if (
+                        quarantine_result
+                        is _QuarantineResult.REMOVED_BY_US
+                    ):
+                        deleted.add(name)
+                        continue
+                    raise KnowledgeIndexError(
+                        "KNOWLEDGE_INDEX_INVALID {}: "
+                        "index changed during publish".format(name)
+                    )
             finally:
                 os.close(stale_descriptor)
 
@@ -939,6 +962,7 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
                 backups,
                 published,
                 deleted,
+                retained_backups,
             )
             raise
     finally:
@@ -948,7 +972,9 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
             if temporary is not None
         )
         _cleanup_index_temporaries(
-            temporary for temporary, _, _, _ in backups.values()
+            temporary
+            for temporary, _, _, _ in backups.values()
+            if temporary not in retained_backups
         )
 
     _validate_index_directory(destination, expected)

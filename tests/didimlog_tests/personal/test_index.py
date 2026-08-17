@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from didimlog.personal import index as knowledge_index
+from didimlog.personal import render as personal_render
 from didimlog.personal.lesson_writing import publish_lesson
 
 
@@ -919,6 +920,117 @@ body
             [entry.read_bytes() for entry in recovery],
             [b"", b""],
         )
+
+    def test_missing_stale_entry_is_not_restored_after_postcheck_failure(self):
+        target = self.root / "index"
+        current = target / "demo-api.md"
+        current.write_bytes(b"previous index bytes\r\n")
+        stale = target / "obsolete.md"
+        stale.write_text(
+            GENERATED_NOTICE + "\n# obsolete\n",
+            encoding="utf-8",
+        )
+        outputs = {
+            "demo-api": GENERATED_NOTICE + "\n# replacement\n",
+        }
+        original_rename = personal_render._rename_entry_no_replace
+        deleted = False
+
+        def delete_stale_before_quarantine(
+            directory_descriptor,
+            source_name,
+            destination_name,
+        ):
+            nonlocal deleted
+            if not deleted and source_name == "obsolete.md":
+                deleted = True
+                stale.unlink()
+            return original_rename(
+                directory_descriptor,
+                source_name,
+                destination_name,
+            )
+
+        with mock.patch.object(
+            knowledge_index,
+            "_require_projects_unchanged",
+            side_effect=[
+                None,
+                knowledge_index.KnowledgeIndexError(
+                    "forced postcheck failure"
+                ),
+            ],
+        ), mock.patch.object(
+            personal_render,
+            "_rename_entry_no_replace",
+            side_effect=delete_stale_before_quarantine,
+        ), self.assertRaisesRegex(
+            knowledge_index.KnowledgeIndexError,
+            "forced postcheck failure",
+        ):
+            knowledge_index.write_all(
+                outputs=outputs,
+                data_root=self.root,
+                target=target,
+            )
+
+        self.assertTrue(deleted)
+        self.assertFalse(stale.exists())
+        self.assertEqual(current.read_bytes(), b"previous index bytes\r\n")
+
+    def test_failed_existing_restore_retains_durable_backup_artifact(self):
+        target = self.root / "index"
+        current = target / "demo-api.md"
+        previous = b"previous index bytes\r\n"
+        current.write_bytes(previous)
+        current.chmod(0o640)
+        outputs = {
+            "demo-api": GENERATED_NOTICE + "\n# replacement\n",
+        }
+        original_replace = (
+            knowledge_index.replace_regular_file_at_if_unchanged_with_info
+        )
+        replacements = 0
+
+        def fail_rollback_restore(*args, **kwargs):
+            nonlocal replacements
+            replacements += 1
+            if replacements == 1:
+                raise OSError("synthetic rollback restore failure")
+            return original_replace(*args, **kwargs)
+
+        with mock.patch.object(
+            knowledge_index,
+            "_require_projects_unchanged",
+            side_effect=[
+                None,
+                knowledge_index.KnowledgeIndexError(
+                    "forced postcheck failure"
+                ),
+            ],
+        ), mock.patch.object(
+            knowledge_index,
+            "replace_regular_file_at_if_unchanged_with_info",
+            side_effect=fail_rollback_restore,
+        ), self.assertRaisesRegex(
+            knowledge_index.KnowledgeIndexError,
+            "published entry restore failed",
+        ) as caught:
+            knowledge_index.write_all(
+                outputs=outputs,
+                data_root=self.root,
+                target=target,
+            )
+
+        self.assertNotIn(str(self.temporary), str(caught.exception))
+        recovery = [
+            entry
+            for entry in target.iterdir()
+            if entry.name.startswith(".index-backup-")
+        ]
+        self.assertEqual(len(recovery), 1)
+        self.assertEqual(recovery[0].read_bytes(), previous)
+        self.assertEqual(stat.S_IMODE(recovery[0].stat().st_mode), 0o640)
 
     def test_stale_index_removal_preserves_concurrent_writer(self):
         self.write("lessons/demo-api/rule.md", LESSON)
