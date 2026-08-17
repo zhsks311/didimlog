@@ -146,6 +146,77 @@ class BookStateTests(unittest.TestCase):
             "project link changed during operation",
         )
 
+    def test_candidates_pin_link_target_during_pathname_swap(self):
+        external = self.temporary_root / "external-lessons"
+        external.mkdir()
+        original = lesson_bytes(title="원래 대상")
+        (external / "one.md").write_bytes(original)
+        replacement = self.temporary_root / "replacement-lessons"
+        replacement.mkdir()
+        replacement_bytes = lesson_bytes(topic="jpa", title="교체 대상")
+        (replacement / "other.md").write_bytes(replacement_bytes)
+        displaced = self.temporary_root / "displaced-lessons"
+        logical = self.lessons_root / "app"
+        logical.rmdir()
+        logical.symlink_to(external, target_is_directory=True)
+        real_scan = book_state._lessons
+
+        def scan_while_path_swapped(source):
+            external.rename(displaced)
+            replacement.rename(external)
+            try:
+                yield from real_scan(source)
+            finally:
+                external.rename(replacement)
+                displaced.rename(external)
+
+        with mock.patch.object(
+            book_state,
+            "_lessons",
+            side_effect=scan_while_path_swapped,
+        ):
+            rows = book_state.candidates(project="app", root=self.lessons_root)
+
+        self.assertEqual(
+            [(row["id"], row["topic"], row["title"]) for row in rows],
+            [("one", "kafka", "원래 대상")],
+        )
+        self.assertEqual(rows[0]["path"], str(logical / "one.md"))
+        self.assertEqual((external / "one.md").read_bytes(), original)
+        self.assertEqual(
+            (replacement / "other.md").read_bytes(),
+            replacement_bytes,
+        )
+
+    def test_candidates_open_and_close_one_pinned_descriptor(self):
+        external = self.temporary_root / "external-lessons"
+        external.mkdir()
+        (external / "one.md").write_bytes(lesson_bytes())
+        (external / "two.md").write_bytes(lesson_bytes(topic="jpa"))
+        logical = self.lessons_root / "app"
+        logical.rmdir()
+        logical.symlink_to(external, target_is_directory=True)
+        real_open = file_io.open_directory_path
+        opened = []
+
+        def track_open(path):
+            descriptor = real_open(path)
+            opened.append(descriptor)
+            return descriptor
+
+        with mock.patch.object(
+            file_io,
+            "open_directory_path",
+            side_effect=track_open,
+        ):
+            rows = book_state.candidates(project="app", root=self.lessons_root)
+
+        self.assertEqual([row["id"] for row in rows], ["one", "two"])
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(OSError) as caught:
+            os.fstat(opened[0])
+        self.assertEqual(caught.exception.errno, errno.EBADF)
+
     def test_mark_booked_updates_linked_project_with_logical_result(self):
         external = self.temporary_root / "external-lessons"
         external.mkdir()

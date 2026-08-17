@@ -35,11 +35,11 @@ def _project_lessons(project, root, cwd) -> ProjectDirectory | None:
     return resolve_project_directory(base, selected)
 
 
-def _read_regular_file(path: Path) -> bytes | None:
+def _read_regular_file(directory_descriptor: int, path: Path) -> bytes | None:
     """심볼릭 링크와 파일 교체 경쟁을 따라가지 않고 일반 파일만 읽는다."""
     try:
-        data = file_io.read_regular_file_beneath(
-            path.parent,
+        data = file_io.read_regular_file_at(
+            directory_descriptor,
             path.name,
             LESSON_MAX_BYTES,
         )
@@ -76,16 +76,19 @@ def _parse_lesson(path: Path, data: bytes):
     return None
 
 
-def _lessons(directory: ProjectDirectory):
+def _lessons(directory_descriptor: int):
     try:
-        paths = sorted(
-            directory.physical.glob("*.md"),
-            key=lambda item: item.name.encode("utf-8"),
-        )
+        names = [
+            name
+            for name in os.listdir(directory_descriptor)
+            if name.endswith(".md") and SLUG.fullmatch(name[:-3]) is not None
+        ]
+        names.sort(key=lambda name: name.encode("utf-8"))
     except OSError:
         return
-    for path in paths:
-        data = _read_regular_file(path)
+    for name in names:
+        path = Path(name)
+        data = _read_regular_file(directory_descriptor, path)
         if data is None:
             continue
         parsed = _parse_lesson(path, data)
@@ -99,31 +102,53 @@ def candidates(project=None, root=None, cwd=None):
     if directory is None:
         return []
 
-    rows = []
-    for path, _, parsed in _lessons(directory):
-        fields, _, _ = parsed
-        topic = fields["topic"]
-        if topic in parse_booked(fields.get("booked")):
-            continue
-        rows.append(
-            {
-                "id": path.stem,
-                "path": str(directory.logical / path.name),
-                "topic": topic,
-                "title": fields.get("title", ""),
-                "summary": fields.get("summary", ""),
-                "date": fields.get("date", ""),
-            }
-        )
+    descriptor: int | None = None
+    try:
+        try:
+            descriptor = file_io.open_directory_path(directory.physical)
+            if (
+                _directory_identity(os.fstat(descriptor))
+                != directory.target_identity
+                or not project_directory_unchanged(directory)
+            ):
+                raise ProjectDirectoryError(
+                    directory.logical,
+                    "project link changed during operation",
+                )
+        except file_io.UnsafePathError as error:
+            raise ProjectDirectoryError(
+                directory.logical,
+                "project link changed during operation",
+            ) from error
 
-    rows.sort(key=lambda row: row["id"].encode("utf-8"))
-    rows.sort(key=lambda row: row["date"], reverse=True)
-    if not project_directory_unchanged(directory):
-        raise ProjectDirectoryError(
-            directory.logical,
-            "project link changed during operation",
-        )
-    return rows
+        rows = []
+        for path, _, parsed in _lessons(descriptor):
+            fields, _, _ = parsed
+            topic = fields["topic"]
+            if topic in parse_booked(fields.get("booked")):
+                continue
+            rows.append(
+                {
+                    "id": path.stem,
+                    "path": str(directory.logical / path.name),
+                    "topic": topic,
+                    "title": fields.get("title", ""),
+                    "summary": fields.get("summary", ""),
+                    "date": fields.get("date", ""),
+                }
+            )
+
+        rows.sort(key=lambda row: row["id"].encode("utf-8"))
+        rows.sort(key=lambda row: row["date"], reverse=True)
+        if not project_directory_unchanged(directory):
+            raise ProjectDirectoryError(
+                directory.logical,
+                "project link changed during operation",
+            )
+        return rows
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _booked_bytes(data: bytes, parsed) -> bytes:
