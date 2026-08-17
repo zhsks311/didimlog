@@ -68,74 +68,93 @@ def _validate_topic(topic: str) -> str:
     return topic
 
 
-def _assert_no_symlink(path: Path, root: Path, label: str) -> None:
+def _read_source(
+    project_descriptor: int,
+    name: str,
+    logical_path: str,
+) -> str:
     try:
-        relative = path.relative_to(root)
+        linked = os.stat(
+            name,
+            dir_fd=project_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        raise ValueError("book markdown missing: " + logical_path) from None
+    except OSError:
+        raise ValueError("book markdown must be a regular file") from None
+    if stat.S_ISLNK(linked.st_mode) or not stat.S_ISREG(linked.st_mode):
+        raise ValueError(
+            "book markdown must be a regular file; symlinks are not allowed"
+        )
+    try:
+        data = file_io.read_regular_file_at(
+            project_descriptor,
+            name,
+            sys.maxsize,
+        )
+    except OSError:
+        raise ValueError("book markdown must be a regular file") from None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("book markdown must be UTF-8") from None
+
+
+def _image_relative_path(source_path: Path, image_source: str) -> Path:
+    candidate = Path(os.path.normpath(os.fspath(source_path.parent / image_source)))
+    if (
+        candidate.is_absolute()
+        or not candidate.parts
+        or candidate.parts[0] == ".."
+    ):
+        raise ValueError("image escapes book directory: " + image_source)
+    return candidate
+
+
+def _read_image_at(
+    project_descriptor: int,
+    relative_path: Path,
+    image_source: str,
+) -> bytes:
+    descriptor = os.dup(project_descriptor)
+    try:
+        for component in relative_path.parts[:-1]:
+            child = file_io.open_child_directory(descriptor, component)
+            os.close(descriptor)
+            descriptor = child
+        try:
+            linked = os.stat(
+                relative_path.name,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            raise ValueError("image missing: " + image_source) from None
+        except OSError:
+            raise ValueError("image missing: " + image_source) from None
+        if stat.S_ISLNK(linked.st_mode) or not stat.S_ISREG(linked.st_mode):
+            raise ValueError(
+                "image must be a regular file; symlinks are not allowed: "
+                + image_source
+            )
+        try:
+            return file_io.read_regular_file_at(
+                descriptor,
+                relative_path.name,
+                sys.maxsize,
+            )
+        except OSError:
+            raise ValueError("image missing: " + image_source) from None
     except ValueError:
-        raise ValueError("{} escapes book directory".format(label)) from None
-
-    current = root
-    if current.is_symlink():
-        raise ValueError("{} contains a symlink".format(label))
-    for part in relative.parts:
-        current = current / part
-        if current.is_symlink():
-            raise ValueError("{} contains a symlink".format(label))
-
-
-def _assert_real_descendant(path: Path, root: Path, label: str) -> None:
-    try:
-        path.resolve(strict=True).relative_to(root.resolve(strict=True))
-    except (FileNotFoundError, OSError, RuntimeError, ValueError):
-        raise ValueError("{} escapes book directory".format(label)) from None
-
-
-def _read_source(path: Path) -> str:
-    try:
-        path_status = path.lstat()
-    except OSError as error:
-        raise ValueError("book markdown missing: {}".format(path)) from error
-    if stat.S_ISLNK(path_status.st_mode) or not stat.S_ISREG(path_status.st_mode):
-        raise ValueError("book markdown must be a regular file; symlinks are not allowed")
-
-    descriptor = None
-    try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise ValueError("book markdown must be a regular file")
-        with os.fdopen(descriptor, "r", encoding="utf-8", newline="") as handle:
-            descriptor = None
-            return handle.read()
-    except UnicodeDecodeError as error:
-        raise ValueError("book markdown must be UTF-8") from error
-    except OSError as error:
-        raise ValueError("book markdown must be a regular file") from error
+        raise
+    except OSError:
+        raise ValueError(
+            "image must be a regular file; symlinks are not allowed: "
+            + image_source
+        ) from None
     finally:
-        if descriptor is not None:
-            os.close(descriptor)
-
-
-def _read_image(path: Path, source: str) -> bytes:
-    try:
-        path_status = path.lstat()
-    except OSError as error:
-        raise ValueError("image missing: {} ({})".format(source, error)) from error
-    if stat.S_ISLNK(path_status.st_mode) or not stat.S_ISREG(path_status.st_mode):
-        raise ValueError("image must be a regular file; symlinks are not allowed: " + source)
-
-    descriptor = None
-    try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise ValueError("image must be a regular file: " + source)
-        with os.fdopen(descriptor, "rb") as handle:
-            descriptor = None
-            return handle.read()
-    except OSError as error:
-        raise ValueError("image missing: {} ({})".format(source, error)) from error
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
+        os.close(descriptor)
 
 
 def _remove_inline_code(source: str) -> str:
@@ -160,7 +179,7 @@ def _reject_raw_html(source: str) -> None:
 def _inline_images(
     rendered: str,
     source_path: Path,
-    project_book: Path,
+    project_descriptor: int,
 ) -> str:
     def replace(match: re.Match[str]) -> str:
         before, rendered_source, after = match.groups()
@@ -168,17 +187,16 @@ def _inline_images(
         if _EXTERNAL_URI.match(image_source) or image_source.startswith("//"):
             raise ValueError("external image URL is not allowed: " + image_source)
 
-        image_path = _absolute(source_path.parent / image_source)
-        try:
-            image_path.relative_to(project_book)
-        except ValueError:
-            raise ValueError("image escapes book directory: " + image_source) from None
-        _assert_no_symlink(image_path, project_book, "image")
-        if image_path.exists():
-            _assert_real_descendant(image_path, project_book, "image")
-        data = _read_image(image_path, image_source)
-
-        mime = mimetypes.guess_type(image_path.name)[0] or "application/octet-stream"
+        relative_path = _image_relative_path(source_path, image_source)
+        data = _read_image_at(
+            project_descriptor,
+            relative_path,
+            image_source,
+        )
+        mime = (
+            mimetypes.guess_type(relative_path.name)[0]
+            or "application/octet-stream"
+        )
         encoded = base64.b64encode(data).decode("ascii")
         alt = "" if re.search(r"\balt=", before + after, re.IGNORECASE) else ' alt=""'
         return '<img {}src="data:{};base64,{}"{}{}>'.format(
@@ -255,6 +273,26 @@ class _EntrySnapshot:
     revision: tuple[int, ...]
     digest: bytes | None = None
     link_target: bytes | None = None
+
+def _snapshot_regular_descriptor(descriptor: int) -> _EntrySnapshot:
+    opened = os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode):
+        raise ValueError("book output changed during render")
+    revision = _entry_revision(opened)
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        chunk = os.pread(descriptor, 64 * 1024, offset)
+        if not chunk:
+            break
+        digest.update(chunk)
+        offset += len(chunk)
+    if _entry_revision(os.fstat(descriptor)) != revision:
+        raise ValueError("book output changed during render")
+    return _EntrySnapshot(
+        revision=revision,
+        digest=digest.digest(),
+    )
 
 
 def _snapshot_output_entry(
@@ -374,7 +412,7 @@ def _temporary_output(
     suffix: str,
 ) -> tuple[str, int]:
     flags = (
-        os.O_WRONLY
+        os.O_RDWR
         | os.O_CREAT
         | os.O_EXCL
         | getattr(os, "O_NOFOLLOW", 0)
@@ -494,6 +532,42 @@ def _rename_entry_no_replace(
         destination_name,
     )
 
+def _probe_atomic_no_replace(output_descriptor: int) -> None:
+    for _ in range(32):
+        source_name, source_descriptor = _temporary_output(
+            output_descriptor,
+            ".probe",
+        )
+        os.close(source_descriptor)
+        destination_name = ".render-{}.probe-target".format(
+            secrets.token_hex(12)
+        )
+        try:
+            _rename_entry_no_replace(
+                output_descriptor,
+                source_name,
+                destination_name,
+            )
+        except FileExistsError:
+            os.unlink(source_name, dir_fd=output_descriptor)
+            continue
+        except OSError:
+            try:
+                os.unlink(source_name, dir_fd=output_descriptor)
+            except OSError:
+                pass
+            try:
+                os.unlink(destination_name, dir_fd=output_descriptor)
+            except OSError:
+                pass
+            raise
+        os.unlink(destination_name, dir_fd=output_descriptor)
+        return
+    raise OSError(
+        errno.EEXIST,
+        "atomic no-replace probe name collision",
+    )
+
 
 def _restore_entry_no_clobber(
     output_descriptor: int,
@@ -515,7 +589,7 @@ def _restore_entry_no_clobber(
 class _OutputPublication:
     name: str
     descriptor: int
-    revision: tuple[int, ...]
+    snapshot: _EntrySnapshot
     backup_name: str | None
 
 
@@ -550,8 +624,12 @@ def _replace_output(
             ".tmp",
         )
         _write_all(temporary_descriptor, document.encode("utf-8"))
+        publication_snapshot = _snapshot_regular_descriptor(
+            temporary_descriptor
+        )
 
         if existing is not None:
+            _probe_atomic_no_replace(output_descriptor)
             backup_name, backup_descriptor = _temporary_output(
                 output_descriptor,
                 ".bak",
@@ -580,7 +658,8 @@ def _replace_output(
             if moved != existing:
                 raise ValueError("book output changed during render")
 
-        revision = _entry_revision(os.fstat(temporary_descriptor))
+        if _snapshot_regular_descriptor(temporary_descriptor) != publication_snapshot:
+            raise ValueError("book output changed during render")
         try:
             _rename_entry_no_replace(
                 output_descriptor,
@@ -594,18 +673,17 @@ def _replace_output(
         publication = _OutputPublication(
             name=output_name,
             descriptor=temporary_descriptor,
-            revision=revision,
+            snapshot=publication_snapshot,
             backup_name=backup_name if backup_moved else None,
         )
         temporary_descriptor = None
         backup_name = None
         backup_moved = False
-        linked = os.stat(
+        linked = _snapshot_output_entry(
+            output_descriptor,
             output_name,
-            dir_fd=output_descriptor,
-            follow_symlinks=False,
         )
-        if _entry_revision(linked) != revision:
+        if linked != publication_snapshot:
             raise ValueError("book output changed during render")
         os.fsync(output_descriptor)
         completed = True
@@ -669,89 +747,80 @@ def _finish_output(
     rollback: bool,
 ) -> None:
     recovery_name: str | None = None
-    recovery_moved = False
+    current_uncertain = False
     try:
-        current: os.stat_result | None
         try:
-            current = os.stat(
+            current = _snapshot_output_entry(
+                output_descriptor,
                 publication.name,
-                dir_fd=output_descriptor,
-                follow_symlinks=False,
             )
         except FileNotFoundError:
             current = None
+        except ValueError:
+            current = None
+            current_uncertain = True
 
-        publication_descriptor_unchanged = (
-            _entry_revision(os.fstat(publication.descriptor))
-            == publication.revision
-        )
+        try:
+            publication_descriptor_unchanged = (
+                _snapshot_regular_descriptor(publication.descriptor)
+                == publication.snapshot
+            )
+        except ValueError:
+            publication_descriptor_unchanged = False
         current_was_publication = (
-            current is not None
-            and _entry_revision(current) == publication.revision
+            current == publication.snapshot
             and publication_descriptor_unchanged
         )
         if rollback and current_was_publication:
-            recovery_name, recovery_descriptor = _temporary_output(
+            candidate_name, recovery_descriptor = _temporary_output(
                 output_descriptor,
                 ".recover",
             )
             os.close(recovery_descriptor)
-            os.unlink(recovery_name, dir_fd=output_descriptor)
+            os.unlink(candidate_name, dir_fd=output_descriptor)
             try:
-                os.rename(
+                _rename_entry_no_replace(
+                    output_descriptor,
                     publication.name,
-                    recovery_name,
-                    src_dir_fd=output_descriptor,
-                    dst_dir_fd=output_descriptor,
+                    candidate_name,
                 )
             except FileNotFoundError:
-                recovery_name = None
+                pass
             except OSError:
-                recovery_name = None
                 try:
-                    remaining = os.stat(
+                    remaining = _snapshot_output_entry(
+                        output_descriptor,
                         publication.name,
-                        dir_fd=output_descriptor,
-                        follow_symlinks=False,
                     )
                 except FileNotFoundError:
                     remaining = None
                 if (
-                    remaining is not None
-                    and _entry_revision(remaining) == publication.revision
-                    and _entry_revision(os.fstat(publication.descriptor))
-                    == publication.revision
+                    remaining == publication.snapshot
+                    and _snapshot_regular_descriptor(publication.descriptor)
+                    == publication.snapshot
                 ):
                     raise
             else:
-                recovery_moved = True
+                recovery_name = candidate_name
 
-        if recovery_moved and recovery_name is not None:
-            recovered = os.stat(
+        if recovery_name is not None:
+            recovered = _snapshot_output_entry(
+                output_descriptor,
                 recovery_name,
-                dir_fd=output_descriptor,
-                follow_symlinks=False,
             )
             publication_unchanged = (
-                _entry_revision(recovered) == publication.revision
-                and _entry_revision(os.fstat(publication.descriptor))
-                == publication.revision
+                recovered == publication.snapshot
+                and _snapshot_regular_descriptor(publication.descriptor)
+                == publication.snapshot
             )
             if publication_unchanged:
                 if publication.backup_name is not None:
-                    try:
-                        restored = _restore_entry_no_clobber(
-                            output_descriptor,
-                            publication.backup_name,
-                            publication.name,
-                        )
-                    except OSError:
-                        os.unlink(recovery_name, dir_fd=output_descriptor)
-                        recovery_name = None
-                        raise
+                    restored = _restore_entry_no_clobber(
+                        output_descriptor,
+                        publication.backup_name,
+                        publication.name,
+                    )
                     if not restored:
-                        os.unlink(recovery_name, dir_fd=output_descriptor)
-                        recovery_name = None
                         raise FileExistsError(
                             errno.EEXIST,
                             "book output backup destination exists",
@@ -766,15 +835,18 @@ def _finish_output(
                     recovery_name,
                     publication.name,
                 )
-                if restored:
-                    recovery_name = None
-                else:
-                    if stat.S_ISDIR(recovered.st_mode):
-                        os.rmdir(recovery_name, dir_fd=output_descriptor)
-                    else:
-                        os.unlink(recovery_name, dir_fd=output_descriptor)
-                    recovery_name = None
-        elif rollback and publication.backup_name is not None:
+                if not restored:
+                    raise FileExistsError(
+                        errno.EEXIST,
+                        "book output recovery destination exists",
+                        publication.name,
+                    )
+                recovery_name = None
+        elif (
+            rollback
+            and not current_uncertain
+            and publication.backup_name is not None
+        ):
             restored = _restore_entry_no_clobber(
                 output_descriptor,
                 publication.backup_name,
@@ -788,7 +860,10 @@ def _finish_output(
                 )
             publication.backup_name = None
 
-        if publication.backup_name is not None:
+        if (
+            publication.backup_name is not None
+            and not (rollback and current_uncertain)
+        ):
             os.unlink(publication.backup_name, dir_fd=output_descriptor)
             publication.backup_name = None
         os.fsync(output_descriptor)
@@ -828,7 +903,6 @@ def render_book(
     if resolved is None:
         raise ValueError("project book directory missing")
     physical_project = resolved.physical
-    physical_source = physical_project / source_path.relative_to(resolved.logical)
     physical_output = physical_project / output_path.relative_to(resolved.logical)
 
     project_descriptor: int | None = None
@@ -842,17 +916,18 @@ def render_book(
         if not _project_directory_is_current(resolved, project_descriptor):
             raise ValueError("project book link changed during render")
 
-        _assert_no_symlink(physical_source, physical_project, "book markdown")
-        if not physical_source.exists():
-            raise ValueError("book markdown missing: {}".format(source_path))
-        _assert_real_descendant(physical_source, physical_project, "book markdown")
-        source_text = _read_source(physical_source)
+        logical_source_display = "book/{}/{}.md".format(project, topic)
+        source_text = _read_source(
+            project_descriptor,
+            source_path.name,
+            logical_source_display,
+        )
 
         source_title = topic
         body_source = source_text
         if source_text.startswith("---"):
             parsed = parse_frontmatter_text(
-                physical_source.name,
+                source_path.name,
                 source_text,
                 ("title", "find_when"),
             )
@@ -874,7 +949,11 @@ def render_book(
             lambda match: '<pre class="mermaid">{}</pre>'.format(match.group(1)),
             body,
         )
-        body = _inline_images(body, physical_source, physical_project)
+        body = _inline_images(
+            body,
+            Path(source_path.name),
+            project_descriptor,
+        )
         _reject_unsafe_links(body)
 
         heading = re.search(r"^#\s+(.+)$", body_source, re.MULTILINE)

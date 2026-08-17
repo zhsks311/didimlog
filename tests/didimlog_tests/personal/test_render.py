@@ -65,6 +65,23 @@ class RenderBookTests(unittest.TestCase):
         except (NotImplementedError, OSError) as error:
             self.skipTest("symlinks unavailable: {}".format(error))
 
+    def link_external_book(self, body):
+        external = self.root / "external-book"
+        (external / "assets").mkdir(parents=True)
+        self.assets.rmdir()
+        self.project_book.rmdir()
+        self.make_symlink(
+            self.project_book,
+            external,
+            target_is_directory=True,
+        )
+        (external / "test.md").write_text(
+            book_markdown(body),
+            encoding="utf-8",
+            newline="\n",
+        )
+        return external
+
     def test_renders_linked_book_project_and_returns_logical_output(self):
         external = self.root / "external-book"
         external_assets = external / "assets"
@@ -382,12 +399,22 @@ class RenderBookTests(unittest.TestCase):
         self.output.parent.mkdir()
         original = b"original rendered entry\n"
         self.output.write_bytes(original)
+        real_atomic_rename = render_module._rename_entry_no_replace
+
+        def fail_backup_restore(descriptor, source, destination):
+            if str(source).endswith(".bak"):
+                raise OSError(errno.ENOSPC, "forced restore failure")
+            return real_atomic_rename(descriptor, source, destination)
+
 
         with mock.patch.object(
             render_module,
             "_rename_entry_no_replace",
-            create=True,
-            side_effect=OSError(errno.ENOSPC, "forced restore failure"),
+            side_effect=fail_backup_restore,
+        ), mock.patch.object(
+            render_module,
+            "_project_directory_is_current",
+            side_effect=(True, True, True, False),
         ), self.assertRaises(ValueError):
             self.render()
 
@@ -396,7 +423,11 @@ class RenderBookTests(unittest.TestCase):
         self.assertEqual(len(backups), 1)
         self.assertEqual(backups[0].read_bytes(), original)
         self.assertEqual(list(self.output.parent.glob(".render-*.tmp")), [])
-        self.assertEqual(list(self.output.parent.glob(".render-*.recover")), [])
+        recoveries = list(self.output.parent.glob(".render-*.recover"))
+        self.assertEqual(len(recoveries), 1)
+        self.assertTrue(
+            recoveries[0].read_text(encoding="utf-8").startswith("<!doctype html>")
+        )
 
     def test_same_length_output_change_with_restored_mtime_is_preserved(self):
         self.write_source("# safe\n")
@@ -557,7 +588,8 @@ class RenderBookTests(unittest.TestCase):
         external_html = external / "html"
         external_html.mkdir(parents=True)
         existing_output = external_html / "test.html"
-        existing_output.write_bytes(b"original rendered entry\n")
+        original = b"original rendered entry\n"
+        existing_output.write_bytes(original)
         replacement = self.root / "replacement-book"
         replacement.mkdir()
         concurrent = b"user replaced during rollback\n"
@@ -620,7 +652,11 @@ class RenderBookTests(unittest.TestCase):
 
         self.assertEqual(existing_output.read_bytes(), concurrent)
         self.assertFalse((replacement / "html" / "test.html").exists())
-        self.assertEqual(list(external_html.glob(".render-*")), [])
+        backups = list(external_html.glob(".render-*.bak"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), original)
+        self.assertEqual(list(external_html.glob(".render-*.tmp")), [])
+        self.assertEqual(list(external_html.glob(".render-*.recover")), [])
 
     def test_rollback_preserves_directory_replacing_published_output(self):
         external = self.root / "external-book"
@@ -780,7 +816,7 @@ class RenderBookTests(unittest.TestCase):
             return publication
 
         def stat_and_replace_with_directory(path, *args, **kwargs):
-            nonlocal replaced
+            nonlocal replaced, competitor_identity
             info = real_stat(path, *args, **kwargs)
             if (
                 retargeted
@@ -790,6 +826,16 @@ class RenderBookTests(unittest.TestCase):
             ):
                 concurrent_output.unlink()
                 concurrent_output.mkdir()
+                competitor = real_stat(
+                    path,
+                    dir_fd=kwargs["dir_fd"],
+                    follow_symlinks=False,
+                )
+                competitor_identity = (
+                    competitor.st_dev,
+                    competitor.st_ino,
+                    competitor.st_mode,
+                )
                 replaced = True
             return info
 
@@ -925,7 +971,7 @@ class RenderBookTests(unittest.TestCase):
             return publication
 
         def stat_and_replace_with_directory(path, *args, **kwargs):
-            nonlocal replaced
+            nonlocal replaced, swapped_identity
             info = real_stat(path, *args, **kwargs)
             if (
                 retargeted
@@ -935,6 +981,16 @@ class RenderBookTests(unittest.TestCase):
             ):
                 concurrent_output.unlink()
                 concurrent_output.mkdir()
+                swapped = real_stat(
+                    path,
+                    dir_fd=kwargs["dir_fd"],
+                    follow_symlinks=False,
+                )
+                swapped_identity = (
+                    swapped.st_dev,
+                    swapped.st_ino,
+                    swapped.st_mode,
+                )
                 replaced = True
             return info
 
@@ -1027,6 +1083,208 @@ class RenderBookTests(unittest.TestCase):
 
         self.assertFalse(existing_output.exists())
         self.assertEqual(list(external_html.glob(".render-*")), [])
+
+    def test_no_replace_support_is_probed_before_existing_output_moves(self):
+        self.write_source("# safe\n")
+        self.output.parent.mkdir()
+        original = b"original rendered entry\n"
+        self.output.write_bytes(original)
+
+        with mock.patch.object(
+            render_module,
+            "_rename_entry_no_replace",
+            side_effect=OSError(errno.ENOTSUP, "no atomic no-replace"),
+        ), self.assertRaises(ValueError):
+            self.render()
+
+        self.assertEqual(self.output.read_bytes(), original)
+        self.assertEqual(list(self.output.parent.glob(".render-*")), [])
+
+    def test_two_writers_keep_recovery_when_restore_destination_is_recreated(self):
+        external = self.link_external_book("# linked\n")
+        replacement = self.root / "replacement-book"
+        replacement.mkdir()
+        output = external / "html" / "test.html"
+        writer_a = b"writer A output\n"
+        writer_b = b"writer B output\n"
+        real_replace = render_module._replace_output
+        real_atomic_rename = render_module._rename_entry_no_replace
+        retargeted = False
+        wrote_a = False
+        wrote_b = False
+
+        def publish_and_retarget(*args, **kwargs):
+            nonlocal retargeted
+            publication = real_replace(*args, **kwargs)
+            os.unlink(self.project_book)
+            os.symlink(
+                replacement,
+                self.project_book,
+                target_is_directory=True,
+            )
+            retargeted = True
+            return publication
+
+        def move_after_writer_changes(descriptor, source, destination):
+            nonlocal wrote_a, wrote_b
+            if (
+                source == "test.html"
+                and str(destination).endswith(".recover")
+                and not wrote_a
+            ):
+                output.write_bytes(writer_a)
+                wrote_a = True
+            if str(source).endswith(".recover") and not wrote_b:
+                output.write_bytes(writer_b)
+                wrote_b = True
+            return real_atomic_rename(
+                descriptor,
+                source,
+                destination,
+            )
+
+        with mock.patch.object(
+            render_module,
+            "_replace_output",
+            side_effect=publish_and_retarget,
+        ), mock.patch.object(
+            render_module,
+            "_rename_entry_no_replace",
+            side_effect=move_after_writer_changes,
+        ), self.assertRaises(ValueError):
+            self.render()
+
+        self.assertEqual(output.read_bytes(), writer_b)
+        recoveries = list((external / "html").glob(".render-*.recover"))
+        self.assertEqual(len(recoveries), 1)
+        self.assertEqual(recoveries[0].read_bytes(), writer_a)
+        self.assertEqual(list((external / "html").glob(".render-*.tmp")), [])
+        self.assertEqual(list((external / "html").glob(".render-*.bak")), [])
+        self.assertFalse((replacement / "html" / "test.html").exists())
+
+    def test_asset_intermediate_directory_retarget_is_rejected(self):
+        external = self.link_external_book("# linked\n\n![점](assets/pixel.png)")
+        (external / "assets" / "pixel.png").write_bytes(PNG)
+        attacker_assets = self.root / "attacker-assets"
+        attacker_assets.mkdir()
+        attacker = b"attacker image bytes"
+        (attacker_assets / "pixel.png").write_bytes(attacker)
+        real_open_child_directory = render_module.file_io.open_child_directory
+        retargeted = False
+
+        def retarget_before_assets_open(parent_descriptor, name):
+            nonlocal retargeted
+            if name == "assets" and not retargeted:
+                (external / "assets" / "pixel.png").unlink()
+                (external / "assets").rmdir()
+                os.symlink(
+                    attacker_assets,
+                    external / "assets",
+                    target_is_directory=True,
+                )
+                retargeted = True
+            return real_open_child_directory(parent_descriptor, name)
+
+        with mock.patch.object(
+            render_module.file_io,
+            "open_child_directory",
+            side_effect=retarget_before_assets_open,
+        ), self.assertRaises(ValueError):
+            self.render()
+
+        self.assertTrue(retargeted)
+        self.assertFalse((external / "html" / "test.html").exists())
+
+    def test_missing_linked_image_error_uses_only_logical_path(self):
+        external = self.link_external_book("# linked\n\n![점](assets/missing.png)")
+
+        with self.assertRaises(ValueError) as caught:
+            self.render()
+
+        message = str(caught.exception)
+        self.assertIn("assets/missing.png", message)
+        self.assertNotIn(str(external), message)
+        self.assertNotIn(str(self.root), message)
+        self.assertIsNone(caught.exception.__cause__)
+
+    def test_published_output_digest_detects_same_inode_bytes_change(self):
+        external = self.link_external_book("# linked\n")
+        replacement = self.root / "replacement-book"
+        replacement.mkdir()
+        output = external / "html" / "test.html"
+        real_replace = render_module._replace_output
+        real_stat = render_module.os.stat
+        retargeted = False
+        changed = False
+        concurrent = []
+
+        def publish_and_retarget(*args, **kwargs):
+            nonlocal retargeted
+            publication = real_replace(*args, **kwargs)
+            os.unlink(self.project_book)
+            os.symlink(
+                replacement,
+                self.project_book,
+                target_is_directory=True,
+            )
+            retargeted = True
+            return publication
+
+        def stat_and_change_bytes(path, *args, **kwargs):
+            nonlocal changed
+            info = real_stat(path, *args, **kwargs)
+            if (
+                retargeted
+                and not changed
+                and path == "test.html"
+                and kwargs.get("dir_fd") is not None
+            ):
+                replacement_bytes = b"X" * info.st_size
+                output.write_bytes(replacement_bytes)
+                os.utime(
+                    output,
+                    ns=(info.st_atime_ns, info.st_mtime_ns),
+                )
+                concurrent.append(replacement_bytes)
+                changed = True
+            return info
+
+        with mock.patch.object(
+            render_module,
+            "_replace_output",
+            side_effect=publish_and_retarget,
+        ), mock.patch.object(
+            render_module.os,
+            "stat",
+            side_effect=stat_and_change_bytes,
+        ), self.assertRaises(ValueError):
+            self.render()
+
+        self.assertTrue(changed)
+        self.assertEqual(output.read_bytes(), concurrent[0])
+        self.assertEqual(list((external / "html").glob(".render-*")), [])
+        self.assertFalse((replacement / "html" / "test.html").exists())
+
+    def test_source_read_race_does_not_expose_physical_path(self):
+        external = self.link_external_book("# linked\n")
+        real_read_source = render_module._read_source
+
+        def delete_before_read(*args, **kwargs):
+            (external / "test.md").unlink()
+            return real_read_source(*args, **kwargs)
+
+        with mock.patch.object(
+            render_module,
+            "_read_source",
+            side_effect=delete_before_read,
+        ), self.assertRaises(ValueError) as caught:
+            self.render()
+
+        message = str(caught.exception)
+        self.assertIn("book/{}/test.md".format(PROJECT), message)
+        self.assertNotIn(str(external), message)
+        self.assertNotIn(str(self.root), message)
+        self.assertIsNone(caught.exception.__cause__)
 
     def test_renders_self_contained_html_with_markdown_table_mermaid_and_image(self):
         (self.assets / "pixel.png").write_bytes(PNG)
