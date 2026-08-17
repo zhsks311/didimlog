@@ -15,7 +15,9 @@ from pathlib import Path
 from typing import Iterable, Mapping
 from didimlog.file_io import (
     UnsafePathError,
+    open_child_directory,
     open_directory_path,
+    read_regular_file_at,
     read_regular_file_beneath,
     replace_regular_file_at_if_unchanged_with_info,
 )
@@ -24,7 +26,7 @@ from didimlog.locking import path_lock
 from .lesson import (
     parse_frontmatter_text,
     parse_inline_list,
-    parse_lesson,
+    parse_lesson_text,
     valid_index_title,
 )
 from .paths import (
@@ -158,7 +160,7 @@ def _project_directories(root: Path) -> dict[str, ProjectDirectory]:
             continue
         selected.append(entry)
 
-    entries = sorted(selected, key=lambda entry: _byte_key(entry.name))
+    entries = sorted(selected, key=lambda entry: os.fsencode(entry.name))
     result = {}
     for entry in entries:
         logical_path = "{}/{}".format(root.name, entry.name)
@@ -189,12 +191,77 @@ def _project_directories(root: Path) -> dict[str, ProjectDirectory]:
     return result
 
 
+def _open_project_directory(project: ProjectDirectory) -> int:
+    descriptor = None
+    try:
+        descriptor = open_directory_path(project.physical)
+        opened = os.fstat(descriptor)
+        opened_identity = (
+            opened.st_dev,
+            opened.st_ino,
+            stat.S_IFMT(opened.st_mode),
+        )
+        if opened_identity != project.target_identity:
+            raise UnsafePathError("project target changed")
+        return descriptor
+    except (OSError, UnsafePathError) as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise KnowledgeSourceError(
+            _logical_source_path(project),
+            "project link changed during scan",
+        ) from exc
+
+
+def _read_pinned_markdown(
+    root_descriptor: int,
+    relative: Path,
+) -> bytes:
+    if relative.is_absolute() or any(
+        part in ("", ".", "..") for part in relative.parts
+    ):
+        raise UnsafePathError("unsafe relative path")
+    descriptors = []
+    try:
+        root_copy = os.dup(root_descriptor)
+        descriptors.append(root_copy)
+        if not stat.S_ISDIR(os.fstat(root_copy).st_mode):
+            raise UnsafePathError("unsafe project descriptor")
+        for component in relative.parts[:-1]:
+            descriptors.append(
+                open_child_directory(descriptors[-1], component)
+            )
+        return read_regular_file_at(
+            descriptors[-1],
+            relative.name,
+            SOURCE_MAX_BYTES,
+        )
+    except UnsafePathError:
+        raise
+    except OSError as exc:
+        raise UnsafePathError("cannot traverse project directory") from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
 def _lesson_item(
     project: ProjectDirectory,
+    root_descriptor: int,
     relative: Path,
 ) -> dict[str, object]:
     logical_path = _logical_source_path(project, relative)
-    parsed = parse_lesson(project.physical / relative, project.physical)
+    try:
+        data = _read_pinned_markdown(root_descriptor, relative)
+        if len(data) > SOURCE_MAX_BYTES:
+            raise UnsafePathError("source exceeds read limit")
+        text = data.decode("utf-8")
+        parsed = parse_lesson_text(relative.name, text)
+    except (UnsafePathError, UnicodeDecodeError, ValueError) as exc:
+        raise KnowledgeSourceError(
+            logical_path,
+            "invalid lesson metadata",
+        ) from exc
     if parsed is None:
         raise KnowledgeSourceError(logical_path, "invalid lesson metadata")
     fields, _, _ = parsed
@@ -215,16 +282,13 @@ def _lesson_item(
 
 def _document_item(
     project: ProjectDirectory,
+    root_descriptor: int,
     relative: Path,
     kind: str,
 ) -> dict[str, object]:
     logical_path = _logical_source_path(project, relative)
     try:
-        data = read_regular_file_beneath(
-            project.physical,
-            relative,
-            SOURCE_MAX_BYTES,
-        )
+        data = _read_pinned_markdown(root_descriptor, relative)
         if len(data) > SOURCE_MAX_BYTES:
             raise UnsafePathError("source exceeds read limit")
         text = data.decode("utf-8")
@@ -252,9 +316,18 @@ def _document_item(
     }
 
 
-def _symlink_points_to_directory(path: Path) -> bool:
+def _symlink_points_to_directory(
+    parent_descriptor: int,
+    name: str,
+) -> bool:
     try:
-        return path.is_dir()
+        return stat.S_ISDIR(
+            os.stat(
+                name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=True,
+            ).st_mode
+        )
     except OSError:
         return False
 
@@ -263,12 +336,13 @@ def _markdown_files(
     project: ProjectDirectory,
     *,
     recursive: bool,
+    root_descriptor: int,
 ) -> list[Path]:
     files = []
 
-    def scan(directory: Path, parent_relative: Path) -> None:
+    def scan(directory_descriptor: int, parent_relative: Path) -> None:
         try:
-            entries = list(directory.iterdir())
+            names = sorted(os.listdir(directory_descriptor), key=os.fsencode)
         except OSError as exc:
             raise KnowledgeSourceError(
                 _logical_source_path(project, parent_relative),
@@ -276,10 +350,23 @@ def _markdown_files(
             ) from exc
 
         selected = []
-        for entry in entries:
-            relative = parent_relative / entry.name
+        for name in names:
             try:
-                entry_info = entry.lstat()
+                name.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                if name.endswith(".md"):
+                    raise KnowledgeSourceError(
+                        _logical_source_path(project, parent_relative),
+                        "source name must be valid UTF-8",
+                    ) from exc
+                continue
+            relative = parent_relative / name
+            try:
+                entry_info = os.stat(
+                    name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
             except OSError as exc:
                 raise KnowledgeSourceError(
                     _logical_source_path(project, relative),
@@ -287,18 +374,31 @@ def _markdown_files(
                 ) from exc
 
             if stat.S_ISLNK(entry_info.st_mode):
-                if entry.suffix == ".md":
+                if relative.suffix == ".md":
                     action = "invalid-file"
-                elif _symlink_points_to_directory(entry):
+                elif _symlink_points_to_directory(directory_descriptor, name):
                     action = "invalid-directory"
                 else:
                     continue
             elif stat.S_ISDIR(entry_info.st_mode):
                 if not recursive:
                     continue
-                scan(entry, relative)
+                try:
+                    child_descriptor = open_child_directory(
+                        directory_descriptor,
+                        name,
+                    )
+                except UnsafePathError as exc:
+                    raise KnowledgeSourceError(
+                        _logical_source_path(project, relative),
+                        "cannot inspect source directory",
+                    ) from exc
+                try:
+                    scan(child_descriptor, relative)
+                finally:
+                    os.close(child_descriptor)
                 continue
-            elif entry.suffix != ".md":
+            elif relative.suffix != ".md":
                 continue
             elif not stat.S_ISREG(entry_info.st_mode):
                 action = "invalid-file"
@@ -328,7 +428,7 @@ def _markdown_files(
                 )
             files.append(relative)
 
-    scan(project.physical, Path())
+    scan(root_descriptor, Path())
     return sorted(files, key=lambda relative: _byte_key(relative.as_posix()))
 
 
@@ -375,21 +475,61 @@ def _collect_with_projects(
         items = []
         lesson_project = directories["lesson"].get(project_name)
         if lesson_project is not None:
-            for relative in _markdown_files(lesson_project, recursive=False):
-                items.append(_lesson_item(lesson_project, relative))
-            _require_projects_unchanged((lesson_project,))
+            descriptor = _open_project_directory(lesson_project)
+            try:
+                for relative in _markdown_files(
+                    lesson_project,
+                    recursive=False,
+                    root_descriptor=descriptor,
+                ):
+                    items.append(
+                        _lesson_item(lesson_project, descriptor, relative)
+                    )
+                _require_projects_unchanged((lesson_project,))
+            finally:
+                os.close(descriptor)
 
         docs_project = directories["docs"].get(project_name)
         if docs_project is not None:
-            for relative in _markdown_files(docs_project, recursive=True):
-                items.append(_document_item(docs_project, relative, "docs"))
-            _require_projects_unchanged((docs_project,))
+            descriptor = _open_project_directory(docs_project)
+            try:
+                for relative in _markdown_files(
+                    docs_project,
+                    recursive=True,
+                    root_descriptor=descriptor,
+                ):
+                    items.append(
+                        _document_item(
+                            docs_project,
+                            descriptor,
+                            relative,
+                            "docs",
+                        )
+                    )
+                _require_projects_unchanged((docs_project,))
+            finally:
+                os.close(descriptor)
 
         book_project = directories["book"].get(project_name)
         if book_project is not None:
-            for relative in _markdown_files(book_project, recursive=False):
-                items.append(_document_item(book_project, relative, "book"))
-            _require_projects_unchanged((book_project,))
+            descriptor = _open_project_directory(book_project)
+            try:
+                for relative in _markdown_files(
+                    book_project,
+                    recursive=False,
+                    root_descriptor=descriptor,
+                ):
+                    items.append(
+                        _document_item(
+                            book_project,
+                            descriptor,
+                            relative,
+                            "book",
+                        )
+                    )
+                _require_projects_unchanged((book_project,))
+            finally:
+                os.close(descriptor)
         collected[project_name] = items
     _require_projects_unchanged(snapshots)
     return collected, snapshots
@@ -496,6 +636,221 @@ def _expected_names(outputs: Mapping[str, str]) -> set[str]:
     return {project + ".md" for project in outputs}
 
 
+def _decode_recovery_record(entry: Path) -> tuple[str, bytes, int]:
+    try:
+        linked_info = entry.lstat()
+        if not stat.S_ISREG(linked_info.st_mode):
+            raise ValueError("record is not regular")
+        raw = read_regular_file_beneath(
+            entry.parent,
+            entry.name,
+            linked_info.st_size,
+        )
+        record = json.loads(raw.decode("utf-8"))
+        if (
+            not isinstance(record, dict)
+            or set(record) != {
+                "data_base64",
+                "logical_name",
+                "mode",
+                "version",
+            }
+            or record["version"] != 1
+            or not isinstance(record["logical_name"], str)
+            or not isinstance(record["data_base64"], str)
+            or not isinstance(record["mode"], int)
+            or isinstance(record["mode"], bool)
+            or record["mode"] < 0
+            or record["mode"] > 0o777
+        ):
+            raise ValueError("invalid recovery record")
+        logical_name = record["logical_name"]
+        logical = Path(logical_name)
+        if (
+            logical.name != logical_name
+            or logical.suffix != ".md"
+        ):
+            raise ValueError("invalid logical name")
+        validate_project(logical.stem, allow_global=True)
+        data = base64.b64decode(
+            record["data_base64"].encode("ascii"),
+            validate=True,
+        )
+    except (
+        OSError,
+        UnsafePathError,
+        UnicodeDecodeError,
+        UnicodeEncodeError,
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_INVALID: invalid index recovery record"
+        ) from exc
+    return logical_name, data, record["mode"]
+
+
+def _recovery_record_name_matches(entry: Path, kind: str) -> bool:
+    prefix = ".index-{}-".format(kind)
+    if not entry.name.startswith(prefix) or entry.suffix != ".json":
+        return False
+    remainder = entry.name[len(prefix) : -len(".json")]
+    parts = remainder.split("-")
+    if len(parts) != 2:
+        return False
+    digest, token = parts
+    return (
+        len(digest) == 16
+        and all(character in "0123456789abcdef" for character in digest)
+        and len(token) == 24
+        and all(character in "0123456789abcdef" for character in token)
+    )
+
+
+def _retired_artifact_is_valid(entry: Path, entries: set[str]) -> bool:
+    if entry.suffix not in (".tmp", ".name"):
+        return False
+    base = entry.with_suffix("")
+    temporary_name = base.name + ".tmp"
+    metadata_name = base.name + ".name"
+    if temporary_name not in entries or metadata_name not in entries:
+        return False
+    prefix = ".index-retired-"
+    if not base.name.startswith(prefix):
+        return False
+    remainder = base.name[len(prefix) :]
+    parts = remainder.split("-")
+    if len(parts) != 2:
+        return False
+    digest, token = parts
+    if (
+        len(digest) != 16
+        or len(token) != 24
+        or any(
+            character not in "0123456789abcdef"
+            for character in digest + token
+        )
+    ):
+        return False
+    metadata = entry.parent / metadata_name
+    try:
+        linked_info = metadata.lstat()
+        raw = read_regular_file_beneath(
+            entry.parent,
+            metadata_name,
+            linked_info.st_size,
+        )
+        logical_name = raw.decode("utf-8").removesuffix("\n")
+        if raw != (logical_name + "\n").encode("utf-8"):
+            return False
+        logical = Path(logical_name)
+        if logical.name != logical_name or logical.suffix != ".md":
+            return False
+        validate_project(logical.stem, allow_global=True)
+    except (
+        OSError,
+        UnsafePathError,
+        UnicodeDecodeError,
+        UnicodeEncodeError,
+        ValueError,
+    ):
+        return False
+    expected_digest = hashlib.sha256(
+        logical_name.encode("utf-8")
+    ).hexdigest()[:16]
+    return digest == expected_digest
+
+
+def _reconcile_index_recovery(target: Path) -> None:
+    if not target.exists() or target.is_symlink() or not target.is_dir():
+        return
+    from .render import _rename_entry_no_replace
+
+    try:
+        records = [
+            entry
+            for entry in target.iterdir()
+            if _recovery_record_name_matches(entry, "recovery")
+        ]
+    except OSError as exc:
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_INVALID: cannot inspect index recovery"
+        ) from exc
+    if not records:
+        return
+
+    directory_descriptor = open_directory_path(target)
+    try:
+        for entry in sorted(records, key=lambda path: _byte_key(path.name)):
+            logical_name, data, mode = _decode_recovery_record(entry)
+            public = target / logical_name
+            try:
+                public_info = public.lstat()
+            except FileNotFoundError:
+                try:
+                    _restore_missing_index(
+                        directory_descriptor,
+                        logical_name,
+                        data,
+                        mode,
+                    )
+                    os.fsync(directory_descriptor)
+                except FileExistsError:
+                    raise KnowledgeIndexError(
+                        "KNOWLEDGE_INDEX_RECOVERY_CONFLICT {}".format(
+                            logical_name
+                        )
+                    ) from None
+                except OSError as exc:
+                    raise KnowledgeIndexError(
+                        "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
+                        "cannot restore index recovery record"
+                    ) from exc
+            else:
+                try:
+                    current = read_regular_file_beneath(
+                        target,
+                        logical_name,
+                        public_info.st_size,
+                    )
+                except (OSError, UnsafePathError) as exc:
+                    raise KnowledgeIndexError(
+                        "KNOWLEDGE_INDEX_RECOVERY_CONFLICT {}".format(
+                            logical_name
+                        )
+                    ) from exc
+                if (
+                    current != data
+                    or stat.S_IMODE(public_info.st_mode) != mode
+                ):
+                    raise KnowledgeIndexError(
+                        "KNOWLEDGE_INDEX_RECOVERY_CONFLICT {}".format(
+                            logical_name
+                        )
+                    )
+
+            resolved_name = _recovery_name(
+                "resolved",
+                logical_name,
+                ".json",
+            )
+            try:
+                _rename_entry_no_replace(
+                    directory_descriptor,
+                    entry.name,
+                    resolved_name,
+                )
+                os.fsync(directory_descriptor)
+            except OSError as exc:
+                raise KnowledgeIndexError(
+                    "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
+                    "cannot retire index recovery record"
+                ) from exc
+    finally:
+        os.close(directory_descriptor)
+
+
 def _validate_index_directory(target: Path, expected: set[str]) -> None:
     if target.is_symlink() or (target.exists() and not target.is_dir()):
         raise KnowledgeIndexError(
@@ -509,8 +864,18 @@ def _validate_index_directory(target: Path, expected: set[str]) -> None:
         raise KnowledgeIndexError(
             "KNOWLEDGE_INDEX_INVALID {}: cannot inspect index".format(target)
         ) from exc
+    entry_names = {entry.name for entry in entries}
     for entry in entries:
-        if entry.is_symlink() or not entry.is_file() or entry.suffix != ".md":
+        if entry.is_symlink() or not entry.is_file():
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_INVALID {}: unknown index entry".format(entry)
+            )
+        if _recovery_record_name_matches(entry, "resolved"):
+            _decode_recovery_record(entry)
+            continue
+        if _retired_artifact_is_valid(entry, entry_names):
+            continue
+        if entry.suffix != ".md":
             raise KnowledgeIndexError(
                 "KNOWLEDGE_INDEX_INVALID {}: unknown index entry".format(entry)
             )
@@ -670,6 +1035,8 @@ def _prepare_index_backups(
             destination.iterdir(),
             key=lambda path: _byte_key(path.name),
         ):
+            if entry.suffix != ".md":
+                continue
             linked_info = entry.lstat()
             data = read_regular_file_beneath(
                 destination,
@@ -745,12 +1112,18 @@ def _quarantine_index_entry(
     expected_info: os.stat_result,
     *,
     restore: bool,
+    retire_owned: bool = False,
+    retired_artifacts: dict[str, tuple[str, str]] | None = None,
 ) -> _QuarantineResult:
     from .render import _rename_entry_no_replace
 
     quarantine_name = None
     for _ in range(32):
-        candidate = _recovery_name("quarantine", name, ".tmp")
+        candidate = _recovery_name(
+            "retired" if retire_owned else "quarantine",
+            name,
+            ".tmp",
+        )
         try:
             _rename_entry_no_replace(
                 directory_descriptor,
@@ -821,11 +1194,49 @@ def _quarantine_index_entry(
             "cannot inspect quarantined index"
         ) from exc
 
+    try:
+        current_quarantined_info = quarantine.lstat()
+    except OSError as exc:
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
+            "cannot recheck quarantined index"
+        ) from exc
     entry_owned = (
         quarantined_data == expected_data
         and _index_publication_revision(quarantined_info)
         == _index_publication_revision(expected_info)
+        and _index_revision(current_quarantined_info)
+        == _index_revision(quarantined_info)
     )
+    if restore and retire_owned and entry_owned:
+        metadata_name = _persist_quarantine_metadata(
+            directory_descriptor,
+            quarantine_name,
+            name,
+        )
+        try:
+            os.stat(
+                name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            if retired_artifacts is not None:
+                retired_artifacts[name] = (
+                    quarantine_name,
+                    metadata_name,
+                )
+            return _QuarantineResult.REMOVED_BY_US
+        except OSError as exc:
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
+                "cannot verify retired index"
+            ) from exc
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
+            "concurrent index preserved after retirement"
+        )
+
     if restore:
         try:
             _rename_entry_no_replace(
@@ -860,6 +1271,11 @@ def _quarantine_index_entry(
                 "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
                 "cannot persist restored index"
             ) from exc
+        if not entry_owned:
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
+                "changed quarantined index was preserved"
+            )
         return _QuarantineResult.RESTORED
 
     _persist_quarantine_metadata(
@@ -933,6 +1349,7 @@ def _rollback_index_namespace(
     backups: Mapping[str, tuple[bytes, int, os.stat_result]],
     published: Mapping[str, tuple[bytes, os.stat_result]],
     deleted: set[str],
+    retired_artifacts: Mapping[str, tuple[str, str]],
 ) -> None:
     try:
         directory_descriptor = open_directory_path(destination)
@@ -997,6 +1414,12 @@ def _rollback_index_namespace(
                     previous_data,
                     previous_mode,
                 )
+                artifact_names = retired_artifacts.get(name)
+                if artifact_names is not None:
+                    _cleanup_index_temporaries(
+                        str(destination / artifact_name)
+                        for artifact_name in artifact_names
+                    )
             except OSError:
                 failures.append("stale entry restore failed")
                 try:
@@ -1036,6 +1459,7 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
     normalized = _normalized_outputs(built)
     destination = Path(target) if target is not None else index_dir()
     expected = _expected_names(normalized)
+    _reconcile_index_recovery(destination)
     _validate_index_directory(destination, expected)
     try:
         destination.mkdir(parents=True, exist_ok=True)
@@ -1045,14 +1469,22 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
                 destination
             )
         ) from exc
+    _reconcile_index_recovery(destination)
     _validate_index_directory(destination, expected)
 
     backups = _prepare_index_backups(destination)
     prepared: dict[str, str | None] = {}
     published: dict[str, tuple[bytes, os.stat_result]] = {}
     deleted = set()
+    retired_artifacts: dict[str, tuple[str, str]] = {}
     try:
         for project, text in normalized.items():
+            name = project + ".md"
+            encoded = text.encode("utf-8")
+            backup = backups.get(name)
+            if backup is not None and backup[0] == encoded:
+                prepared[project] = None
+                continue
             descriptor = None
             try:
                 descriptor, temporary = tempfile.mkstemp(
@@ -1120,6 +1552,8 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
                         stale_data,
                         stale_info,
                         restore=True,
+                        retire_owned=True,
+                        retired_artifacts=retired_artifacts,
                     )
                     if quarantine_result is _QuarantineResult.MISSING:
                         continue
@@ -1143,6 +1577,7 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
                 backups,
                 published,
                 deleted,
+                retired_artifacts,
             )
             raise
     finally:
