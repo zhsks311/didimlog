@@ -10,9 +10,17 @@ import secrets
 import stat
 import sys
 
+from didimlog.file_io import open_directory_path
 from didimlog.locking import path_lock
 from .lesson import SLUG, parse_lesson_text
-from .paths import lessons_dir, resolve_project
+from .paths import (
+    ProjectDirectory,
+    ProjectDirectoryError,
+    lessons_dir,
+    project_directory_unchanged,
+    resolve_project,
+    resolve_project_directory,
+)
 
 
 MAX_INPUT_BYTES = 64 * 1024
@@ -107,38 +115,101 @@ def _open_real_directory(path: Path, message: str) -> int:
     return descriptor
 
 
-def _open_project_directory(base_descriptor: int, project: str) -> int:
+def _open_project_directory(
+    base: Path,
+    base_descriptor: int,
+    project: str,
+) -> tuple[int, ProjectDirectory]:
+    message = "project lessons directory must be a real directory"
     try:
-        os.mkdir(project, 0o700, dir_fd=base_descriptor)
-    except FileExistsError:
-        pass
-    except OSError as error:
-        raise LessonError("unable to create project lessons directory") from error
+        resolved = resolve_project_directory(base, project)
+    except ProjectDirectoryError as error:
+        raise LessonInvalid(message) from error
+
+    if resolved is None:
+        try:
+            os.mkdir(project, 0o700, dir_fd=base_descriptor)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise LessonError(
+                "unable to create project lessons directory"
+            ) from error
+        try:
+            resolved = resolve_project_directory(base, project)
+        except ProjectDirectoryError as error:
+            raise LessonInvalid(message) from error
+        if resolved is None:
+            raise LessonInvalid(message)
+
+    if resolved.physical != resolved.logical:
+        descriptor: int | None = None
+        try:
+            linked = os.stat(
+                project,
+                dir_fd=base_descriptor,
+                follow_symlinks=False,
+            )
+            descriptor = open_directory_path(resolved.physical)
+            opened = os.fstat(descriptor)
+        except OSError as error:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise LessonInvalid(message) from error
+        opened_identity = (
+            opened.st_dev,
+            opened.st_ino,
+            stat.S_IFMT(opened.st_mode),
+        )
+        linked_identity = (
+            linked.st_dev,
+            linked.st_ino,
+            stat.S_IFMT(linked.st_mode),
+        )
+        if (
+            not stat.S_ISLNK(linked.st_mode)
+            or linked_identity != resolved.entry_identity
+            or not stat.S_ISDIR(opened.st_mode)
+            or opened_identity != resolved.target_identity
+        ):
+            os.close(descriptor)
+            raise LessonInvalid(message)
+        return descriptor, resolved
 
     flags = (
         os.O_RDONLY
         | getattr(os, "O_DIRECTORY", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
+    descriptor: int | None = None
     try:
         descriptor = os.open(project, flags, dir_fd=base_descriptor)
         opened = os.fstat(descriptor)
         linked = os.stat(project, dir_fd=base_descriptor, follow_symlinks=False)
     except OSError as error:
-        if "descriptor" in locals():
+        if descriptor is not None:
             os.close(descriptor)
-        raise LessonInvalid(
-            "project lessons directory must be a real directory"
-        ) from error
+        raise LessonInvalid(message) from error
+    opened_identity = (
+        opened.st_dev,
+        opened.st_ino,
+        stat.S_IFMT(opened.st_mode),
+    )
+    linked_identity = (
+        linked.st_dev,
+        linked.st_ino,
+        stat.S_IFMT(linked.st_mode),
+    )
     if (
         not stat.S_ISDIR(opened.st_mode)
         or stat.S_ISLNK(linked.st_mode)
-        or opened.st_dev != linked.st_dev
-        or opened.st_ino != linked.st_ino
+        or opened_identity != linked_identity
+        or linked_identity != resolved.entry_identity
+        or opened_identity != resolved.target_identity
     ):
         os.close(descriptor)
-        raise LessonInvalid("project lessons directory must be a real directory")
-    return descriptor
+        raise LessonInvalid(message)
+    return descriptor, resolved
 
 
 def _temporary_file(directory_descriptor: int) -> tuple[str, int]:
@@ -201,14 +272,24 @@ def _publish_lesson_locked(
         "lessons directory must be a real directory",
     )
     project_descriptor: int | None = None
+    project_directory: ProjectDirectory | None = None
     temporary_name: str | None = None
     temporary_descriptor: int | None = None
     try:
-        project_descriptor = _open_project_directory(base_descriptor, selected)
+        project_descriptor, project_directory = _open_project_directory(
+            base,
+            base_descriptor,
+            selected,
+        )
         temporary_name, temporary_descriptor = _temporary_file(project_descriptor)
         _write_all(temporary_descriptor, data)
         os.close(temporary_descriptor)
         temporary_descriptor = None
+        if (
+            project_directory is None
+            or not project_directory_unchanged(project_directory)
+        ):
+            raise LessonInvalid("project lessons link changed during write")
         try:
             os.link(
                 temporary_name,

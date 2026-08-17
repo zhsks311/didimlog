@@ -113,6 +113,56 @@ class LessonWritingTests(unittest.TestCase):
         self.assertIn("저장 직후 색인한다", output)
         self.assertIn("`lessons/demo-api/indexed.md`", output)
 
+
+    def test_publish_lesson_writes_through_linked_project_and_returns_logical_path(self):
+        external = self.temporary / "external-lessons"
+        external.mkdir()
+        linked = self.lessons / "demo-api"
+        linked.symlink_to(external, target_is_directory=True)
+
+        result = self.publish("linked-rule", valid_lesson())
+
+        self.assertEqual(result, Path("lessons/demo-api/linked-rule.md"))
+        self.assertTrue((external / "linked-rule.md").is_file())
+        index = self.data_root / "index" / "demo-api.md"
+        output = index.read_text(encoding="utf-8")
+        self.assertIn("lessons/demo-api/linked-rule.md", output)
+        self.assertNotIn(str(external), output)
+
+    def test_link_change_before_publish_leaves_no_lesson(self):
+        external = self.temporary / "external-lessons"
+        external.mkdir()
+        replacement = self.temporary / "replacement-lessons"
+        replacement.mkdir()
+        linked = self.lessons / "demo-api"
+        linked.symlink_to(external, target_is_directory=True)
+        index = self.data_root / "index" / "demo-api.md"
+        original_index = b"user-owned index bytes\r\n"
+        index.write_bytes(original_index)
+        original_write_all = lesson_writing._write_all
+
+        def write_and_retarget(descriptor, data):
+            original_write_all(descriptor, data)
+            linked.unlink()
+            linked.symlink_to(replacement, target_is_directory=True)
+
+        with mock.patch.object(
+            lesson_writing,
+            "_write_all",
+            side_effect=write_and_retarget,
+        ):
+            with self.assertRaisesRegex(
+                lesson_writing.LessonInvalid,
+                "^project lessons link changed during write$",
+            ):
+                self.publish("retargeted", valid_lesson())
+
+        self.assertFalse((external / "retargeted.md").exists())
+        self.assertFalse((replacement / "retargeted.md").exists())
+        self.assertEqual(list(external.glob(".lesson-*.tmp")), [])
+        self.assertEqual(list(replacement.glob(".lesson-*.tmp")), [])
+        self.assertEqual(index.read_bytes(), original_index)
+
     def test_explicit_global_project_is_supported_but_invalid_project_is_rejected(self):
         relative = self.publish(
             "global-rule",
@@ -263,7 +313,7 @@ class LessonWritingTests(unittest.TestCase):
         self.assertEqual(stored.read_bytes(), canonical.encode("utf-8"))
         self.assertNotIn(b"\r", stored.read_bytes())
 
-    def test_lessons_root_and_project_source_symlinks_are_rejected(self):
+    def test_lessons_root_symlink_is_rejected(self):
         outside_root = self.temporary / "outside-root"
         outside_root.mkdir()
         linked_root = self.temporary / "linked-lessons"
@@ -275,16 +325,6 @@ class LessonWritingTests(unittest.TestCase):
         with self.assertRaises(lesson_writing.LessonInvalid):
             self.publish("root-link", valid_lesson(), root=linked_root)
         self.assertEqual(list(outside_root.iterdir()), [])
-
-        outside_project = self.temporary / "outside-project"
-        outside_project.mkdir()
-        (self.lessons / "demo-api").symlink_to(
-            outside_project,
-            target_is_directory=True,
-        )
-        with self.assertRaises(lesson_writing.LessonInvalid):
-            self.publish("project-link", valid_lesson())
-        self.assertEqual(list(outside_project.iterdir()), [])
 
     def test_existing_lesson_collision_preserves_every_existing_byte(self):
         project = self.lessons / "demo-api"
