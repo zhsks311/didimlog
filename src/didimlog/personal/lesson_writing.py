@@ -502,8 +502,12 @@ def _publish_lesson_locked(
         if not publication_unchanged:
             raise LessonInvalid("project lessons link changed during write")
         if recovery_name is not None:
-            os.unlink(recovery_name, dir_fd=project_descriptor)
-            recovery_name = None
+            try:
+                os.unlink(recovery_name, dir_fd=project_descriptor)
+            except OSError:
+                pass
+            else:
+                recovery_name = None
         os.close(temporary_descriptor)
         temporary_descriptor = None
         os.unlink(temporary_name, dir_fd=project_descriptor)

@@ -265,6 +265,48 @@ class LessonWritingTests(unittest.TestCase):
         self.assertEqual(list(replacement.glob(".lesson-*.tmp")), [])
         self.assertEqual(index.read_bytes(), original_index)
 
+    def test_recovery_cleanup_error_retries_and_keeps_publish_successful(self):
+        external = self.temporary / "external-lessons"
+        external.mkdir()
+        linked = self.lessons / "demo-api"
+        linked.symlink_to(external, target_is_directory=True)
+        original_unlink = os.unlink
+        cleanup_failed_once = False
+
+        def fail_first_recovery_cleanup(path, *args, **kwargs):
+            nonlocal cleanup_failed_once
+            if (
+                not cleanup_failed_once
+                and str(path).startswith(".lesson-")
+                and str(path).endswith(".tmp")
+            ):
+                cleanup_failed_once = True
+                raise OSError(errno.EIO, "temporary cleanup failed")
+            return original_unlink(path, *args, **kwargs)
+
+        errors = io.StringIO()
+        with mock.patch.object(
+            lesson_writing.os,
+            "unlink",
+            side_effect=fail_first_recovery_cleanup,
+        ), contextlib.redirect_stderr(errors):
+            result = self.publish("cleanup-retry", valid_lesson())
+
+        self.assertTrue(cleanup_failed_once)
+        self.assertEqual(
+            result,
+            Path("lessons/demo-api/cleanup-retry.md"),
+        )
+        published = external / "cleanup-retry.md"
+        self.assertEqual(published.read_bytes(), valid_lesson().encode("utf-8"))
+        index = self.data_root / "index" / "demo-api.md"
+        self.assertIn(
+            "lessons/demo-api/cleanup-retry.md",
+            index.read_text(encoding="utf-8"),
+        )
+        self.assertEqual(list(external.glob(".lesson-*.tmp")), [])
+        self.assertEqual(errors.getvalue(), "")
+
     def test_concurrent_in_place_change_after_publish_is_preserved(self):
         external = self.temporary / "external-lessons"
         external.mkdir()
