@@ -841,6 +841,85 @@ body
         self.assertEqual(len(recovery), 1)
         self.assertEqual(recovery[0].read_bytes(), b"")
 
+    def test_rollback_cleanup_failure_does_not_skip_later_existing_index(self):
+        target = self.root / "index"
+        later = target / "z-project.md"
+        later.write_bytes(b"later previous bytes\r\n")
+        outputs = {
+            "a-project": GENERATED_NOTICE + "\n# a\n",
+            "z-project": GENERATED_NOTICE + "\n# z\n",
+        }
+
+        with mock.patch.object(
+            knowledge_index,
+            "_require_projects_unchanged",
+            side_effect=[
+                None,
+                knowledge_index.KnowledgeIndexError(
+                    "forced publish invalidation"
+                ),
+            ],
+        ), self.assertRaisesRegex(
+            knowledge_index.KnowledgeIndexError,
+            "KNOWLEDGE_INDEX_ROLLBACK_FAILED",
+        ) as caught:
+            knowledge_index.write_all(
+                outputs=outputs,
+                data_root=self.root,
+                target=target,
+            )
+
+        self.assertNotIn(str(self.temporary), str(caught.exception))
+        self.assertFalse((target / "a-project.md").exists())
+        self.assertEqual(later.read_bytes(), b"later previous bytes\r\n")
+        recovery = [
+            entry
+            for entry in target.iterdir()
+            if entry.name.startswith(".index-quarantine-")
+        ]
+        self.assertEqual(len(recovery), 1)
+        self.assertEqual(recovery[0].read_bytes(), b"")
+
+    def test_rollback_cleanup_failure_does_not_skip_later_absent_index(self):
+        target = self.root / "index"
+        outputs = {
+            "a-project": GENERATED_NOTICE + "\n# a\n",
+            "z-project": GENERATED_NOTICE + "\n# z\n",
+        }
+
+        with mock.patch.object(
+            knowledge_index,
+            "_require_projects_unchanged",
+            side_effect=[
+                None,
+                knowledge_index.KnowledgeIndexError(
+                    "forced publish invalidation"
+                ),
+            ],
+        ), self.assertRaisesRegex(
+            knowledge_index.KnowledgeIndexError,
+            "KNOWLEDGE_INDEX_ROLLBACK_FAILED",
+        ) as caught:
+            knowledge_index.write_all(
+                outputs=outputs,
+                data_root=self.root,
+                target=target,
+            )
+
+        self.assertNotIn(str(self.temporary), str(caught.exception))
+        self.assertFalse((target / "a-project.md").exists())
+        self.assertFalse((target / "z-project.md").exists())
+        recovery = [
+            entry
+            for entry in target.iterdir()
+            if entry.name.startswith(".index-quarantine-")
+        ]
+        self.assertEqual(len(recovery), 2)
+        self.assertEqual(
+            [entry.read_bytes() for entry in recovery],
+            [b"", b""],
+        )
+
     def test_stale_index_removal_preserves_concurrent_writer(self):
         self.write("lessons/demo-api/rule.md", LESSON)
         target = self.root / "index"

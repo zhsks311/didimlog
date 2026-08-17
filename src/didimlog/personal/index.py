@@ -761,20 +761,29 @@ def _rollback_index_namespace(
 ) -> None:
     try:
         directory_descriptor = open_directory_path(destination)
-    except UnsafePathError:
-        return
+    except UnsafePathError as exc:
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
+            "cannot access index namespace"
+        ) from exc
+
+    failures = []
     try:
         for name, (published_data, published_info) in published.items():
             backup = backups.get(name)
             if backup is None:
-                _unlink_published_index_if_unchanged(
-                    directory_descriptor,
-                    destination,
-                    name,
-                    published_data,
-                    published_info,
-                )
+                try:
+                    _unlink_published_index_if_unchanged(
+                        directory_descriptor,
+                        destination,
+                        name,
+                        published_data,
+                        published_info,
+                    )
+                except (KnowledgeIndexError, OSError):
+                    failures.append("published entry cleanup failed")
                 continue
+
             _, previous_data, previous_mode, _ = backup
             try:
                 replace_regular_file_at_if_unchanged_with_info(
@@ -785,8 +794,8 @@ def _rollback_index_namespace(
                     previous_mode,
                     expected_info=published_info,
                 )
-            except UnsafePathError:
-                pass
+            except (KnowledgeIndexError, OSError):
+                failures.append("published entry restore failed")
 
         for name in deleted:
             backup = backups.get(name)
@@ -800,13 +809,23 @@ def _rollback_index_namespace(
                     follow_symlinks=False,
                 )
             except OSError:
-                pass
+                failures.append("stale entry restore failed")
+
         try:
             os.fsync(directory_descriptor)
         except OSError:
-            pass
+            failures.append("namespace persistence failed")
     finally:
         os.close(directory_descriptor)
+
+    if failures:
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_ROLLBACK_FAILED: {}; "
+            "{} rollback operation(s) require recovery".format(
+                failures[0],
+                len(failures),
+            )
+        )
 
 
 def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
