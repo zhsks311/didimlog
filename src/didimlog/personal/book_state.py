@@ -243,17 +243,32 @@ def _mark_booked_locked(values, directory: ProjectDirectory):
                     skipped.append(slug)
                     continue
                 replacement = _booked_bytes(data, parsed)
-                if (
-                    replacement != data
-                    and not file_io.replace_regular_file_at_if_unchanged(
-                        descriptor,
-                        name,
-                        data,
-                        replacement,
-                        stat.S_IMODE(entry.st_mode),
-                        expected_info=entry,
+                if replacement != data:
+                    published_info = (
+                        file_io.replace_regular_file_at_if_unchanged_with_info(
+                            descriptor,
+                            name,
+                            data,
+                            replacement,
+                            stat.S_IMODE(entry.st_mode),
+                            expected_info=entry,
+                        )
                     )
-                ):
+                    if published_info is None:
+                        skipped.append(slug)
+                        continue
+                    if not project_directory_unchanged(directory):
+                        file_io.replace_regular_file_at_if_unchanged_with_info(
+                            descriptor,
+                            name,
+                            replacement,
+                            data,
+                            stat.S_IMODE(entry.st_mode),
+                            expected_info=published_info,
+                        )
+                        skipped.append(slug)
+                        continue
+                elif not project_directory_unchanged(directory):
                     skipped.append(slug)
                     continue
             except (OSError, file_io.UnsafePathError):

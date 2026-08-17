@@ -1,6 +1,7 @@
 import errno
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -283,6 +284,135 @@ class BookStateTests(unittest.TestCase):
 
         self.assertEqual(result, {"marked": [], "skipped": ["one"]})
         self.assertEqual(external_path.read_bytes(), original)
+        self.assertEqual(replacement_path.read_bytes(), replacement_bytes)
+
+    def test_mark_booked_rolls_back_when_link_retargets_at_publish(self):
+        external = self.temporary_root / "external-lessons"
+        external.mkdir()
+        original = lesson_bytes(title="검증된 원본")
+        external_path = external / "one.md"
+        external_path.write_bytes(original)
+        replacement = self.temporary_root / "replacement-lessons"
+        external_path.chmod(0o640)
+        replacement.mkdir()
+        replacement_bytes = lesson_bytes(topic="jpa", title="교체 대상")
+        replacement_path = replacement / "one.md"
+        replacement_path.write_bytes(replacement_bytes)
+        logical = self.lessons_root / "app"
+        logical.rmdir()
+        logical.symlink_to(external, target_is_directory=True)
+        real_publish = file_io.replace_regular_file_at_if_unchanged_with_ownership
+        publish_calls = 0
+
+        def publish_and_retarget(*args, **kwargs):
+            nonlocal publish_calls
+            publication = real_publish(*args, **kwargs)
+            publish_calls += 1
+            if publish_calls == 1 and publication is not None:
+                logical.unlink()
+                logical.symlink_to(replacement, target_is_directory=True)
+            return publication
+
+        with mock.patch.object(
+            file_io,
+            "replace_regular_file_at_if_unchanged_with_ownership",
+            side_effect=publish_and_retarget,
+        ):
+            result = book_state.mark_booked(
+                ["one"],
+                project="app",
+                root=self.lessons_root,
+            )
+
+        self.assertEqual(result, {"marked": [], "skipped": ["one"]})
+        self.assertEqual(external_path.read_bytes(), original)
+        self.assertEqual(stat.S_IMODE(external_path.stat().st_mode), 0o640)
+        self.assertEqual(replacement_path.read_bytes(), replacement_bytes)
+
+    def test_mark_booked_preserves_concurrent_change_after_publish_retarget(self):
+        external = self.temporary_root / "external-lessons"
+        external.mkdir()
+        original = lesson_bytes(title="검증된 원본")
+        external_path = external / "one.md"
+        external_path.write_bytes(original)
+        replacement = self.temporary_root / "replacement-lessons"
+        replacement.mkdir()
+        replacement_bytes = lesson_bytes(topic="jpa", title="교체 대상")
+        replacement_path = replacement / "one.md"
+        replacement_path.write_bytes(replacement_bytes)
+        concurrent = lesson_bytes(title="사용자 최신 변경")
+        logical = self.lessons_root / "app"
+        logical.rmdir()
+        logical.symlink_to(external, target_is_directory=True)
+        real_publish = file_io.replace_regular_file_at_if_unchanged_with_ownership
+        publish_calls = 0
+
+        def publish_retarget_and_save(*args, **kwargs):
+            nonlocal publish_calls
+            publication = real_publish(*args, **kwargs)
+            publish_calls += 1
+            if publish_calls == 1 and publication is not None:
+                logical.unlink()
+                logical.symlink_to(replacement, target_is_directory=True)
+                external_path.write_bytes(concurrent)
+            return publication
+
+        with mock.patch.object(
+            file_io,
+            "replace_regular_file_at_if_unchanged_with_ownership",
+            side_effect=publish_retarget_and_save,
+        ):
+            result = book_state.mark_booked(
+                ["one"],
+                project="app",
+                root=self.lessons_root,
+            )
+
+        self.assertEqual(result, {"marked": [], "skipped": ["one"]})
+        self.assertEqual(external_path.read_bytes(), concurrent)
+        self.assertEqual(replacement_path.read_bytes(), replacement_bytes)
+
+    def test_mark_booked_skips_when_retarget_rollback_fails(self):
+        external = self.temporary_root / "external-lessons"
+        external.mkdir()
+        original = lesson_bytes(title="검증된 원본")
+        external_path = external / "one.md"
+        external_path.write_bytes(original)
+        replacement = self.temporary_root / "replacement-lessons"
+        replacement.mkdir()
+        replacement_bytes = lesson_bytes(topic="jpa", title="교체 대상")
+        replacement_path = replacement / "one.md"
+        replacement_path.write_bytes(replacement_bytes)
+        logical = self.lessons_root / "app"
+        logical.rmdir()
+        logical.symlink_to(external, target_is_directory=True)
+        real_publish = file_io.replace_regular_file_at_if_unchanged_with_ownership
+        publish_calls = 0
+
+        def publish_then_fail_rollback(*args, **kwargs):
+            nonlocal publish_calls
+            publish_calls += 1
+            if publish_calls == 2:
+                return None
+            publication = real_publish(*args, **kwargs)
+            if publication is not None:
+                logical.unlink()
+                logical.symlink_to(replacement, target_is_directory=True)
+            return publication
+
+        with mock.patch.object(
+            file_io,
+            "replace_regular_file_at_if_unchanged_with_ownership",
+            side_effect=publish_then_fail_rollback,
+        ):
+            result = book_state.mark_booked(
+                ["one"],
+                project="app",
+                root=self.lessons_root,
+            )
+
+        self.assertEqual(result, {"marked": [], "skipped": ["one"]})
+        self.assertIn(b"booked: [kafka]", external_path.read_bytes())
         self.assertEqual(replacement_path.read_bytes(), replacement_bytes)
 
     def test_mark_booked_inserts_one_field_and_is_idempotent(self):
