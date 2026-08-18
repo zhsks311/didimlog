@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.0.4] - 2026-08-18
+
 ### 수정
 
 - 배포 산출물 폴더에 `uv`가 만드는 `.gitignore`를 패키지 파일로 잘못 세어 배포가 중단되던 문제를 고쳤습니다. 실패한 배포는 유효한 `main` merge commit SHA를 지정해 같은 버전으로 안전하게 다시 실행할 수 있습니다.
@@ -49,7 +51,8 @@
 - macOS·Linux 및 Python 3.11~3.14 지원 계약.
 
 
-[Unreleased]: https://github.com/zhsks311/didimlog/compare/v0.0.3...HEAD
+[Unreleased]: https://github.com/zhsks311/didimlog/compare/v0.0.4...HEAD
+[0.0.4]: https://github.com/zhsks311/didimlog/releases/tag/v0.0.4
 [0.0.3]: https://github.com/zhsks311/didimlog/releases/tag/v0.0.3
 [0.0.2]: https://github.com/zhsks311/didimlog/releases/tag/v0.0.2
 [0.0.1]: https://github.com/zhsks311/didimlog/releases/tag/v0.0.1
