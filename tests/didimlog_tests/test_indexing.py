@@ -242,38 +242,34 @@ class IndexServiceTests(unittest.TestCase):
         self.assertEqual(result.personal, "개인 지식: PERSONAL_INDEX_EXTRA")
         self.assertEqual(extra.read_bytes(), b"user bytes\n")
 
-    def test_check_ignores_valid_retired_personal_index_history(self):
-        external = self.root / "external-project"
-        external.mkdir()
-        lesson = external / "rule.md"
-        lesson.write_text(LESSON, encoding="utf-8", newline="")
-        project_link = (
-            self.home / "knowledge" / "lessons" / "demo-project"
-        )
-        project_link.parent.mkdir(parents=True)
-        project_link.symlink_to(external, target_is_directory=True)
-
-        run_index(check=False, home=self.home, cwd=self.cwd)
-        project_link.unlink()
+    def test_check_reads_valid_retired_personal_index_history_without_mutation(self):
+        self._write_lesson()
         run_index(check=False, home=self.home, cwd=self.cwd)
         index_directory = self.home / "knowledge" / "index"
-        history_before = {
-            entry.name: entry.read_bytes()
-            for entry in index_directory.iterdir()
-            if entry.name.startswith(".index-retired-")
+        logical_name = "_global.md"
+        generated_bytes = (index_directory / logical_name).read_bytes()
+        logical_name_digest = hashlib.sha256(
+            logical_name.encode("utf-8")
+        ).hexdigest()[:16]
+        retired_base = (
+            f".index-retired-{logical_name_digest}-"
+            "0123456789abcdef01234567"
+        )
+        retired_files = {
+            index_directory / f"{retired_base}.tmp": generated_bytes,
+            index_directory / f"{retired_base}.name": (
+                logical_name + "\n"
+            ).encode("utf-8"),
         }
+        for path, data in retired_files.items():
+            path.write_bytes(data)
 
         result = run_index(check=True, home=self.home, cwd=self.cwd)
 
         self.assertEqual(result.personal_token, "PERSONAL_INDEX_CURRENT")
-        self.assertTrue(history_before)
         self.assertEqual(
-            {
-                entry.name: entry.read_bytes()
-                for entry in index_directory.iterdir()
-                if entry.name.startswith(".index-retired-")
-            },
-            history_before,
+            {path: path.read_bytes() for path in retired_files},
+            retired_files,
         )
 
     def test_check_rejects_pathname_swap_after_namespace_validation(self):

@@ -179,7 +179,7 @@ def _create_temporary_file_at(
     raise UnsafePathError("unable to allocate temporary file")
 
 
-def _write_all_and_sync(descriptor: int, data: bytes) -> None:
+def write_all_and_sync(descriptor: int, data: bytes) -> None:
     remaining = memoryview(data)
     while remaining:
         written = os.write(descriptor, remaining)
@@ -300,7 +300,7 @@ def _replace_regular_file_at_if_unchanged(
             ".didim-replacement-",
             mode,
         )
-        _write_all_and_sync(temporary_descriptor, replacement)
+        write_all_and_sync(temporary_descriptor, replacement)
         os.fchmod(temporary_descriptor, mode)
         os.fsync(temporary_descriptor)
         temporary_info = os.fstat(temporary_descriptor)

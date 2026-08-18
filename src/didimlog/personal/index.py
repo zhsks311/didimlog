@@ -18,7 +18,8 @@ from didimlog.file_io import (
     open_child_directory,
     open_directory_path,
     read_regular_file_at,
-    replace_regular_file_at_if_unchanged_with_info,
+    read_regular_file_at_with_stat,
+    write_all_and_sync,
 )
 from didimlog.locking import path_lock
 
@@ -69,10 +70,6 @@ class KnowledgeSourceError(KnowledgeIndexError):
         )
 
 
-class _QuarantineResult(Enum):
-    MISSING = "missing"
-    REMOVED_BY_US = "removed-by-us"
-    RESTORED = "restored"
 
 
 def _byte_key(value: str) -> bytes:
@@ -688,63 +685,37 @@ def _expected_names(outputs: Mapping[str, str]) -> set[str]:
     return {project + ".md" for project in outputs}
 
 
-def _decode_recovery_record_at(
-    directory_descriptor: int,
-    name: str,
-) -> tuple[str, bytes, int]:
-    try:
-        linked_info = os.stat(
-            name,
-            dir_fd=directory_descriptor,
-            follow_symlinks=False,
-        )
-        if not stat.S_ISREG(linked_info.st_mode):
-            raise ValueError("record is not regular")
-        raw = read_regular_file_at(
-            directory_descriptor,
-            name,
-            linked_info.st_size,
-        )
-        record = json.loads(raw.decode("utf-8"))
-        if (
-            not isinstance(record, dict)
-            or set(record) != {
-                "data_base64",
-                "logical_name",
-                "mode",
-                "version",
-            }
-            or record["version"] != 1
-            or not isinstance(record["logical_name"], str)
-            or not isinstance(record["data_base64"], str)
-            or not isinstance(record["mode"], int)
-            or isinstance(record["mode"], bool)
-            or record["mode"] < 0
-            or record["mode"] > 0o7777
-        ):
-            raise ValueError("invalid recovery record")
-        logical_name = record["logical_name"]
-        logical = Path(logical_name)
-        if logical.name != logical_name or logical.suffix != ".md":
-            raise ValueError("invalid logical name")
-        validate_project(logical.stem, allow_global=True)
-        data = base64.b64decode(
-            record["data_base64"].encode("ascii"),
-            validate=True,
-        )
-    except (
-        OSError,
-        UnsafePathError,
-        UnicodeDecodeError,
-        UnicodeEncodeError,
-        ValueError,
-        TypeError,
-        json.JSONDecodeError,
-    ) as exc:
-        raise KnowledgeIndexError(
-            "KNOWLEDGE_INDEX_INVALID: invalid index recovery record"
-        ) from exc
+def _decode_recovery_record_bytes(raw: bytes) -> tuple[str, bytes, int]:
+    record = json.loads(raw.decode("utf-8"))
+    if (
+        not isinstance(record, dict)
+        or set(record) != {
+            "data_base64",
+            "logical_name",
+            "mode",
+            "version",
+        }
+        or record["version"] != 1
+        or not isinstance(record["logical_name"], str)
+        or not isinstance(record["data_base64"], str)
+        or not isinstance(record["mode"], int)
+        or isinstance(record["mode"], bool)
+        or record["mode"] < 0
+        or record["mode"] > 0o7777
+    ):
+        raise ValueError("invalid recovery record")
+    logical_name = record["logical_name"]
+    logical = Path(logical_name)
+    if logical.name != logical_name or logical.suffix != ".md":
+        raise ValueError("invalid logical name")
+    validate_project(logical.stem, allow_global=True)
+    data = base64.b64decode(
+        record["data_base64"].encode("ascii"),
+        validate=True,
+    )
     return logical_name, data, record["mode"]
+
+
 
 
 def _recovery_record_name_matches(name: str, kind: str) -> bool:
@@ -763,11 +734,72 @@ def _recovery_record_name_matches(name: str, kind: str) -> bool:
         and all(character in "0123456789abcdef" for character in token)
     )
 
+def _decode_named_recovery_record_bytes(
+    raw: bytes,
+    name: str,
+    kind: str,
+) -> tuple[str, bytes, int]:
+    try:
+        logical_name, data, mode = _decode_recovery_record_bytes(raw)
+    except (
+        UnicodeDecodeError,
+        UnicodeEncodeError,
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_INVALID: invalid index recovery record"
+        ) from exc
+    digest = hashlib.sha256(logical_name.encode("utf-8")).hexdigest()[:16]
+    if not name.startswith(".index-{}-{}-".format(kind, digest)):
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_INVALID: invalid index recovery record"
+        )
+    return logical_name, data, mode
 
-def _retired_artifact_is_valid_at(
+
+
+
+def _legacy_artifact_snapshot_at(
     directory_descriptor: int,
     name: str,
+) -> tuple[bytes, tuple[int, ...]] | None:
+    try:
+        linked_info = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISREG(linked_info.st_mode):
+            return None
+        data, opened_info = read_regular_file_at_with_stat(
+            directory_descriptor,
+            name,
+            linked_info.st_size,
+        )
+        current_info = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except (OSError, UnsafePathError):
+        return None
+    opened_revision = _index_publication_revision(opened_info)
+    if (
+        len(data) != opened_info.st_size
+        or not stat.S_ISREG(current_info.st_mode)
+        or _index_publication_revision(current_info) != opened_revision
+    ):
+        return None
+    return data, opened_revision
+
+
+def _paired_recovery_artifact_is_valid(
+    name: str,
     entries: set[str],
+    kind: str,
+    snapshots: Mapping[str, tuple[bytes, tuple[int, ...]]],
 ) -> bool:
     suffix = Path(name).suffix
     if suffix not in (".tmp", ".name"):
@@ -775,13 +807,17 @@ def _retired_artifact_is_valid_at(
     base_name = name.removesuffix(suffix)
     temporary_name = base_name + ".tmp"
     metadata_name = base_name + ".name"
-    if temporary_name not in entries or metadata_name not in entries:
+    if (
+        temporary_name not in entries
+        or metadata_name not in entries
+        or temporary_name not in snapshots
+        or metadata_name not in snapshots
+    ):
         return False
-    prefix = ".index-retired-"
+    prefix = ".index-{}-".format(kind)
     if not base_name.startswith(prefix):
         return False
-    remainder = base_name[len(prefix) :]
-    parts = remainder.split("-")
+    parts = base_name[len(prefix) :].split("-")
     if len(parts) != 2:
         return False
     digest, token = parts
@@ -795,18 +831,7 @@ def _retired_artifact_is_valid_at(
     ):
         return False
     try:
-        linked_info = os.stat(
-            metadata_name,
-            dir_fd=directory_descriptor,
-            follow_symlinks=False,
-        )
-        if not stat.S_ISREG(linked_info.st_mode):
-            return False
-        raw = read_regular_file_at(
-            directory_descriptor,
-            metadata_name,
-            linked_info.st_size,
-        )
+        raw = snapshots[metadata_name][0]
         logical_name = raw.decode("utf-8").removesuffix("\n")
         if raw != (logical_name + "\n").encode("utf-8"):
             return False
@@ -814,110 +839,118 @@ def _retired_artifact_is_valid_at(
         if logical.name != logical_name or logical.suffix != ".md":
             return False
         validate_project(logical.stem, allow_global=True)
-    except (
-        OSError,
-        UnsafePathError,
-        UnicodeDecodeError,
-        UnicodeEncodeError,
-        ValueError,
-    ):
+    except (UnicodeDecodeError, UnicodeEncodeError, ValueError):
         return False
+    data = snapshots[temporary_name][0]
     expected_digest = hashlib.sha256(
         logical_name.encode("utf-8")
     ).hexdigest()[:16]
-    return digest == expected_digest
+    generated_prefix = (GENERATED_NOTICE + "\n").encode("utf-8")
+    content_is_owned = data.startswith(generated_prefix) or (
+        kind == "quarantine" and data == b""
+    )
+    return digest == expected_digest and content_is_owned
 
 
-def _reconcile_index_recovery(directory_descriptor: int) -> None:
-    from .render import _rename_entry_no_replace
-
-    try:
-        records = [
-            name
-            for name in os.listdir(directory_descriptor)
-            if _recovery_record_name_matches(name, "recovery")
-        ]
-    except OSError as exc:
-        raise KnowledgeIndexError(
-            "KNOWLEDGE_INDEX_INVALID: cannot inspect index recovery"
-        ) from exc
-
-    for name in sorted(records, key=_byte_key):
-        logical_name, data, mode = _decode_recovery_record_at(
-            directory_descriptor,
-            name,
+def _generated_temporary_name_matches(name: str) -> bool:
+    return (
+        name.startswith(".index-")
+        and name.endswith(".tmp")
+        and len(name) == len(".index-") + 24 + len(".tmp")
+        and all(
+            character in "0123456789abcdef"
+            for character in name[len(".index-") : -len(".tmp")]
         )
-        try:
-            public_info = os.stat(
-                logical_name,
-                dir_fd=directory_descriptor,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            try:
-                _restore_missing_index(
-                    directory_descriptor,
-                    logical_name,
-                    data,
-                    mode,
-                )
-                os.fsync(directory_descriptor)
-            except FileExistsError:
-                raise KnowledgeIndexError(
-                    "KNOWLEDGE_INDEX_RECOVERY_CONFLICT {}".format(
-                        logical_name
-                    )
-                ) from None
-            except OSError as exc:
-                raise KnowledgeIndexError(
-                    "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-                    "cannot restore index recovery record"
-                ) from exc
-        else:
-            try:
-                current = read_regular_file_at(
-                    directory_descriptor,
-                    logical_name,
-                    public_info.st_size,
-                )
-            except (OSError, UnsafePathError) as exc:
-                raise KnowledgeIndexError(
-                    "KNOWLEDGE_INDEX_RECOVERY_CONFLICT {}".format(
-                        logical_name
-                    )
-                ) from exc
-            if (
-                current != data
-                or stat.S_IMODE(public_info.st_mode) != mode
-            ):
-                raise KnowledgeIndexError(
-                    "KNOWLEDGE_INDEX_RECOVERY_CONFLICT {}".format(
-                        logical_name
-                    )
-                )
+    )
 
-        resolved_name = _recovery_name(
-            "resolved",
-            logical_name,
-            ".json",
+
+def _legacy_index_artifacts_at(
+    directory_descriptor: int,
+    entries: set[str],
+) -> dict[str, tuple[bytes, tuple[int, ...]]]:
+    recovery_kinds = ("recovery", "resolved")
+    candidate_names = {
+        name
+        for name in entries
+        if any(
+            _recovery_record_name_matches(name, kind)
+            for kind in recovery_kinds
         )
-        try:
-            _rename_entry_no_replace(
+        or _generated_temporary_name_matches(name)
+        or any(
+            name.startswith(".index-{}-".format(kind))
+            and Path(name).suffix in (".tmp", ".name")
+            for kind in ("retired", "quarantine")
+        )
+    }
+    snapshots = {
+        name: snapshot
+        for name in candidate_names
+        if (
+            snapshot := _legacy_artifact_snapshot_at(
                 directory_descriptor,
                 name,
-                resolved_name,
             )
-            os.fsync(directory_descriptor)
-        except OSError as exc:
-            raise KnowledgeIndexError(
-                "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-                "cannot retire index recovery record"
-            ) from exc
+        )
+        is not None
+    }
+    artifacts = {}
+    generated_prefix = (GENERATED_NOTICE + "\n").encode("utf-8")
+    for name in entries:
+        recovery_kind = next(
+            (
+                kind
+                for kind in recovery_kinds
+                if _recovery_record_name_matches(name, kind)
+            ),
+            None,
+        )
+        if recovery_kind is not None:
+            snapshot = snapshots.get(name)
+            if snapshot is None:
+                continue
+            _, data, _ = _decode_named_recovery_record_bytes(
+                snapshot[0],
+                name,
+                recovery_kind,
+            )
+            if data.startswith(generated_prefix):
+                artifacts[name] = snapshot
+            continue
+        if any(
+            _paired_recovery_artifact_is_valid(
+                name,
+                entries,
+                kind,
+                snapshots,
+            )
+            for kind in ("retired", "quarantine")
+        ):
+            artifacts[name] = snapshots[name]
+            continue
+        if _generated_temporary_name_matches(name):
+            snapshot = snapshots.get(name)
+            if snapshot is not None and snapshot[0].startswith(
+                generated_prefix
+            ):
+                artifacts[name] = snapshot
+    return artifacts
+
+
 
 
 def _validate_index_directory(
     directory_descriptor: int,
     expected: set[str],
+    *,
+    cleanup_artifacts: dict[
+        str,
+        tuple[bytes, tuple[int, ...]],
+    ] | None = None,
+    stale_snapshots: dict[
+        str,
+        tuple[bytes, tuple[int, ...]],
+    ] | None = None,
 ) -> set[str]:
     try:
         names = tuple(os.listdir(directory_descriptor))
@@ -926,6 +959,12 @@ def _validate_index_directory(
             "KNOWLEDGE_INDEX_INVALID: cannot inspect index"
         ) from exc
     entry_names = set(names)
+    legacy_artifacts = _legacy_index_artifacts_at(
+        directory_descriptor,
+        entry_names,
+    )
+    if cleanup_artifacts is not None:
+        cleanup_artifacts.update(legacy_artifacts)
     for name in names:
         try:
             entry_info = os.stat(
@@ -938,20 +977,7 @@ def _validate_index_directory(
                 "KNOWLEDGE_INDEX_INVALID {}: "
                 "cannot inspect index entry".format(name)
             ) from exc
-        if stat.S_ISLNK(entry_info.st_mode) or not stat.S_ISREG(
-            entry_info.st_mode
-        ):
-            raise KnowledgeIndexError(
-                "KNOWLEDGE_INDEX_INVALID {}: unknown index entry".format(name)
-            )
-        if _recovery_record_name_matches(name, "resolved"):
-            _decode_recovery_record_at(directory_descriptor, name)
-            continue
-        if _retired_artifact_is_valid_at(
-            directory_descriptor,
-            name,
-            entry_names,
-        ):
+        if name in legacy_artifacts:
             continue
         entry = Path(name)
         if entry.suffix != ".md":
@@ -959,21 +985,32 @@ def _validate_index_directory(
                 "KNOWLEDGE_INDEX_INVALID {}: unknown index entry".format(name)
             )
         if name in expected:
-            continue
+            if stat.S_ISREG(entry_info.st_mode) or stat.S_ISLNK(
+                entry_info.st_mode
+            ):
+                continue
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_INVALID {}: unknown index entry".format(name)
+            )
+        if not stat.S_ISREG(entry_info.st_mode):
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_INVALID {}: unknown index entry".format(name)
+            )
         try:
             validate_project(entry.stem, allow_global=True)
-            notice_limit = len(GENERATED_NOTICE.encode("utf-8")) + 2
-            data = read_regular_file_at(
+            snapshot = _legacy_artifact_snapshot_at(
                 directory_descriptor,
                 name,
-                notice_limit,
             )
+            if snapshot is None:
+                raise ValueError("index changed during inspection")
             first_line = (
-                data.decode("utf-8")
+                snapshot[0]
+                .decode("utf-8")
                 .split("\n", 1)[0]
                 .removesuffix("\r")
             )
-        except (ValueError, UnsafePathError, UnicodeDecodeError) as exc:
+        except (ValueError, UnicodeDecodeError) as exc:
             raise KnowledgeIndexError(
                 "KNOWLEDGE_INDEX_INVALID {}: unknown index entry".format(name)
             ) from exc
@@ -982,6 +1019,8 @@ def _validate_index_directory(
                 "KNOWLEDGE_INDEX_INVALID {}: "
                 "index entry is not generator-owned".format(name)
             )
+        if stale_snapshots is not None:
+            stale_snapshots[name] = snapshot
     return {
         name
         for name in names
@@ -999,15 +1038,6 @@ def _domain_root(data_root=None, target=None) -> Path:
     return lessons_dir().parent
 
 
-def _index_revision(info: os.stat_result) -> tuple[int, ...]:
-    return (
-        info.st_dev,
-        info.st_ino,
-        info.st_mode,
-        info.st_size,
-        info.st_mtime_ns,
-        info.st_ctime_ns,
-    )
 
 
 def _index_publication_revision(info: os.stat_result) -> tuple[int, ...]:
@@ -1044,6 +1074,229 @@ def _require_index_directory_unchanged(
             "KNOWLEDGE_INDEX_INVALID: index directory changed during publish"
         )
 
+
+def _cleanup_created_index_directory(
+    parent_descriptor: int,
+    temporary_name: str,
+    identity: tuple[int, int, int],
+) -> None:
+    from .render import _rename_entry_no_replace
+
+    staged_name = None
+    for _ in range(32):
+        candidate = ".index-preserved-directory-{}".format(
+            secrets.token_hex(12)
+        )
+        try:
+            _rename_entry_no_replace(
+                parent_descriptor,
+                temporary_name,
+                candidate,
+            )
+        except FileExistsError:
+            continue
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_INVALID: "
+                "cannot preserve temporary index directory"
+            ) from exc
+        staged_name = candidate
+        break
+    if staged_name is None:
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_INVALID: "
+            "cannot preserve temporary index directory"
+        )
+
+    def restore_staged() -> None:
+        try:
+            _rename_entry_no_replace(
+                parent_descriptor,
+                staged_name,
+                temporary_name,
+            )
+        except OSError:
+            return
+        try:
+            os.fsync(parent_descriptor)
+        except OSError:
+            pass
+
+    try:
+        staged_info = os.stat(
+            staged_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        restore_staged()
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_INVALID: "
+            "cannot inspect temporary index directory"
+        ) from exc
+    if (
+        not stat.S_ISDIR(staged_info.st_mode)
+        or _index_directory_identity(staged_info) != identity
+    ):
+        restore_staged()
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_INVALID: "
+            "temporary index directory changed during creation"
+        )
+
+    try:
+        os.rmdir(staged_name, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+    except OSError as exc:
+        restore_staged()
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_INVALID: "
+            "cannot remove temporary index directory"
+        ) from exc
+
+
+def _create_index_directory_no_replace(
+    destination: Path,
+) -> tuple[int, tuple[int, int, int]]:
+    from .render import _rename_entry_no_replace
+
+    parent = destination.parent
+    try:
+        parent_info = parent.lstat()
+    except FileNotFoundError as exc:
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_INVALID: index parent does not exist"
+        ) from exc
+    if (
+        stat.S_ISLNK(parent_info.st_mode)
+        or not stat.S_ISDIR(parent_info.st_mode)
+    ):
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_INVALID: index parent must be a real directory"
+        )
+
+    parent_identity = _index_directory_identity(parent_info)
+    parent_descriptor = open_directory_path(parent)
+    directory_descriptor = None
+    temporary_name = None
+    try:
+        opened_parent_identity = _index_directory_identity(
+            os.fstat(parent_descriptor)
+        )
+        if opened_parent_identity != parent_identity:
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_INVALID: "
+                "index parent changed while opening"
+            )
+
+        try:
+            os.stat(
+                destination.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_INVALID: "
+                "index directory changed during creation"
+            )
+
+        for _ in range(32):
+            candidate = ".index-directory-{}".format(secrets.token_hex(12))
+            try:
+                os.mkdir(candidate, 0o700, dir_fd=parent_descriptor)
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            break
+        if temporary_name is None:
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_INVALID: "
+                "cannot create temporary index directory"
+            )
+
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        directory_descriptor = os.open(
+            temporary_name,
+            flags,
+            dir_fd=parent_descriptor,
+        )
+        identity = _index_directory_identity(
+            os.fstat(directory_descriptor)
+        )
+        temporary_info = os.stat(
+            temporary_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(temporary_info.st_mode)
+            or _index_directory_identity(temporary_info) != identity
+        ):
+            _cleanup_created_index_directory(
+                parent_descriptor,
+                temporary_name,
+                identity,
+            )
+            temporary_name = None
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_INVALID: "
+                "temporary index directory changed while opening"
+            )
+
+        try:
+            _rename_entry_no_replace(
+                parent_descriptor,
+                temporary_name,
+                destination.name,
+            )
+        except OSError as exc:
+            try:
+                _cleanup_created_index_directory(
+                    parent_descriptor,
+                    temporary_name,
+                    identity,
+                )
+            except KnowledgeIndexError as cleanup_error:
+                raise cleanup_error from exc
+            temporary_name = None
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_INVALID: "
+                "index directory changed during creation"
+            ) from exc
+        temporary_name = None
+
+        installed_info = os.stat(
+            destination.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(installed_info.st_mode)
+            or _index_directory_identity(installed_info) != identity
+        ):
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_INVALID: "
+                "index directory changed during creation"
+            )
+        _require_index_directory_unchanged(destination, identity)
+
+        result = directory_descriptor
+        directory_descriptor = None
+        return result, identity
+    finally:
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+        os.close(parent_descriptor)
 
 def inspect_index(
     outputs: Mapping[str, str],
@@ -1118,510 +1371,143 @@ def inspect_index(
         os.close(directory_descriptor)
 
 
-def _cleanup_index_temporaries(
+def _cleanup_owned_legacy_index_artifacts(
     directory_descriptor: int,
-    names: Iterable[str],
+    snapshots: Mapping[str, tuple[bytes, tuple[int, ...]]],
+    *,
+    allow_missing: bool = False,
 ) -> None:
-    for name in names:
+    from .render import _rename_entry_no_replace
+
+    if not snapshots:
+        return
+
+    remaining = set(snapshots)
+    groups = []
+    while remaining:
+        name = min(remaining, key=_byte_key)
+        suffix = Path(name).suffix
+        counterpart = None
+        if (
+            suffix in (".tmp", ".name")
+            and name.startswith((".index-retired-", ".index-quarantine-"))
+        ):
+            counterpart = name.removesuffix(suffix) + (
+                ".name" if suffix == ".tmp" else ".tmp"
+            )
+        if counterpart in remaining:
+            group = tuple(sorted((name, counterpart), key=_byte_key))
+            remaining.difference_update(group)
+        else:
+            group = (name,)
+            remaining.remove(name)
+        groups.append(group)
+
+    staged = []
+
+    def restore_staged() -> None:
+        for original_name, staged_name, _ in reversed(staged):
+            try:
+                _rename_entry_no_replace(
+                    directory_descriptor,
+                    staged_name,
+                    original_name,
+                )
+            except FileNotFoundError:
+                continue
+            except OSError:
+                pass
         try:
-            os.unlink(name, dir_fd=directory_descriptor)
+            os.fsync(directory_descriptor)
         except OSError:
             pass
 
-
-def _recovery_name(kind: str, logical_name: str, suffix: str) -> str:
-    digest = hashlib.sha256(logical_name.encode("utf-8")).hexdigest()[:16]
-    return ".index-{}-{}-{}{}".format(
-        kind,
-        digest,
-        secrets.token_hex(12),
-        suffix,
-    )
-
-
-def _recovery_record_bytes(
-    logical_name: str,
-    data: bytes,
-    mode: int,
-) -> bytes:
-    record = {
-        "data_base64": base64.b64encode(data).decode("ascii"),
-        "logical_name": logical_name,
-        "mode": mode,
-        "version": 1,
-    }
-    return (
-        json.dumps(
-            record,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        + b"\n"
-    )
-
-
-def _persist_index_recovery_record(
-    directory_descriptor: int,
-    logical_name: str,
-    data: bytes,
-    mode: int,
-) -> str:
-    record = _recovery_record_bytes(logical_name, data, mode)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    for _ in range(32):
-        name = _recovery_name("recovery", logical_name, ".json")
-        descriptor = None
-        try:
-            descriptor = os.open(
-                name,
-                flags,
-                0o600,
-                dir_fd=directory_descriptor,
-            )
-        except FileExistsError:
-            continue
-        except OSError as exc:
-            raise KnowledgeIndexError(
-                "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-                "cannot create index recovery record"
-            ) from exc
-
-        try:
-            handle = os.fdopen(descriptor, "wb")
-            descriptor = None
-            with handle:
-                handle.write(record)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.fsync(directory_descriptor)
-        except OSError as exc:
-            if descriptor is not None:
-                os.close(descriptor)
-            raise KnowledgeIndexError(
-                "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-                "cannot persist index recovery record"
-            ) from exc
-        return name
-
-    raise KnowledgeIndexError(
-        "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-        "cannot allocate index recovery record"
-    )
-
-
-def _prepare_index_backups(
-    directory_descriptor: int,
-) -> dict[str, tuple[bytes, int, os.stat_result]]:
-    backups = {}
     try:
-        for name in sorted(os.listdir(directory_descriptor), key=_byte_key):
-            if Path(name).suffix != ".md":
-                continue
-            linked_info = os.stat(
-                name,
-                dir_fd=directory_descriptor,
-                follow_symlinks=False,
-            )
-            data = read_regular_file_at(
+        for group in groups:
+            digest = hashlib.sha256(
+                b"\x00".join(os.fsencode(name) for name in group)
+            ).hexdigest()[:16]
+            token = secrets.token_hex(12)
+            base_name = ".index-preserved-{}-{}".format(digest, token)
+            for name in group:
+                staged_name = base_name + Path(name).suffix
+                try:
+                    _rename_entry_no_replace(
+                        directory_descriptor,
+                        name,
+                        staged_name,
+                    )
+                except FileNotFoundError:
+                    if allow_missing:
+                        continue
+                    raise
+                staged.append((name, staged_name, snapshots[name]))
+
+        for _, staged_name, expected_snapshot in staged:
+            current_snapshot = _legacy_artifact_snapshot_at(
                 directory_descriptor,
-                name,
-                linked_info.st_size,
+                staged_name,
             )
-            current_info = os.stat(
-                name,
-                dir_fd=directory_descriptor,
-                follow_symlinks=False,
-            )
-            if (
-                len(data) != linked_info.st_size
-                or _index_revision(current_info)
-                != _index_revision(linked_info)
-            ):
+            if current_snapshot != expected_snapshot:
+                restore_staged()
                 raise KnowledgeIndexError(
                     "KNOWLEDGE_INDEX_INVALID: "
-                    "index changed before publish"
+                    "legacy index artifact changed during cleanup"
                 )
-            backups[name] = (
-                data,
-                stat.S_IMODE(linked_info.st_mode),
-                linked_info,
-            )
+
+        for _, staged_name, _ in staged:
+            os.unlink(staged_name, dir_fd=directory_descriptor)
+        os.fsync(directory_descriptor)
     except KnowledgeIndexError:
         raise
-    except (OSError, UnsafePathError) as exc:
-        raise KnowledgeIndexError(
-            "KNOWLEDGE_INDEX_INVALID: "
-            "cannot snapshot index before publish"
-        ) from exc
-    return backups
-
-
-def _persist_quarantine_metadata(
-    directory_descriptor: int,
-    quarantine_name: str,
-    logical_name: str,
-) -> str:
-    metadata_name = quarantine_name.removesuffix(".tmp") + ".name"
-    descriptor = None
-    try:
-        descriptor = os.open(
-            metadata_name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            0o600,
-            dir_fd=directory_descriptor,
-        )
-        handle = os.fdopen(
-            descriptor,
-            "w",
-            encoding="utf-8",
-            newline="\n",
-        )
-        descriptor = None
-        with handle:
-            handle.write(logical_name + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.fsync(directory_descriptor)
     except OSError as exc:
-        if descriptor is not None:
-            os.close(descriptor)
+        restore_staged()
         raise KnowledgeIndexError(
-            "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-            "cannot persist quarantine recovery metadata"
+            "KNOWLEDGE_INDEX_INVALID: cannot remove legacy index artifact"
         ) from exc
-    return metadata_name
 
 
-def _quarantine_index_entry(
+def _cleanup_index_temporaries(
     directory_descriptor: int,
-    name: str,
-    expected_data: bytes,
-    expected_info: os.stat_result,
-    *,
-    restore: bool,
-    retire_owned: bool = False,
-) -> _QuarantineResult:
-    from .render import _rename_entry_no_replace
-
-    quarantine_name = None
-    for _ in range(32):
-        candidate = _recovery_name(
-            "retired" if retire_owned else "quarantine",
-            name,
-            ".tmp",
-        )
-        try:
-            _rename_entry_no_replace(
-                directory_descriptor,
-                name,
-                candidate,
-            )
-        except FileExistsError:
-            continue
-        except FileNotFoundError:
-            return _QuarantineResult.MISSING
-        except OSError as exc:
-            raise KnowledgeIndexError(
-                "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-                "atomic quarantine unavailable"
-            ) from exc
-        quarantine_name = candidate
-        break
-    if quarantine_name is None:
-        raise KnowledgeIndexError(
-            "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-            "cannot allocate quarantine name"
-        )
-
-    try:
-        os.fsync(directory_descriptor)
-    except OSError as exc:
-        _persist_quarantine_metadata(
-            directory_descriptor,
-            quarantine_name,
-            name,
-        )
-        raise KnowledgeIndexError(
-            "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-            "cannot persist quarantined index"
-        ) from exc
-
-    try:
-        quarantined_info = os.stat(
-            quarantine_name,
-            dir_fd=directory_descriptor,
-            follow_symlinks=False,
-        )
-        quarantined_data = read_regular_file_at(
-            directory_descriptor,
-            quarantine_name,
-            len(expected_data),
-        )
-    except (OSError, UnsafePathError) as exc:
-        try:
-            _rename_entry_no_replace(
-                directory_descriptor,
-                quarantine_name,
-                name,
-            )
-        except OSError:
-            _persist_quarantine_metadata(
-                directory_descriptor,
-                quarantine_name,
-                name,
-            )
-        else:
-            try:
-                os.fsync(directory_descriptor)
-            except OSError as persist_exc:
-                raise KnowledgeIndexError(
-                    "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-                    "cannot persist restored index"
-                ) from persist_exc
-        raise KnowledgeIndexError(
-            "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-            "cannot inspect quarantined index"
-        ) from exc
-
-    try:
-        current_quarantined_info = os.stat(
-            quarantine_name,
-            dir_fd=directory_descriptor,
-            follow_symlinks=False,
-        )
-    except OSError as exc:
-        raise KnowledgeIndexError(
-            "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-            "cannot recheck quarantined index"
-        ) from exc
-    entry_owned = (
-        quarantined_data == expected_data
-        and _index_publication_revision(quarantined_info)
-        == _index_publication_revision(expected_info)
-        and _index_revision(current_quarantined_info)
-        == _index_revision(quarantined_info)
-    )
-    if restore and retire_owned and entry_owned:
-        _persist_quarantine_metadata(
-            directory_descriptor,
-            quarantine_name,
-            name,
-        )
-        try:
-            os.stat(
-                name,
-                dir_fd=directory_descriptor,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            return _QuarantineResult.REMOVED_BY_US
-        except OSError as exc:
-            raise KnowledgeIndexError(
-                "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-                "cannot verify retired index"
-            ) from exc
-        raise KnowledgeIndexError(
-            "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-            "concurrent index preserved after retirement"
-        )
-
-    if restore:
-        try:
-            _rename_entry_no_replace(
-                directory_descriptor,
-                quarantine_name,
-                name,
-            )
-        except FileExistsError as exc:
-            _persist_quarantine_metadata(
-                directory_descriptor,
-                quarantine_name,
-                name,
-            )
-            raise KnowledgeIndexError(
-                "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-                "concurrent index preserved in quarantine"
-            ) from exc
-        except OSError as exc:
-            _persist_quarantine_metadata(
-                directory_descriptor,
-                quarantine_name,
-                name,
-            )
-            raise KnowledgeIndexError(
-                "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-                "cannot restore quarantined index"
-            ) from exc
-        try:
-            os.fsync(directory_descriptor)
-        except OSError as exc:
-            raise KnowledgeIndexError(
-                "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-                "cannot persist restored index"
-            ) from exc
-        if not entry_owned:
-            raise KnowledgeIndexError(
-                "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-                "changed quarantined index was preserved"
-            )
-        return _QuarantineResult.RESTORED
-
-    _persist_quarantine_metadata(
-        directory_descriptor,
-        quarantine_name,
-        name,
-    )
-    state = "owned" if entry_owned else "changed"
-    raise KnowledgeIndexError(
-        "KNOWLEDGE_INDEX_ROLLBACK_FAILED: "
-        "{} quarantined index requires recovery".format(state)
-    )
-
-
-def _unlink_published_index_if_unchanged(
-    directory_descriptor: int,
-    name: str,
-    published_data: bytes,
-    published_info: os.stat_result,
+    snapshots: Mapping[str, tuple[bytes, tuple[int, ...]]],
 ) -> None:
-    marker_info = replace_regular_file_at_if_unchanged_with_info(
+    _cleanup_owned_legacy_index_artifacts(
         directory_descriptor,
-        name,
-        published_data,
-        b"",
-        0o600,
-        expected_info=published_info,
-    )
-    if marker_info is None:
-        return
-    _quarantine_index_entry(
-        directory_descriptor,
-        name,
-        b"",
-        marker_info,
-        restore=False,
+        snapshots,
+        allow_missing=True,
     )
 
 
-def _restore_missing_index(
-    directory_descriptor: int,
-    name: str,
-    data: bytes,
-    mode: int,
-) -> None:
-    descriptor = None
-    try:
-        descriptor = os.open(
-            name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            mode,
-            dir_fd=directory_descriptor,
-        )
-        handle = os.fdopen(descriptor, "wb")
-        descriptor = None
-        with handle:
-            handle.write(data)
-            handle.flush()
-            os.fchmod(handle.fileno(), mode)
-            os.fsync(handle.fileno())
-    except OSError:
-        if descriptor is not None:
-            os.close(descriptor)
-        raise
-
-
-def _rollback_index_namespace(
-    directory_descriptor: int,
-    backups: Mapping[str, tuple[bytes, int, os.stat_result]],
-    published: Mapping[str, tuple[bytes, os.stat_result]],
-    deleted: set[str],
-) -> None:
-    failures = []
-    for name, (published_data, published_info) in published.items():
-        backup = backups.get(name)
-        if backup is None:
-            try:
-                _unlink_published_index_if_unchanged(
-                    directory_descriptor,
-                    name,
-                    published_data,
-                    published_info,
-                )
-            except (KnowledgeIndexError, OSError):
-                failures.append("published entry cleanup failed")
-            continue
-
-        previous_data, previous_mode, _ = backup
-        try:
-            restored_info = replace_regular_file_at_if_unchanged_with_info(
-                directory_descriptor,
-                name,
-                published_data,
-                previous_data,
-                previous_mode,
-                expected_info=published_info,
-            )
-            if restored_info is None:
-                raise KnowledgeIndexError("index changed during rollback")
-        except (KnowledgeIndexError, OSError):
-            failures.append("published entry restore failed")
-            try:
-                _persist_index_recovery_record(
-                    directory_descriptor,
-                    name,
-                    previous_data,
-                    previous_mode,
-                )
-            except KnowledgeIndexError:
-                failures.append("recovery record creation failed")
-
-    for name in deleted:
-        backup = backups.get(name)
-        if backup is None:
-            continue
-        previous_data, previous_mode, _ = backup
-        try:
-            _restore_missing_index(
-                directory_descriptor,
-                name,
-                previous_data,
-                previous_mode,
-            )
-        except OSError:
-            failures.append("stale entry restore failed")
-            try:
-                _persist_index_recovery_record(
-                    directory_descriptor,
-                    name,
-                    previous_data,
-                    previous_mode,
-                )
-            except KnowledgeIndexError:
-                failures.append("recovery record creation failed")
-
-    try:
-        os.fsync(directory_descriptor)
-    except OSError:
-        failures.append("namespace persistence failed")
-
-    if failures:
-        raise KnowledgeIndexError(
-            "KNOWLEDGE_INDEX_ROLLBACK_FAILED: {}; "
-            "{} rollback operation(s) require recovery".format(
-                failures[0],
-                len(failures),
-            )
-        )
+def _snapshot_index_temporary_descriptor(
+    descriptor: int,
+    maximum_bytes: int,
+) -> tuple[bytes, tuple[int, ...]] | None:
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_size < 0
+        or info.st_size > maximum_bytes
+    ):
+        return None
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    remaining = info.st_size
+    chunks = bytearray()
+    while remaining:
+        chunk = os.read(descriptor, remaining)
+        if not chunk:
+            return None
+        chunks.extend(chunk)
+        remaining -= len(chunk)
+    return bytes(chunks), _index_publication_revision(info)
 
 
 def _prepare_index_temporary(
     directory_descriptor: int,
     project: str,
-    text: str,
-) -> str:
+    data: bytes,
+) -> tuple[str, tuple[bytes, tuple[int, ...]]]:
     flags = (
-        os.O_WRONLY
+        os.O_RDWR
         | os.O_CREAT
         | os.O_EXCL
         | getattr(os, "O_NOFOLLOW", 0)
@@ -1638,27 +1524,44 @@ def _prepare_index_temporary(
                 dir_fd=directory_descriptor,
             )
             os.fchmod(descriptor, 0o600)
-            handle = os.fdopen(
-                descriptor,
-                "w",
-                encoding="utf-8",
-                newline="\n",
+            write_all_and_sync(descriptor, data)
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_size != len(data):
+                raise OSError("invalid prepared index")
+            prepared_snapshot = (
+                data,
+                _index_publication_revision(info),
             )
+            os.close(descriptor)
             descriptor = None
-            with handle:
-                handle.write(text)
-                handle.flush()
-                os.fsync(handle.fileno())
-            return name
+            return name, prepared_snapshot
         except FileExistsError:
             continue
         except OSError as exc:
+            failed_snapshot = None
             if descriptor is not None:
-                os.close(descriptor)
-            try:
-                os.unlink(name, dir_fd=directory_descriptor)
-            except OSError:
-                pass
+                try:
+                    observed_snapshot = _snapshot_index_temporary_descriptor(
+                        descriptor,
+                        len(data),
+                    )
+                    if (
+                        observed_snapshot is not None
+                        and data.startswith(observed_snapshot[0])
+                    ):
+                        failed_snapshot = observed_snapshot
+                except OSError:
+                    pass
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                descriptor = None
+            if failed_snapshot is not None:
+                _cleanup_index_temporaries(
+                    directory_descriptor,
+                    {name: failed_snapshot},
+                )
             raise KnowledgeIndexError(
                 "KNOWLEDGE_INDEX_INVALID {}: cannot prepare index".format(
                     project
@@ -1669,8 +1572,166 @@ def _prepare_index_temporary(
     )
 
 
+def _publish_index_temporary(
+    directory_descriptor: int,
+    project: str,
+    temporary_name: str,
+    temporary_snapshot: tuple[bytes, tuple[int, ...]],
+    output_name: str,
+) -> None:
+    from .render import (
+        _remove_entry_if_unchanged,
+        _rename_entry_no_replace,
+        _snapshot_output_entry,
+    )
+
+    def restore_staged(staged_name: str) -> None:
+        try:
+            _rename_entry_no_replace(
+                directory_descriptor,
+                staged_name,
+                output_name,
+            )
+        except OSError as exc:
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_INVALID {}: "
+                "cannot preserve replaced index entry".format(project)
+            ) from exc
+
+    if (
+        _legacy_artifact_snapshot_at(
+            directory_descriptor,
+            temporary_name,
+        )
+        != temporary_snapshot
+    ):
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_INVALID {}: "
+            "prepared index changed during publish".format(project)
+        )
+
+    try:
+        existing = _snapshot_output_entry(
+            directory_descriptor,
+            output_name,
+        )
+    except FileNotFoundError:
+        existing = None
+    except (OSError, ValueError) as exc:
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_INVALID {}: "
+            "cannot inspect index entry".format(project)
+        ) from exc
+
+    if existing is not None and not (
+        stat.S_ISREG(existing.revision[2])
+        or stat.S_ISLNK(existing.revision[2])
+    ):
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_INVALID {}: unknown index entry".format(project)
+        )
+
+    staged_name = None
+    if existing is not None:
+        for _ in range(32):
+            candidate = ".index-preserved-output-{}".format(
+                secrets.token_hex(12)
+            )
+            try:
+                _rename_entry_no_replace(
+                    directory_descriptor,
+                    output_name,
+                    candidate,
+                )
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise KnowledgeIndexError(
+                    "KNOWLEDGE_INDEX_INVALID {}: "
+                    "index entry changed during publish".format(project)
+                ) from exc
+            staged_name = candidate
+            break
+        if staged_name is None:
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_INVALID {}: "
+                "cannot stage replaced index entry".format(project)
+            )
+        try:
+            moved = _snapshot_output_entry(
+                directory_descriptor,
+                staged_name,
+            )
+        except (OSError, ValueError) as exc:
+            try:
+                restore_staged(staged_name)
+            except KnowledgeIndexError as restore_error:
+                raise restore_error from exc
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_INVALID {}: "
+                "cannot inspect replaced index entry".format(project)
+            ) from exc
+        if moved != existing:
+            restore_staged(staged_name)
+            raise KnowledgeIndexError(
+                "KNOWLEDGE_INDEX_INVALID {}: "
+                "index entry changed during publish".format(project)
+            )
+
+    if (
+        _legacy_artifact_snapshot_at(
+            directory_descriptor,
+            temporary_name,
+        )
+        != temporary_snapshot
+    ):
+        if staged_name is not None:
+            restore_staged(staged_name)
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_INVALID {}: "
+            "prepared index changed during publish".format(project)
+        )
+
+    try:
+        _rename_entry_no_replace(
+            directory_descriptor,
+            temporary_name,
+            output_name,
+        )
+    except OSError as exc:
+        if staged_name is not None:
+            try:
+                restore_staged(staged_name)
+            except KnowledgeIndexError as restore_error:
+                raise restore_error from exc
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_INVALID {}: cannot replace index".format(project)
+        ) from exc
+
+    if (
+        _legacy_artifact_snapshot_at(
+            directory_descriptor,
+            output_name,
+        )
+        != temporary_snapshot
+    ):
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_INVALID {}: "
+            "published index changed during publish".format(project)
+        )
+
+    if staged_name is not None and not _remove_entry_if_unchanged(
+        directory_descriptor,
+        staged_name,
+        existing,
+    ):
+        raise KnowledgeIndexError(
+            "KNOWLEDGE_INDEX_INVALID {}: "
+            "replaced index entry changed during publish".format(project)
+        )
+
 def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
-    """잠금을 보유한 호출자가 전체 인덱스를 원자적으로 교체한다."""
+    """잠금을 보유한 호출자가 전체 인덱스를 한 방향으로 다시 만든다."""
     if outputs is None:
         built, source_projects = _build_all_with_projects(data_root)
     else:
@@ -1679,122 +1740,112 @@ def _write_all_locked(outputs=None, data_root=None, target=None) -> Path:
     normalized = _normalized_outputs(built)
     destination = Path(target) if target is not None else index_dir()
     expected = _expected_names(normalized)
+    directory_descriptor = None
     try:
         try:
             initial_info = destination.lstat()
         except FileNotFoundError:
-            destination.mkdir(parents=True)
+            directory_descriptor, identity = (
+                _create_index_directory_no_replace(destination)
+            )
         else:
             if not stat.S_ISDIR(initial_info.st_mode):
                 raise KnowledgeIndexError(
                     "KNOWLEDGE_INDEX_INVALID: "
                     "index must be a real directory"
                 )
-        directory_descriptor = open_directory_path(destination)
+            identity = _index_directory_identity(initial_info)
+            directory_descriptor = open_directory_path(destination)
+            opened_identity = _index_directory_identity(
+                os.fstat(directory_descriptor)
+            )
+            if opened_identity != identity:
+                raise KnowledgeIndexError(
+                    "KNOWLEDGE_INDEX_INVALID: "
+                    "index directory changed while opening"
+                )
     except KnowledgeIndexError:
+        if directory_descriptor is not None:
+            try:
+                os.close(directory_descriptor)
+            except OSError:
+                pass
         raise
     except (OSError, UnsafePathError) as exc:
+        if directory_descriptor is not None:
+            try:
+                os.close(directory_descriptor)
+            except OSError:
+                pass
         raise KnowledgeIndexError(
             "KNOWLEDGE_INDEX_INVALID: cannot create or open index directory"
         ) from exc
-
-    identity = _index_directory_identity(os.fstat(directory_descriptor))
-    prepared: dict[str, str | None] = {}
-    published: dict[str, tuple[bytes, os.stat_result]] = {}
-    deleted = set()
+    prepared: dict[
+        str,
+        tuple[str, tuple[bytes, tuple[int, ...]]],
+    ] = {}
     try:
-        _reconcile_index_recovery(directory_descriptor)
-        _validate_index_directory(directory_descriptor, expected)
-        backups = _prepare_index_backups(directory_descriptor)
+        cleanup_artifacts = {}
+        stale_snapshots = {}
+        _validate_index_directory(
+            directory_descriptor,
+            expected,
+            cleanup_artifacts=cleanup_artifacts,
+            stale_snapshots=stale_snapshots,
+        )
+        _require_index_directory_unchanged(destination, identity)
+        _cleanup_owned_legacy_index_artifacts(
+            directory_descriptor,
+            cleanup_artifacts,
+        )
+        _require_index_directory_unchanged(destination, identity)
+        output_bytes = {
+            project: text.encode("utf-8")
+            for project, text in normalized.items()
+        }
         try:
-            for project, text in normalized.items():
-                name = project + ".md"
-                encoded = text.encode("utf-8")
-                backup = backups.get(name)
-                if backup is not None and backup[0] == encoded:
-                    prepared[project] = None
-                    continue
+            for project in sorted(output_bytes, key=_byte_key):
                 prepared[project] = _prepare_index_temporary(
                     directory_descriptor,
                     project,
-                    text,
+                    output_bytes[project],
                 )
 
-            replacement_projects = sorted(prepared, key=_byte_key)
             _require_projects_unchanged(source_projects)
+            _require_index_directory_unchanged(destination, identity)
+
+            for project in sorted(prepared, key=_byte_key):
+                temporary_name, temporary_snapshot = prepared[project]
+                _publish_index_temporary(
+                    directory_descriptor,
+                    project,
+                    temporary_name,
+                    temporary_snapshot,
+                    project + ".md",
+                )
+                del prepared[project]
 
             try:
-                for project in replacement_projects:
-                    temporary = prepared[project]
-                    if temporary is None:
-                        continue
-                    published_info = os.stat(
-                        temporary,
-                        dir_fd=directory_descriptor,
-                        follow_symlinks=False,
-                    )
-                    published_data = normalized[project].encode("utf-8")
-                    try:
-                        os.replace(
-                            temporary,
-                            project + ".md",
-                            src_dir_fd=directory_descriptor,
-                            dst_dir_fd=directory_descriptor,
-                        )
-                    except OSError as exc:
-                        raise KnowledgeIndexError(
-                            "KNOWLEDGE_INDEX_INVALID {}: "
-                            "cannot replace index".format(project)
-                        ) from exc
-                    prepared[project] = None
-                    published[project + ".md"] = (
-                        published_data,
-                        published_info,
-                    )
-
-                for name in sorted(set(backups) - expected, key=_byte_key):
-                    stale_data, _, stale_info = backups[name]
-                    quarantine_result = _quarantine_index_entry(
-                        directory_descriptor,
-                        name,
-                        stale_data,
-                        stale_info,
-                        restore=True,
-                        retire_owned=True,
-                    )
-                    if quarantine_result is _QuarantineResult.MISSING:
-                        continue
-                    if (
-                        quarantine_result
-                        is _QuarantineResult.REMOVED_BY_US
-                    ):
-                        deleted.add(name)
-                        continue
-                    raise KnowledgeIndexError(
-                        "KNOWLEDGE_INDEX_INVALID {}: "
-                        "index changed during publish".format(name)
-                    )
-
-                _require_projects_unchanged(source_projects)
-                _validate_index_directory(directory_descriptor, expected)
                 os.fsync(directory_descriptor)
-                _require_index_directory_unchanged(destination, identity)
-            except Exception:
-                _rollback_index_namespace(
-                    directory_descriptor,
-                    backups,
-                    published,
-                    deleted,
-                )
-                raise
+            except OSError as exc:
+                raise KnowledgeIndexError(
+                    "KNOWLEDGE_INDEX_INVALID: cannot persist index"
+                ) from exc
+            _require_index_directory_unchanged(destination, identity)
+            _require_projects_unchanged(source_projects)
+            _require_index_directory_unchanged(destination, identity)
+            _cleanup_owned_legacy_index_artifacts(
+                directory_descriptor,
+                stale_snapshots,
+            )
+            _require_index_directory_unchanged(destination, identity)
         finally:
             _cleanup_index_temporaries(
                 directory_descriptor,
-                (
-                    temporary
-                    for temporary in prepared.values()
-                    if temporary is not None
-                ),
+                {
+                    temporary_name: snapshot
+                    for temporary_name, snapshot in prepared.values()
+                },
             )
         return destination
     finally:

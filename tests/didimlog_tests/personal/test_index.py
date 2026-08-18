@@ -2,6 +2,7 @@ import base64
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
 import io
+import hashlib
 import json
 import multiprocessing
 import os
@@ -41,6 +42,32 @@ find_when: [mongodb, recovery]
 ---
 장문 해설 본문 표식
 """
+
+def _legacy_artifact_name(kind, logical_name, suffix, token):
+    digest = hashlib.sha256(logical_name.encode("utf-8")).hexdigest()[:16]
+    return ".index-{}-{}-{}{}".format(
+        kind,
+        digest,
+        token,
+        suffix,
+    )
+
+
+def _legacy_recovery_record_bytes(logical_name, data, mode):
+    return (
+        json.dumps(
+            {
+                "data_base64": base64.b64encode(data).decode("ascii"),
+                "logical_name": logical_name,
+                "mode": mode,
+                "version": 1,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
 
 
 
@@ -753,11 +780,11 @@ body
             "demo-api": GENERATED_NOTICE + "\n# replacement\n",
         }
         boundaries = (
-            "_reconcile_index_recovery",
+            "open_directory_path",
             "_validate_index_directory",
-            "_prepare_index_backups",
+            "_prepare_index_temporary",
             "_require_projects_unchanged",
-            "os.replace",
+            "_rename_entry_no_replace",
         )
 
         for boundary in boundaries:
@@ -779,8 +806,8 @@ body
                     target.mkdir()
                     swapped = True
 
-                if boundary == "os.replace":
-                    original = knowledge_index.os.replace
+                if boundary == "_rename_entry_no_replace":
+                    original = personal_render._rename_entry_no_replace
 
                     def swap_at_boundary(*args, **kwargs):
                         result = original(*args, **kwargs)
@@ -788,8 +815,8 @@ body
                         return result
 
                     patcher = mock.patch.object(
-                        knowledge_index.os,
-                        "replace",
+                        personal_render,
+                        "_rename_entry_no_replace",
                         side_effect=swap_at_boundary,
                     )
                 else:
@@ -817,14 +844,283 @@ body
                 self.assertTrue(swapped)
                 self.assertNotIn(str(self.temporary), str(caught.exception))
                 self.assertEqual(list(target.iterdir()), [])
-                self.assertEqual(
-                    (saved / "demo-api.md").read_bytes(),
-                    previous,
+                saved_bytes = (saved / "demo-api.md").read_bytes()
+                self.assertIn(
+                    saved_bytes,
+                    (previous, outputs["demo-api"].encode("utf-8")),
                 )
-                self.assertEqual(
+                self.assertIn(
                     stat.S_IMODE((saved / "demo-api.md").stat().st_mode),
-                    0o640,
+                    (0o600, 0o640),
                 )
+
+
+    def test_absent_index_target_race_never_writes_competing_directory(self):
+        parent = self.root / "generated"
+        parent.mkdir()
+        target = parent / "index"
+        output = GENERATED_NOTICE + "\n# generated\n"
+        original_rename = personal_render._rename_entry_no_replace
+        installed_competitor = False
+
+        def install_competitor_before_target(parent_descriptor, source, destination):
+            nonlocal installed_competitor
+            if (
+                destination == target.name
+                and source.startswith(".index-directory-")
+                and not installed_competitor
+            ):
+                target.mkdir()
+                installed_competitor = True
+            return original_rename(parent_descriptor, source, destination)
+
+        with mock.patch.object(
+            personal_render,
+            "_rename_entry_no_replace",
+            side_effect=install_competitor_before_target,
+        ), self.assertRaises(knowledge_index.KnowledgeIndexError) as caught:
+            knowledge_index.write_all(
+                outputs={"demo-api": output},
+                data_root=self.root,
+                target=target,
+            )
+
+        self.assertTrue(installed_competitor)
+        self.assertNotIn(str(self.temporary), str(caught.exception))
+        self.assertEqual(list(target.iterdir()), [])
+        self.assertEqual({entry.name for entry in parent.iterdir()}, {target.name})
+
+    def test_prepared_temp_path_replacement_is_preserved_on_precheck_failure(self):
+        user_bytes = b"user replacement bytes\n"
+
+        for case_name in ("regular", "fifo"):
+            with self.subTest(case=case_name):
+                target = self.root / ("index-temp-" + case_name)
+                target.mkdir()
+                original_prepare = knowledge_index._prepare_index_temporary
+                prepared_name = None
+
+                def replace_prepared_path(parent_descriptor, project, data):
+                    nonlocal prepared_name
+                    prepared = original_prepare(
+                        parent_descriptor,
+                        project,
+                        data,
+                    )
+                    prepared_name = prepared[0]
+                    prepared_path = target / prepared_name
+                    if case_name == "regular":
+                        replacement = self.temporary / (
+                            "prepared-user-" + case_name
+                        )
+                        replacement.write_bytes(user_bytes)
+                        os.replace(replacement, prepared_path)
+                    else:
+                        prepared_path.unlink()
+                        os.mkfifo(prepared_path)
+                    return prepared
+
+                def fail_source_precheck(projects):
+                    raise knowledge_index.KnowledgeSourceError(
+                        "lessons/demo-api",
+                        "project link changed during scan",
+                    )
+
+                with mock.patch.object(
+                    knowledge_index,
+                    "_prepare_index_temporary",
+                    side_effect=replace_prepared_path,
+                ), mock.patch.object(
+                    knowledge_index,
+                    "_require_projects_unchanged",
+                    side_effect=fail_source_precheck,
+                ), self.assertRaises(
+                    knowledge_index.KnowledgeIndexError
+                ) as caught:
+                    knowledge_index.write_all(
+                        outputs={
+                            "demo-api": GENERATED_NOTICE + "\n# generated\n"
+                        },
+                        data_root=self.root,
+                        target=target,
+                    )
+
+                self.assertIsNotNone(prepared_name)
+                self.assertNotIn(str(self.temporary), str(caught.exception))
+                preserved = target / prepared_name
+                if case_name == "regular":
+                    self.assertEqual(preserved.read_bytes(), user_bytes)
+                else:
+                    self.assertTrue(stat.S_ISFIFO(preserved.lstat().st_mode))
+
+    def test_prepared_temp_open_descriptor_mutation_is_preserved(self):
+        target = self.root / "index-temp-open-descriptor"
+        target.mkdir()
+        user_bytes = b"user open-descriptor bytes\n"
+        original_prepare = knowledge_index._prepare_index_temporary
+        prepared_name = None
+        descriptor = None
+        mutated = False
+
+        def retain_prepared_descriptor(parent_descriptor, project, data):
+            nonlocal descriptor, prepared_name
+            prepared = original_prepare(parent_descriptor, project, data)
+            prepared_name = prepared[0]
+            descriptor = os.open(
+                prepared_name,
+                os.O_WRONLY,
+                dir_fd=parent_descriptor,
+            )
+            return prepared
+
+        def mutate_before_source_precheck(projects):
+            nonlocal mutated
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.write(descriptor, user_bytes)
+            os.ftruncate(descriptor, len(user_bytes))
+            os.fsync(descriptor)
+            mutated = True
+            raise knowledge_index.KnowledgeSourceError(
+                "lessons/demo-api",
+                "project link changed during scan",
+            )
+
+        try:
+            with mock.patch.object(
+                knowledge_index,
+                "_prepare_index_temporary",
+                side_effect=retain_prepared_descriptor,
+            ), mock.patch.object(
+                knowledge_index,
+                "_require_projects_unchanged",
+                side_effect=mutate_before_source_precheck,
+            ), self.assertRaises(knowledge_index.KnowledgeIndexError) as caught:
+                knowledge_index.write_all(
+                    outputs={
+                        "demo-api": GENERATED_NOTICE + "\n# generated\n"
+                    },
+                    data_root=self.root,
+                    target=target,
+                )
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+        self.assertTrue(mutated)
+        self.assertIsNotNone(prepared_name)
+        self.assertNotIn(str(self.temporary), str(caught.exception))
+        self.assertEqual((target / prepared_name).read_bytes(), user_bytes)
+
+    def test_prepared_temp_replacement_before_publish_is_preserved(self):
+        target = self.root / "index-temp-before-publish"
+        target.mkdir()
+        existing = target / "demo-api.md"
+        existing_bytes = GENERATED_NOTICE.encode("utf-8") + b"\n# previous\n"
+        existing.write_bytes(existing_bytes)
+        replacement_bytes = b"user prepared replacement bytes\n"
+        replacement = self.temporary / "prepared-replacement"
+        replacement.write_bytes(replacement_bytes)
+        original_publish = knowledge_index._publish_index_temporary
+        replaced_name = None
+
+        def replace_then_publish(
+            parent_descriptor,
+            project,
+            temporary_name,
+            temporary_snapshot,
+            output_name,
+        ):
+            nonlocal replaced_name
+            os.replace(replacement, target / temporary_name)
+            replaced_name = temporary_name
+            return original_publish(
+                parent_descriptor,
+                project,
+                temporary_name,
+                temporary_snapshot,
+                output_name,
+            )
+
+        with mock.patch.object(
+            knowledge_index,
+            "_publish_index_temporary",
+            side_effect=replace_then_publish,
+        ), self.assertRaises(knowledge_index.KnowledgeIndexError):
+            knowledge_index.write_all(
+                outputs={
+                    "demo-api": GENERATED_NOTICE + "\n# replacement\n"
+                },
+                data_root=self.root,
+                target=target,
+            )
+
+        self.assertIsNotNone(replaced_name)
+        self.assertEqual(existing.read_bytes(), existing_bytes)
+        self.assertEqual(
+            (target / replaced_name).read_bytes(),
+            replacement_bytes,
+        )
+
+    def test_prepare_short_write_removes_only_its_partial_temp_and_retry_converges(self):
+        target = self.root / "index-short-write"
+        target.mkdir()
+        output = GENERATED_NOTICE + "\n# generated\n"
+
+        def write_prefix_then_fail(descriptor, data):
+            os.write(descriptor, data[: max(1, len(data) // 2)])
+            raise OSError("forced index write failure")
+
+        with mock.patch.object(
+            knowledge_index,
+            "write_all_and_sync",
+            side_effect=write_prefix_then_fail,
+        ), self.assertRaises(knowledge_index.KnowledgeIndexError):
+            knowledge_index.write_all(
+                outputs={"demo-api": output},
+                data_root=self.root,
+                target=target,
+            )
+
+        self.assertEqual(list(target.iterdir()), [])
+        knowledge_index.write_all(
+            outputs={"demo-api": output},
+            data_root=self.root,
+            target=target,
+        )
+        self.assertEqual(
+            (target / "demo-api.md").read_bytes(),
+            output.encode("utf-8"),
+        )
+
+    def test_prepare_failure_preserves_concurrent_open_descriptor_bytes(self):
+        target = self.root / "index-prepare-open-descriptor"
+        target.mkdir()
+        output = GENERATED_NOTICE + "\n# generated\n"
+        user_bytes = b"user concurrent bytes\n"
+
+        def mutate_then_fail(descriptor, data):
+            os.write(descriptor, data[: max(1, len(data) // 2)])
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.write(descriptor, user_bytes)
+            os.ftruncate(descriptor, len(user_bytes))
+            os.fsync(descriptor)
+            raise OSError("forced index write failure")
+
+        with mock.patch.object(
+            knowledge_index,
+            "write_all_and_sync",
+            side_effect=mutate_then_fail,
+        ), self.assertRaises(knowledge_index.KnowledgeIndexError):
+            knowledge_index.write_all(
+                outputs={"demo-api": output},
+                data_root=self.root,
+                target=target,
+            )
+
+        entries = list(target.iterdir())
+        self.assertEqual(len(entries), 1)
+        self.assertTrue(entries[0].name.startswith(".index-"))
+        self.assertEqual(entries[0].read_bytes(), user_bytes)
 
     def test_project_link_change_before_publish_preserves_existing_index(self):
         external = self.temporary / "external"
@@ -863,225 +1159,268 @@ body
         self.assertNotIn(str(external), str(caught.exception))
         self.assertEqual(target.read_bytes(), b"user bytes\r\n")
 
-    def test_source_retarget_after_publish_precheck_rolls_back_index(self):
+    def test_source_retarget_after_publish_never_writes_replacement_target(self):
         external = self.temporary / "external"
         original = external / "original"
         replacement = external / "replacement"
         original.mkdir(parents=True)
         replacement.mkdir()
         (original / "rule.md").write_text(LESSON, encoding="utf-8")
+        replacement_marker = replacement / "keep.txt"
+        replacement_marker.write_bytes(b"replacement target bytes\n")
         logical = self.root / "lessons" / "demo-api"
         logical.symlink_to(original, target_is_directory=True)
-        target = self.root / "index" / "demo-api.md"
-        target.write_bytes(b"previous bytes\r\n")
-        target.chmod(0o640)
-        original_replace = knowledge_index.os.replace
+        target = self.root / "index"
+        expected = knowledge_index.build_all(self.root)["demo-api"].encode(
+            "utf-8"
+        )
+        original_rename = personal_render._rename_entry_no_replace
         retargeted = False
 
-        def retarget_before_first_replace(source, destination, **kwargs):
+        def retarget_after_first_publish(parent, source, destination):
             nonlocal retargeted
+            result = original_rename(parent, source, destination)
             if not retargeted:
                 retargeted = True
                 logical.unlink()
                 logical.symlink_to(replacement, target_is_directory=True)
-            return original_replace(source, destination, **kwargs)
-        with mock.patch.object(
-            knowledge_index.os,
-            "replace",
-            side_effect=retarget_before_first_replace,
-        ), self.assertRaises(knowledge_index.KnowledgeSourceError):
-            knowledge_index.write_all(data_root=self.root, target=self.root / "index")
-
-        self.assertEqual(target.read_bytes(), b"previous bytes\r\n")
-        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
-        self.assertEqual(
-            {entry.name for entry in (self.root / "index").iterdir()},
-            {"demo-api.md"},
-        )
-
-    def test_source_retarget_during_multi_index_publish_rolls_back_namespace(self):
-        external = self.temporary / "external"
-        first = external / "first"
-        first_replacement = external / "first-replacement"
-        last = external / "last"
-        for directory in (first, first_replacement, last):
-            directory.mkdir(parents=True)
-        (first / "rule.md").write_text(LESSON, encoding="utf-8")
-        (last / "rule.md").write_text(LESSON, encoding="utf-8")
-        first_link = self.root / "lessons" / "a-project"
-        first_link.symlink_to(first, target_is_directory=True)
-        (self.root / "lessons" / "z-project").symlink_to(
-            last,
-            target_is_directory=True,
-        )
-        target = self.root / "index"
-        first_index = target / "a-project.md"
-        first_index.write_bytes(b"first previous\r\n")
-        first_index.chmod(0o640)
-        stale = target / "obsolete.md"
-        stale_bytes = (GENERATED_NOTICE + "\n# obsolete\n").encode("utf-8")
-        stale.write_bytes(stale_bytes)
-        stale.chmod(0o604)
-        original_replace = knowledge_index.os.replace
-        replacements = 0
-
-        def retarget_after_first_replace(source, destination, **kwargs):
-            nonlocal replacements
-            result = original_replace(source, destination, **kwargs)
-            replacements += 1
-            if replacements == 1:
-                first_link.unlink()
-                first_link.symlink_to(
-                    first_replacement,
-                    target_is_directory=True,
-                )
             return result
 
         with mock.patch.object(
-            knowledge_index.os,
-            "replace",
-            side_effect=retarget_after_first_replace,
-        ), self.assertRaisesRegex(
-            knowledge_index.KnowledgeIndexError,
-            "KNOWLEDGE_INDEX_ROLLBACK_FAILED",
-        ) as caught:
+            personal_render,
+            "_rename_entry_no_replace",
+            side_effect=retarget_after_first_publish,
+        ), self.assertRaises(knowledge_index.KnowledgeSourceError) as caught:
             knowledge_index.write_all(data_root=self.root, target=target)
 
-        self.assertNotIn(str(external), str(caught.exception))
-        self.assertEqual(first_index.read_bytes(), b"first previous\r\n")
-        self.assertEqual(stat.S_IMODE(first_index.stat().st_mode), 0o640)
-        self.assertFalse((target / "z-project.md").exists())
-        self.assertEqual(stale.read_bytes(), stale_bytes)
-        self.assertEqual(stat.S_IMODE(stale.stat().st_mode), 0o604)
-        recovery = [
-            entry
-            for entry in target.iterdir()
-            if (
-                entry.name.startswith(".index-quarantine-")
-                and entry.suffix == ".tmp"
-            )
-        ]
-        self.assertEqual(len(recovery), 1)
-        self.assertEqual(recovery[0].read_bytes(), b"")
-        metadata = recovery[0].with_suffix(".name")
-        self.assertEqual(metadata.read_text(encoding="utf-8"), "z-project.md\n")
-        retired = [
-            entry
-            for entry in target.iterdir()
-            if (
-                entry.name.startswith(".index-retired-")
-                and entry.suffix == ".tmp"
-            )
-        ]
-        self.assertEqual(len(retired), 1)
-        retired_metadata = retired[0].with_suffix(".name")
-        self.assertEqual(retired[0].read_bytes(), stale_bytes)
+        self.assertTrue(retargeted)
+        self.assertEqual(caught.exception.logical_path, "lessons/demo-api")
         self.assertEqual(
-            retired_metadata.read_text(encoding="utf-8"),
-            "obsolete.md\n",
+            caught.exception.reason,
+            "project link changed during scan",
         )
+        self.assertNotIn(str(external), str(caught.exception))
+        self.assertEqual((target / "demo-api.md").read_bytes(), expected)
         self.assertEqual(
             {entry.name for entry in target.iterdir()},
-            {
-                "a-project.md",
-                "obsolete.md",
-                recovery[0].name,
-                metadata.name,
-                retired[0].name,
-                retired_metadata.name,
-            },
+            {"demo-api.md"},
+        )
+        self.assertEqual(
+            replacement_marker.read_bytes(),
+            b"replacement target bytes\n",
+        )
+        self.assertEqual(
+            {entry.name for entry in replacement.iterdir()},
+            {"keep.txt"},
         )
 
-    def test_rollback_keeps_open_fd_mutation_of_retired_index(self):
+    def test_partial_publication_is_repaired_by_next_write(self):
         target = self.root / "index"
+        outputs = {
+            "a-project": GENERATED_NOTICE + "\n# a\n",
+            "z-project": GENERATED_NOTICE + "\n# z\n",
+        }
         stale = target / "obsolete.md"
         stale_bytes = (GENERATED_NOTICE + "\n# obsolete\n").encode("utf-8")
         stale.write_bytes(stale_bytes)
-        original_restore = knowledge_index._restore_missing_index
+        original_rename = personal_render._rename_entry_no_replace
 
-        def mutate_retired_then_restore(*args, **kwargs):
-            retired = next(
-                entry
-                for entry in target.iterdir()
-                if entry.name.startswith(".index-retired-")
-                and entry.suffix == ".tmp"
-            )
-            descriptor = os.open(retired, os.O_WRONLY)
-            try:
-                os.write(descriptor, b"user open-fd bytes\n")
-                os.ftruncate(descriptor, len(b"user open-fd bytes\n"))
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-            return original_restore(*args, **kwargs)
+        def fail_second_publish(parent, source, destination):
+            if destination == "z-project.md":
+                raise OSError("injected second publication failure")
+            return original_rename(parent, source, destination)
 
         with mock.patch.object(
-            knowledge_index,
-            "_require_projects_unchanged",
-            side_effect=[
-                None,
-                knowledge_index.KnowledgeIndexError("forced postcheck failure"),
-            ],
-        ), mock.patch.object(
-            knowledge_index,
-            "_restore_missing_index",
-            side_effect=mutate_retired_then_restore,
-        ), self.assertRaises(knowledge_index.KnowledgeIndexError):
+            personal_render,
+            "_rename_entry_no_replace",
+            side_effect=fail_second_publish,
+        ), self.assertRaisesRegex(
+            knowledge_index.KnowledgeIndexError,
+            "KNOWLEDGE_INDEX_INVALID z-project",
+        ):
             knowledge_index.write_all(
-                outputs={},
+                outputs=outputs,
                 data_root=self.root,
                 target=target,
             )
 
+        self.assertEqual(
+            (target / "a-project.md").read_bytes(),
+            outputs["a-project"].encode("utf-8"),
+        )
+        self.assertFalse((target / "z-project.md").exists())
         self.assertEqual(stale.read_bytes(), stale_bytes)
-        retired = [
-            entry
-            for entry in target.iterdir()
-            if entry.name.startswith(".index-retired-")
-            and entry.suffix == ".tmp"
-        ]
-        self.assertEqual(len(retired), 1)
-        self.assertEqual(retired[0].read_bytes(), b"user open-fd bytes\n")
-        self.assertTrue(retired[0].with_suffix(".name").is_file())
+        self.assertEqual(
+            {
+                entry.name
+                for entry in target.iterdir()
+                if entry.name.startswith(".index-")
+            },
+            set(),
+        )
+
         knowledge_index.write_all(
-            outputs={"obsolete": stale_bytes.decode("utf-8")},
+            outputs=outputs,
             data_root=self.root,
             target=target,
         )
-        self.assertEqual(retired[0].read_bytes(), b"user open-fd bytes\n")
-        self.assertTrue(retired[0].with_suffix(".name").is_file())
 
-
-    def test_rollback_keeps_path_replacement_of_retired_index(self):
-        target = self.root / "index"
-        stale = target / "obsolete.md"
-        stale_bytes = (GENERATED_NOTICE + "\n# obsolete\n").encode("utf-8")
-        stale.write_bytes(stale_bytes)
-        replacement = self.temporary / "retired-replacement"
-        replacement.write_bytes(b"user replacement bytes\n")
-        original_restore = knowledge_index._restore_missing_index
-
-        def replace_retired_then_restore(*args, **kwargs):
-            retired = next(
-                entry
+        self.assertEqual(
+            {
+                entry.name: entry.read_bytes()
                 for entry in target.iterdir()
-                if entry.name.startswith(".index-retired-")
-                and entry.suffix == ".tmp"
+            },
+            {
+                "a-project.md": outputs["a-project"].encode("utf-8"),
+                "z-project.md": outputs["z-project"].encode("utf-8"),
+            },
+        )
+
+    def test_owned_legacy_index_artifacts_are_removed_and_write_converges(self):
+        target = self.root / "index"
+        current_text = GENERATED_NOTICE + "\n# demo-api\n"
+        current_bytes = current_text.encode("utf-8")
+
+        recovery_name = _legacy_artifact_name(
+            "recovery",
+            "demo-api.md",
+            ".json",
+            "1" * 24,
+        )
+        (target / recovery_name).write_bytes(
+            _legacy_recovery_record_bytes(
+                "demo-api.md",
+                current_bytes,
+                0o640,
             )
-            os.replace(replacement, retired)
-            return original_restore(*args, **kwargs)
+        )
+        resolved_name = _legacy_artifact_name(
+            "resolved",
+            "resolved.md",
+            ".json",
+            "2" * 24,
+        )
+        (target / resolved_name).write_bytes(
+            _legacy_recovery_record_bytes(
+                "resolved.md",
+                (GENERATED_NOTICE + "\n# resolved\n").encode("utf-8"),
+                0o600,
+            )
+        )
+
+        paired_artifacts = (
+            ("retired", "retired.md", current_bytes),
+            ("quarantine", "quarantined.md", current_bytes),
+            ("quarantine", "empty.md", b""),
+        )
+        for artifact_number, (kind, logical_name, data) in enumerate(
+            paired_artifacts,
+            start=3,
+        ):
+            artifact_name = _legacy_artifact_name(
+                kind,
+                logical_name,
+                ".tmp",
+                str(artifact_number) * 24,
+            )
+            (target / artifact_name).write_bytes(data)
+            (target / artifact_name).with_suffix(".name").write_text(
+                logical_name + "\n",
+                encoding="utf-8",
+            )
+
+        temporary = target / (".index-" + "a" * 24 + ".tmp")
+        temporary.write_bytes(current_bytes)
+
+        knowledge_index.write_all(
+            outputs={"demo-api": current_text},
+            data_root=self.root,
+            target=target,
+        )
+
+        expected_names = {"demo-api.md"}
+        self.assertEqual({entry.name for entry in target.iterdir()}, expected_names)
+        self.assertEqual((target / "demo-api.md").read_bytes(), current_bytes)
+        first_write = {
+            entry.name: entry.read_bytes()
+            for entry in target.iterdir()
+        }
+
+        knowledge_index.write_all(
+            outputs={"demo-api": current_text},
+            data_root=self.root,
+            target=target,
+        )
+
+        self.assertEqual(
+            {
+                entry.name: entry.read_bytes()
+                for entry in target.iterdir()
+            },
+            first_write,
+        )
+
+    def test_legacy_cleanup_preserves_open_descriptor_mutation(self):
+        target = self.root / "index"
+        artifact = target / (".index-" + "e" * 24 + ".tmp")
+        artifact.write_bytes(
+            (GENERATED_NOTICE + "\n# generated\n").encode("utf-8")
+        )
+        user_bytes = b"user open-descriptor bytes\n"
+        descriptor = os.open(artifact, os.O_WRONLY)
+        original_rename = personal_render._rename_entry_no_replace
+        mutated = False
+
+        def mutate_before_cleanup(parent, source, destination):
+            nonlocal mutated
+            if source == artifact.name and not mutated:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                os.write(descriptor, user_bytes)
+                os.ftruncate(descriptor, len(user_bytes))
+                os.fsync(descriptor)
+                mutated = True
+            return original_rename(parent, source, destination)
+
+        try:
+            with mock.patch.object(
+                personal_render,
+                "_rename_entry_no_replace",
+                side_effect=mutate_before_cleanup,
+            ), self.assertRaises(knowledge_index.KnowledgeIndexError):
+                knowledge_index.write_all(
+                    outputs={},
+                    data_root=self.root,
+                    target=target,
+                )
+        finally:
+            os.close(descriptor)
+
+        self.assertTrue(mutated)
+        self.assertEqual(artifact.read_bytes(), user_bytes)
+
+    def test_legacy_cleanup_preserves_path_replacement(self):
+        target = self.root / "index"
+        artifact = target / (".index-" + "f" * 24 + ".tmp")
+        artifact.write_bytes(
+            (GENERATED_NOTICE + "\n# generated\n").encode("utf-8")
+        )
+        user_bytes = b"user replacement bytes\n"
+        replacement = self.temporary / "legacy-replacement"
+        replacement.write_bytes(user_bytes)
+        original_rename = personal_render._rename_entry_no_replace
+        replaced = False
+
+        def replace_before_cleanup(parent, source, destination):
+            nonlocal replaced
+            if source == artifact.name and not replaced:
+                os.replace(replacement, source, dst_dir_fd=parent)
+                replaced = True
+            return original_rename(parent, source, destination)
 
         with mock.patch.object(
-            knowledge_index,
-            "_require_projects_unchanged",
-            side_effect=[
-                None,
-                knowledge_index.KnowledgeIndexError("forced postcheck failure"),
-            ],
-        ), mock.patch.object(
-            knowledge_index,
-            "_restore_missing_index",
-            side_effect=replace_retired_then_restore,
+            personal_render,
+            "_rename_entry_no_replace",
+            side_effect=replace_before_cleanup,
         ), self.assertRaises(knowledge_index.KnowledgeIndexError):
             knowledge_index.write_all(
                 outputs={},
@@ -1089,1052 +1428,444 @@ body
                 target=target,
             )
 
-        self.assertEqual(stale.read_bytes(), stale_bytes)
-        retired = [
-            entry
-            for entry in target.iterdir()
-            if entry.name.startswith(".index-retired-")
-            and entry.suffix == ".tmp"
-        ]
-        self.assertEqual(len(retired), 1)
-        self.assertEqual(retired[0].read_bytes(), b"user replacement bytes\n")
-        self.assertTrue(retired[0].with_suffix(".name").is_file())
+        self.assertTrue(replaced)
+        self.assertEqual(artifact.read_bytes(), user_bytes)
 
-
-    def test_source_rollback_does_not_overwrite_concurrent_index_change(self):
-        external = self.temporary / "external"
-        original = external / "original"
-        replacement = external / "replacement"
-        original.mkdir(parents=True)
-        replacement.mkdir()
-        (original / "rule.md").write_text(LESSON, encoding="utf-8")
-        logical = self.root / "lessons" / "demo-api"
-        logical.symlink_to(original, target_is_directory=True)
-        target = self.root / "index" / "demo-api.md"
-        target.write_bytes(b"previous bytes\r\n")
-        original_replace = knowledge_index.os.replace
-        changed = False
-
-        def change_index_after_publish(source, destination, **kwargs):
-            nonlocal changed
-            result = original_replace(source, destination, **kwargs)
-            if not changed:
-                changed = True
-                target.write_bytes(b"concurrent user bytes\n")
-                logical.unlink()
-                logical.symlink_to(replacement, target_is_directory=True)
-            return result
-        with mock.patch.object(
-            knowledge_index.os,
-            "replace",
-            side_effect=change_index_after_publish,
-        ), self.assertRaisesRegex(
-            knowledge_index.KnowledgeIndexError,
-            "published entry restore failed",
-        ) as caught:
-            knowledge_index.write_all(
-                data_root=self.root,
-                target=self.root / "index",
-            )
-
-        self.assertNotIn(str(external), str(caught.exception))
-        self.assertEqual(target.read_bytes(), b"concurrent user bytes\n")
-        recovery = [
-            entry
-            for entry in target.parent.iterdir()
-            if (
-                entry.name.startswith(".index-recovery-")
-                and entry.suffix == ".json"
-            )
-        ]
-        self.assertEqual(len(recovery), 1)
-        record = json.loads(recovery[0].read_text(encoding="utf-8"))
-        self.assertEqual(record["logical_name"], "demo-api.md")
-        self.assertEqual(
-            base64.b64decode(record["data_base64"]),
-            b"previous bytes\r\n",
+    def test_ambiguous_legacy_index_artifact_is_preserved_and_fails_closed(self):
+        generated_bytes = (GENERATED_NOTICE + "\n# generated\n").encode("utf-8")
+        mismatched_resolved = _legacy_artifact_name(
+            "resolved",
+            "demo-api.md",
+            ".json",
+            "6" * 24,
         )
-
-    def test_absent_index_rollback_leaves_recovery_artifact_without_unlinking(self):
-        external = self.temporary / "external"
-        original = external / "original"
-        replacement = external / "replacement"
-        original.mkdir(parents=True)
-        replacement.mkdir()
-        (original / "rule.md").write_text(LESSON, encoding="utf-8")
-        logical = self.root / "lessons" / "demo-api"
-        logical.symlink_to(original, target_is_directory=True)
-        target = self.root / "index" / "demo-api.md"
-        original_replace = knowledge_index.os.replace
-        retargeted = False
-
-        def retarget_after_publish(source, destination, **kwargs):
-            nonlocal retargeted
-            result = original_replace(source, destination, **kwargs)
-            if not retargeted:
-                retargeted = True
-                logical.unlink()
-                logical.symlink_to(replacement, target_is_directory=True)
-            return result
-
-        with mock.patch.object(
-            knowledge_index.os,
-            "replace",
-            side_effect=retarget_after_publish,
-        ), self.assertRaisesRegex(
-            knowledge_index.KnowledgeIndexError,
-            "KNOWLEDGE_INDEX_ROLLBACK_FAILED",
-        ) as caught:
-            knowledge_index.write_all(data_root=self.root, target=self.root / "index")
-
-        self.assertNotIn(str(external), str(caught.exception))
-        self.assertFalse(target.exists())
-        recovery = [
-            entry
-            for entry in target.parent.iterdir()
-            if (
-                entry.name.startswith(".index-quarantine-")
-                and entry.suffix == ".tmp"
-            )
-        ]
-        self.assertEqual(len(recovery), 1)
-        self.assertEqual(recovery[0].read_bytes(), b"")
-        self.assertEqual(
-            recovery[0].with_suffix(".name").read_text(encoding="utf-8"),
-            "demo-api.md\n",
+        mismatched_retired = _legacy_artifact_name(
+            "retired",
+            "demo-api.md",
+            ".tmp",
+            "7" * 24,
         )
-
-    def test_quarantine_metadata_failure_returns_path_safe_aggregate(self):
-        target = self.root / "index"
-        output = GENERATED_NOTICE + "\n# replacement\n"
-
-        with mock.patch.object(
-            knowledge_index,
-            "_require_projects_unchanged",
-            side_effect=[
-                None,
-                knowledge_index.KnowledgeIndexError(
-                    "forced postcheck failure"
-                ),
-            ],
-        ), mock.patch.object(
-            knowledge_index,
-            "_persist_quarantine_metadata",
-            side_effect=knowledge_index.KnowledgeIndexError(
-                "synthetic metadata failure"
+        unsafe_quarantine = _legacy_artifact_name(
+            "quarantine",
+            "bad project.md",
+            ".tmp",
+            "8" * 24,
+        )
+        arbitrary_quarantine = _legacy_artifact_name(
+            "quarantine",
+            "demo-api.md",
+            ".tmp",
+            "9" * 24,
+        )
+        cases = (
+            (
+                "similar temporary name",
+                {".index-" + "a" * 23 + ".tmp": generated_bytes},
             ),
-        ), self.assertRaisesRegex(
-            knowledge_index.KnowledgeIndexError,
-            "published entry cleanup failed",
-        ) as caught:
+            (
+                "temporary with arbitrary bytes",
+                {".index-" + "b" * 24 + ".tmp": b"user bytes\x00\n"},
+            ),
+            (
+                "resolved record with mismatched digest",
+                {
+                    mismatched_resolved:
+                        _legacy_recovery_record_bytes(
+                            "other.md",
+                            generated_bytes,
+                            0o600,
+                        )
+                },
+            ),
+            (
+                "retired artifact without label",
+                {
+                    _legacy_artifact_name(
+                        "retired",
+                        "unpaired.md",
+                        ".tmp",
+                        "a" * 24,
+                    ): generated_bytes
+                },
+            ),
+            (
+                "retired artifact with mismatched label",
+                {
+                    mismatched_retired: generated_bytes,
+                    Path(mismatched_retired).with_suffix(".name").name:
+                        b"other.md\n",
+                },
+            ),
+            (
+                "unsafe quarantine label",
+                {
+                    unsafe_quarantine: b"",
+                    Path(unsafe_quarantine).with_suffix(".name").name:
+                        b"bad project.md\n",
+                },
+            ),
+            (
+                "quarantine with arbitrary bytes",
+                {
+                    arbitrary_quarantine: b"user quarantine bytes\n",
+                    Path(arbitrary_quarantine).with_suffix(".name").name:
+                        b"demo-api.md\n",
+                },
+            ),
+        )
+
+        for case_name, files in cases:
+            with self.subTest(case=case_name):
+                target = self.root / "index" / case_name.replace(" ", "-")
+                target.mkdir()
+                for name, data in files.items():
+                    (target / name).write_bytes(data)
+
+                with self.assertRaises(knowledge_index.KnowledgeIndexError):
+                    knowledge_index.write_all(
+                        outputs={},
+                        data_root=self.root,
+                        target=target,
+                    )
+
+                self.assertEqual(
+                    {
+                        entry.name: entry.read_bytes()
+                        for entry in target.iterdir()
+                    },
+                    files,
+                )
+
+        outside = self.temporary / "outside-index-artifact"
+        outside.write_bytes(b"outside bytes\n")
+        symlink_target = self.root / "index" / "symlink"
+        symlink_target.mkdir()
+        symlink = symlink_target / (".index-" + "c" * 24 + ".tmp")
+        symlink.symlink_to(outside)
+
+        with self.assertRaises(knowledge_index.KnowledgeIndexError):
+            knowledge_index.write_all(
+                outputs={},
+                data_root=self.root,
+                target=symlink_target,
+            )
+
+        self.assertTrue(symlink.is_symlink())
+        self.assertEqual(outside.read_bytes(), b"outside bytes\n")
+
+        directory_target = self.root / "index" / "directory"
+        directory_target.mkdir()
+        artifact_directory = directory_target / (
+            ".index-" + "d" * 24 + ".tmp"
+        )
+        artifact_directory.mkdir()
+
+        with self.assertRaises(knowledge_index.KnowledgeIndexError):
+            knowledge_index.write_all(
+                outputs={},
+                data_root=self.root,
+                target=directory_target,
+            )
+
+        self.assertTrue(artifact_directory.is_dir())
+
+    def test_existing_regular_and_symlink_outputs_are_replaced(self):
+        target = self.root / "index"
+        outputs = {
+            "a-project": GENERATED_NOTICE + "\n# current a\n",
+            "z-project": GENERATED_NOTICE + "\n# current z\n",
+        }
+        regular = target / "a-project.md"
+        regular.write_text(
+            GENERATED_NOTICE + "\n# previous a\n",
+            encoding="utf-8",
+        )
+        linked_target = self.temporary / "linked-index-target.md"
+        linked_target.write_bytes(b"user symlink target bytes\n")
+        linked = target / "z-project.md"
+        linked.symlink_to(linked_target)
+
+        knowledge_index.write_all(
+            outputs=outputs,
+            data_root=self.root,
+            target=target,
+        )
+
+        self.assertEqual(
+            regular.read_bytes(),
+            outputs["a-project"].encode("utf-8"),
+        )
+        self.assertEqual(
+            linked.read_bytes(),
+            outputs["z-project"].encode("utf-8"),
+        )
+        self.assertTrue(stat.S_ISREG(linked.lstat().st_mode))
+        self.assertEqual(
+            linked_target.read_bytes(),
+            b"user symlink target bytes\n",
+        )
+        self.assertEqual(
+            {entry.name for entry in target.iterdir()},
+            {"a-project.md", "z-project.md"},
+        )
+
+    def test_directory_and_special_output_paths_are_preserved(self):
+        output = GENERATED_NOTICE + "\n# replacement\n"
+        cases = ("directory", "fifo")
+
+        for case_name in cases:
+            with self.subTest(case=case_name):
+                target = self.root / "index" / case_name
+                target.mkdir()
+                existing = target / "demo-api.md"
+                if case_name == "directory":
+                    existing.mkdir()
+                    marker = existing / "keep.txt"
+                    marker.write_bytes(b"directory bytes\n")
+                else:
+                    os.mkfifo(existing)
+
+                with self.assertRaises(knowledge_index.KnowledgeIndexError):
+                    knowledge_index.write_all(
+                        outputs={"demo-api": output},
+                        data_root=self.root,
+                        target=target,
+                    )
+
+                if case_name == "directory":
+                    self.assertTrue(existing.is_dir())
+                    self.assertEqual(marker.read_bytes(), b"directory bytes\n")
+                else:
+                    self.assertTrue(stat.S_ISFIFO(existing.lstat().st_mode))
+
+    def test_output_path_swap_to_fifo_before_publish_preserves_fifo(self):
+        target = self.root / "index" / "output-race"
+        target.mkdir()
+        existing = target / "demo-api.md"
+        existing.write_text(
+            GENERATED_NOTICE + "\n# previous\n",
+            encoding="utf-8",
+        )
+        output = GENERATED_NOTICE + "\n# replacement\n"
+        original_rename = personal_render._rename_entry_no_replace
+        replaced = False
+
+        def replace_before_stage(parent, source, destination):
+            nonlocal replaced
+            if source == existing.name and not replaced:
+                existing.unlink()
+                os.mkfifo(existing)
+                replaced = True
+            return original_rename(parent, source, destination)
+
+        with mock.patch.object(
+            personal_render,
+            "_rename_entry_no_replace",
+            side_effect=replace_before_stage,
+        ), self.assertRaises(knowledge_index.KnowledgeIndexError) as caught:
             knowledge_index.write_all(
                 outputs={"demo-api": output},
                 data_root=self.root,
                 target=target,
             )
 
+        self.assertTrue(replaced)
         self.assertNotIn(str(self.temporary), str(caught.exception))
-        self.assertFalse((target / "demo-api.md").exists())
-        quarantine = [
-            entry
-            for entry in target.iterdir()
-            if (
-                entry.name.startswith(".index-quarantine-")
-                and entry.suffix == ".tmp"
-            )
-        ]
-        self.assertEqual(len(quarantine), 1)
-        self.assertEqual(quarantine[0].read_bytes(), b"")
-        self.assertFalse(quarantine[0].with_suffix(".name").exists())
-
-    def test_rollback_cleanup_failure_does_not_skip_later_existing_index(self):
-        target = self.root / "index"
-        later = target / "z-project.md"
-        later.write_bytes(b"later previous bytes\r\n")
-        outputs = {
-            "a-project": GENERATED_NOTICE + "\n# a\n",
-            "z-project": GENERATED_NOTICE + "\n# z\n",
-        }
-
-        with mock.patch.object(
-            knowledge_index,
-            "_require_projects_unchanged",
-            side_effect=[
-                None,
-                knowledge_index.KnowledgeIndexError(
-                    "forced publish invalidation"
-                ),
-            ],
-        ), self.assertRaisesRegex(
-            knowledge_index.KnowledgeIndexError,
-            "KNOWLEDGE_INDEX_ROLLBACK_FAILED",
-        ) as caught:
-            knowledge_index.write_all(
-                outputs=outputs,
-                data_root=self.root,
-                target=target,
-            )
-
-        self.assertNotIn(str(self.temporary), str(caught.exception))
-        self.assertFalse((target / "a-project.md").exists())
-        self.assertEqual(later.read_bytes(), b"later previous bytes\r\n")
-        recovery = [
-            entry
-            for entry in target.iterdir()
-            if (
-                entry.name.startswith(".index-quarantine-")
-                and entry.suffix == ".tmp"
-            )
-        ]
-        self.assertEqual(len(recovery), 1)
-        self.assertEqual(recovery[0].read_bytes(), b"")
-
-    def test_rollback_cleanup_failure_does_not_skip_later_absent_index(self):
-        target = self.root / "index"
-        outputs = {
-            "a-project": GENERATED_NOTICE + "\n# a\n",
-            "z-project": GENERATED_NOTICE + "\n# z\n",
-        }
-
-        with mock.patch.object(
-            knowledge_index,
-            "_require_projects_unchanged",
-            side_effect=[
-                None,
-                knowledge_index.KnowledgeIndexError(
-                    "forced publish invalidation"
-                ),
-            ],
-        ), self.assertRaisesRegex(
-            knowledge_index.KnowledgeIndexError,
-            "KNOWLEDGE_INDEX_ROLLBACK_FAILED",
-        ) as caught:
-            knowledge_index.write_all(
-                outputs=outputs,
-                data_root=self.root,
-                target=target,
-            )
-
-        self.assertNotIn(str(self.temporary), str(caught.exception))
-        self.assertFalse((target / "a-project.md").exists())
-        self.assertFalse((target / "z-project.md").exists())
-        recovery = [
-            entry
-            for entry in target.iterdir()
-            if (
-                entry.name.startswith(".index-quarantine-")
-                and entry.suffix == ".tmp"
-            )
-        ]
-        self.assertEqual(len(recovery), 2)
-        self.assertEqual(
-            {
-                entry.with_suffix(".name")
-                .read_text(encoding="utf-8")
-                .removesuffix("\n")
-                for entry in recovery
-            },
-            {"a-project.md", "z-project.md"},
-        )
-        self.assertEqual(
-            [entry.read_bytes() for entry in recovery],
-            [b"", b""],
-        )
-
-    def test_missing_stale_entry_is_not_restored_after_postcheck_failure(self):
-        target = self.root / "index"
-        current = target / "demo-api.md"
-        current.write_bytes(b"previous index bytes\r\n")
-        stale = target / "obsolete.md"
-        stale.write_text(
-            GENERATED_NOTICE + "\n# obsolete\n",
-            encoding="utf-8",
-        )
-        outputs = {
-            "demo-api": GENERATED_NOTICE + "\n# replacement\n",
-        }
-        original_rename = personal_render._rename_entry_no_replace
-        deleted = False
-
-        def delete_stale_before_quarantine(
-            directory_descriptor,
-            source_name,
-            destination_name,
-        ):
-            nonlocal deleted
-            if not deleted and source_name == "obsolete.md":
-                deleted = True
-                stale.unlink()
-            return original_rename(
-                directory_descriptor,
-                source_name,
-                destination_name,
-            )
-
-        with mock.patch.object(
-            knowledge_index,
-            "_require_projects_unchanged",
-            side_effect=[
-                None,
-                knowledge_index.KnowledgeIndexError(
-                    "forced postcheck failure"
-                ),
-            ],
-        ), mock.patch.object(
-            personal_render,
-            "_rename_entry_no_replace",
-            side_effect=delete_stale_before_quarantine,
-        ), self.assertRaisesRegex(
-            knowledge_index.KnowledgeIndexError,
-            "forced postcheck failure",
-        ):
-            knowledge_index.write_all(
-                outputs=outputs,
-                data_root=self.root,
-                target=target,
-            )
-
-        self.assertTrue(deleted)
-        self.assertFalse(stale.exists())
-        self.assertEqual(current.read_bytes(), b"previous index bytes\r\n")
-
-    def test_failed_existing_restore_retains_durable_backup_artifact(self):
-        target = self.root / "index"
-        current = target / "demo-api.md"
-        previous = b"previous index bytes\r\n"
-        current.write_bytes(previous)
-        current.chmod(0o640)
-        outputs = {
-            "demo-api": GENERATED_NOTICE + "\n# replacement\n",
-        }
-        original_replace = (
-            knowledge_index.replace_regular_file_at_if_unchanged_with_info
-        )
-        replacements = 0
-
-        def fail_rollback_restore(*args, **kwargs):
-            nonlocal replacements
-            replacements += 1
-            if replacements == 1:
-                raise OSError("synthetic rollback restore failure")
-            return original_replace(*args, **kwargs)
-
-        with mock.patch.object(
-            knowledge_index,
-            "_require_projects_unchanged",
-            side_effect=[
-                None,
-                knowledge_index.KnowledgeIndexError(
-                    "forced postcheck failure"
-                ),
-            ],
-        ), mock.patch.object(
-            knowledge_index,
-            "replace_regular_file_at_if_unchanged_with_info",
-            side_effect=fail_rollback_restore,
-        ), self.assertRaisesRegex(
-            knowledge_index.KnowledgeIndexError,
-            "published entry restore failed",
-        ) as caught:
-            knowledge_index.write_all(
-                outputs=outputs,
-                data_root=self.root,
-                target=target,
-            )
-
-        self.assertNotIn(str(self.temporary), str(caught.exception))
-        recovery = [
-            entry
-            for entry in target.iterdir()
-            if (
-                entry.name.startswith(".index-recovery-")
-                and entry.suffix == ".json"
-            )
-        ]
-        self.assertEqual(len(recovery), 1)
-        record = json.loads(recovery[0].read_text(encoding="utf-8"))
-        self.assertEqual(record["version"], 1)
-        self.assertEqual(record["logical_name"], "demo-api.md")
-        self.assertEqual(record["mode"], 0o640)
-        self.assertEqual(
-            base64.b64decode(record["data_base64"]),
-            previous,
-        )
-        self.assertEqual(stat.S_IMODE(recovery[0].stat().st_mode), 0o600)
-
-    def test_two_failed_restores_have_unambiguous_recovery_names(self):
-        target = self.root / "index"
-        previous = b"identical previous bytes\r\n"
-        for name in ("a-project.md", "z-project.md"):
-            entry = target / name
-            entry.write_bytes(previous)
-            entry.chmod(0o640)
-        outputs = {
-            "a-project": GENERATED_NOTICE + "\n# replacement a\n",
-            "z-project": GENERATED_NOTICE + "\n# replacement z\n",
-        }
-
-        with mock.patch.object(
-            knowledge_index,
-            "_require_projects_unchanged",
-            side_effect=[
-                None,
-                knowledge_index.KnowledgeIndexError(
-                    "forced postcheck failure"
-                ),
-            ],
-        ), mock.patch.object(
-            knowledge_index,
-            "replace_regular_file_at_if_unchanged_with_info",
-            side_effect=OSError("synthetic rollback restore failure"),
-        ), self.assertRaisesRegex(
-            knowledge_index.KnowledgeIndexError,
-            "published entry restore failed",
-        ) as caught:
-            knowledge_index.write_all(
-                outputs=outputs,
-                data_root=self.root,
-                target=target,
-            )
-
-        self.assertNotIn(str(self.temporary), str(caught.exception))
-        recovery = [
-            entry
-            for entry in target.iterdir()
-            if (
-                entry.name.startswith(".index-recovery-")
-                and entry.suffix == ".json"
-            )
-        ]
-        self.assertEqual(len(recovery), 2)
-        records = [
-            json.loads(entry.read_text(encoding="utf-8"))
-            for entry in recovery
-        ]
-        self.assertEqual(
-            {record["logical_name"] for record in records},
-            {"a-project.md", "z-project.md"},
-        )
-        self.assertEqual(
-            [base64.b64decode(record["data_base64"]) for record in records],
-            [previous, previous],
-        )
-        self.assertEqual(
-            [record["mode"] for record in records],
-            [0o640, 0o640],
-        )
-        self.assertEqual(
-            [stat.S_IMODE(entry.stat().st_mode) for entry in recovery],
-            [0o600, 0o600],
-        )
-        self.assertEqual(knowledge_index.build_all(self.root), {})
-    def test_generator_owned_stale_index_is_retired_and_not_resurrected(self):
-        target = self.root / "index"
-        previous = (GENERATED_NOTICE + "\n# obsolete\n").encode("utf-8")
-        stale = target / "obsolete.md"
-        stale.write_bytes(previous)
-        stale.chmod(0o640)
-
-        knowledge_index.write_all(
-            outputs={},
-            data_root=self.root,
-            target=target,
-        )
-
-        self.assertFalse(stale.exists())
-        retired = [
-            entry
-            for entry in target.iterdir()
-            if (
-                entry.name.startswith(".index-retired-")
-                and entry.suffix == ".tmp"
-            )
-        ]
-        self.assertEqual(len(retired), 1)
-        self.assertEqual(retired[0].read_bytes(), previous)
-        self.assertEqual(
-            retired[0].with_suffix(".name").read_text(encoding="utf-8"),
-            "obsolete.md\n",
-        )
-
-        knowledge_index.write_all(
-            outputs={},
-            data_root=self.root,
-            target=target,
-        )
-        self.assertFalse(stale.exists())
+        self.assertTrue(stat.S_ISFIFO(existing.lstat().st_mode))
         self.assertEqual(
             {entry.name for entry in target.iterdir()},
-            {retired[0].name, retired[0].with_suffix(".name").name},
+            {"demo-api.md"},
         )
 
-    def test_missing_index_is_restored_from_recovery_record_on_next_write(self):
-        target = self.root / "index"
-        previous = (GENERATED_NOTICE + "\n# previous\n").encode("utf-8")
-        current = target / "demo-api.md"
-        current.write_bytes(previous)
-        current.chmod(0o640)
-
-        with mock.patch.object(
-            knowledge_index,
-            "_require_projects_unchanged",
-            side_effect=[
-                None,
-                knowledge_index.KnowledgeIndexError(
-                    "forced postcheck failure"
-                ),
-            ],
-        ), mock.patch.object(
-            knowledge_index,
-            "replace_regular_file_at_if_unchanged_with_info",
-            side_effect=OSError("synthetic rollback restore failure"),
-        ), self.assertRaises(knowledge_index.KnowledgeIndexError):
-            knowledge_index.write_all(
-                outputs={
-                    "demo-api": GENERATED_NOTICE + "\n# replacement\n",
-                },
-                data_root=self.root,
-                target=target,
-            )
-
-        current.unlink()
-        knowledge_index.write_all(
-            outputs={"demo-api": previous.decode("utf-8")},
-            data_root=self.root,
-            target=target,
-        )
-
-        self.assertEqual(current.read_bytes(), previous)
-        self.assertEqual(stat.S_IMODE(current.stat().st_mode), 0o640)
-        self.assertFalse(
-            any(
-                entry.name.startswith(".index-recovery-")
-                for entry in target.iterdir()
-            )
-        )
-        resolved = [
-            entry
-            for entry in target.iterdir()
-            if entry.name.startswith(".index-resolved-")
-        ]
-        self.assertEqual(len(resolved), 1)
-        record = json.loads(resolved[0].read_text(encoding="utf-8"))
-        self.assertEqual(record["logical_name"], "demo-api.md")
-        self.assertEqual(
-            base64.b64decode(record["data_base64"]),
-            previous,
-        )
-
-    def test_recovery_record_conflict_reports_only_logical_index_name(self):
-        target = self.root / "index"
-        previous = (GENERATED_NOTICE + "\n# previous\n").encode("utf-8")
-        current = target / "demo-api.md"
-        current.write_bytes(previous)
-
-        with mock.patch.object(
-            knowledge_index,
-            "_require_projects_unchanged",
-            side_effect=[
-                None,
-                knowledge_index.KnowledgeIndexError(
-                    "forced postcheck failure"
-                ),
-            ],
-        ), mock.patch.object(
-            knowledge_index,
-            "replace_regular_file_at_if_unchanged_with_info",
-            side_effect=OSError("synthetic rollback restore failure"),
-        ), self.assertRaises(knowledge_index.KnowledgeIndexError):
-            knowledge_index.write_all(
-                outputs={
-                    "demo-api": GENERATED_NOTICE + "\n# replacement\n",
-                },
-                data_root=self.root,
-                target=target,
-            )
-
-        with self.assertRaisesRegex(
-            knowledge_index.KnowledgeIndexError,
-            "KNOWLEDGE_INDEX_RECOVERY_CONFLICT demo-api.md",
-        ) as caught:
-            knowledge_index.write_all(
-                outputs={"demo-api": previous.decode("utf-8")},
-                data_root=self.root,
-                target=target,
-            )
-
-        self.assertNotIn(str(self.temporary), str(caught.exception))
-        self.assertEqual(
-            current.read_bytes(),
-            (GENERATED_NOTICE + "\n# replacement\n").encode("utf-8"),
-        )
-
-    def test_existing_index_restore_applies_exact_mode_after_writing_bytes(self):
-        target = self.root / "index"
-        current = target / "demo-api.md"
-        previous = (GENERATED_NOTICE + "\n# previous\n").encode("utf-8")
-        replacement = (GENERATED_NOTICE + "\n# replacement\n").encode("utf-8")
-        current.write_bytes(replacement)
-        expected_info = current.stat()
-        events = []
-        original_write = os.write
-        original_fchmod = os.fchmod
-
-        def trace_write(descriptor, data):
-            events.append(("write", descriptor, None))
-            return original_write(descriptor, data)
-
-        def trace_fchmod(descriptor, mode):
-            events.append(("fchmod", descriptor, mode))
-            return original_fchmod(descriptor, mode)
-
-        directory_descriptor = file_io.open_directory_path(target)
-        try:
-            with mock.patch.object(
-                file_io.os,
-                "write",
-                side_effect=trace_write,
-            ), mock.patch.object(
-                file_io.os,
-                "fchmod",
-                side_effect=trace_fchmod,
-            ):
-                restored_info = (
-                    file_io.replace_regular_file_at_if_unchanged_with_info(
-                        directory_descriptor,
-                        current.name,
-                        replacement,
-                        previous,
-                        0o4755,
-                        expected_info=expected_info,
-                    )
-                )
-        finally:
-            os.close(directory_descriptor)
-
-        self.assertIsNotNone(restored_info)
-        replacement_descriptor = next(
-            descriptor
-            for action, descriptor, _ in events
-            if action == "write"
-        )
-        last_write = max(
-            index
-            for index, event in enumerate(events)
-            if event[:2] == ("write", replacement_descriptor)
-        )
-        final_mode = max(
-            index
-            for index, event in enumerate(events)
-            if event == ("fchmod", replacement_descriptor, 0o4755)
-        )
-        self.assertGreater(final_mode, last_write)
-        self.assertEqual(current.read_bytes(), previous)
-        self.assertEqual(stat.S_IMODE(current.stat().st_mode), 0o4755)
-
-    def test_recovery_record_restores_exact_special_mode_bits(self):
-        target = self.root / "index"
-        previous = (GENERATED_NOTICE + "\n# previous\n").encode("utf-8")
-        current = target / "demo-api.md"
-        current.write_bytes(previous)
-        current.chmod(0o7640)
-
-        with mock.patch.object(
-            knowledge_index,
-            "_require_projects_unchanged",
-            side_effect=[
-                None,
-                knowledge_index.KnowledgeIndexError(
-                    "forced postcheck failure"
-                ),
-            ],
-        ), mock.patch.object(
-            knowledge_index,
-            "replace_regular_file_at_if_unchanged_with_info",
-            side_effect=OSError("synthetic rollback restore failure"),
-        ), self.assertRaises(knowledge_index.KnowledgeIndexError):
-            knowledge_index.write_all(
-                outputs={
-                    "demo-api": GENERATED_NOTICE + "\n# replacement\n",
-                },
-                data_root=self.root,
-                target=target,
-            )
-
-        current.unlink()
-        knowledge_index.write_all(
-            outputs={"demo-api": previous.decode("utf-8")},
-            data_root=self.root,
-            target=target,
-        )
-
-        self.assertEqual(current.read_bytes(), previous)
-        self.assertEqual(stat.S_IMODE(current.stat().st_mode), 0o7640)
-
-
-    def test_long_project_second_write_uses_bounded_recovery_names(self):
-        project = "a" * 240
-        self.write("lessons/{}/rule.md".format(project), LESSON)
-        target = self.root / "index"
-
-        knowledge_index.write_all(data_root=self.root, target=target)
-        knowledge_index.write_all(data_root=self.root, target=target)
-
-        self.assertTrue((target / (project + ".md")).is_file())
-        self.assertEqual(
-            [
-                entry.name
-                for entry in target.iterdir()
-                if entry.name.startswith(".index-")
-            ],
-            [],
-        )
-
-    def test_backup_metadata_path_replacement_is_never_unlinked(self):
-        target = self.root / "index"
-        current = target / "demo-api.md"
-        current.write_bytes(b"previous public bytes\r\n")
-        user_file = self.temporary / "user-metadata"
-        user_file.write_bytes(b"user replacement bytes\n")
-        replaced_path = None
-
-        def replace_metadata_path(_projects):
-            nonlocal replaced_path
-            if replaced_path is not None:
-                return
-            metadata = next(
-                (
-                    entry
-                    for entry in target.iterdir()
-                    if entry.name.startswith(".index-backup-")
-                    and entry.suffix == ".name"
-                ),
-                None,
-            )
-            if metadata is not None:
-                os.replace(user_file, metadata)
-                replaced_path = metadata
-
-        with mock.patch.object(
-            knowledge_index,
-            "_require_projects_unchanged",
-            side_effect=replace_metadata_path,
-        ):
-            knowledge_index.write_all(
-                outputs={
-                    "demo-api": GENERATED_NOTICE + "\n# replacement\n",
-                },
-                data_root=self.root,
-                target=target,
-            )
-
-        preserved = user_file if user_file.exists() else replaced_path
-        self.assertIsNotNone(preserved)
-        self.assertTrue(preserved.exists())
-        self.assertEqual(preserved.read_bytes(), b"user replacement bytes\n")
-
-    def test_backup_metadata_open_descriptor_write_is_never_unlinked(self):
-        target = self.root / "index"
-        current = target / "demo-api.md"
-        current.write_bytes(b"previous public bytes\r\n")
-        mutated_path = None
-
-        def mutate_metadata_inode(_projects):
-            nonlocal mutated_path
-            if mutated_path is not None:
-                return
-            metadata = next(
-                (
-                    entry
-                    for entry in target.iterdir()
-                    if entry.name.startswith(".index-backup-")
-                    and entry.suffix == ".name"
-                ),
-                None,
-            )
-            if metadata is None:
-                return
-            descriptor = os.open(metadata, os.O_WRONLY | os.O_TRUNC)
-            try:
-                os.write(descriptor, b"user descriptor bytes\n")
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-            mutated_path = metadata
-
-        with mock.patch.object(
-            knowledge_index,
-            "_require_projects_unchanged",
-            side_effect=mutate_metadata_inode,
-        ):
-            knowledge_index.write_all(
-                outputs={
-                    "demo-api": GENERATED_NOTICE + "\n# replacement\n",
-                },
-                data_root=self.root,
-                target=target,
-            )
-
-        if mutated_path is not None:
-            self.assertTrue(mutated_path.exists())
-            self.assertEqual(
-                mutated_path.read_bytes(),
-                b"user descriptor bytes\n",
-            )
-
-    def test_recovery_name_collision_does_not_remove_existing_artifact(self):
-        target = self.root / "index"
-        collision = target / ".index-recovery-collision.json"
-        collision.write_bytes(b"user artifact bytes\n")
-        directory_descriptor = knowledge_index.open_directory_path(target)
-        try:
-            with mock.patch.object(
-                knowledge_index,
-                "_recovery_name",
-                return_value=collision.name,
-            ), self.assertRaisesRegex(
-                knowledge_index.KnowledgeIndexError,
-                "cannot allocate index recovery record",
-            ):
-                knowledge_index._persist_index_recovery_record(
-                    directory_descriptor,
-                    "demo-api.md",
-                    b"previous public bytes\r\n",
-                    0o640,
-                )
-        finally:
-            os.close(directory_descriptor)
-
-        self.assertEqual(collision.read_bytes(), b"user artifact bytes\n")
-
-    def test_normal_write_does_not_materialize_recovery_records(self):
-        target = self.root / "index"
-        current = target / "demo-api.md"
-        current.write_bytes(b"previous public bytes\r\n")
-        replacement = GENERATED_NOTICE + "\n# replacement\n"
-        original_open = knowledge_index.os.open
-
-        def reject_recovery_record(path, flags, *args, **kwargs):
-            if Path(os.fspath(path)).name.startswith(".index-recovery-"):
-                raise OSError("unexpected recovery record creation")
-            return original_open(path, flags, *args, **kwargs)
-
-        with mock.patch.object(
-            knowledge_index.os,
-            "open",
-            side_effect=reject_recovery_record,
-        ):
-            knowledge_index.write_all(
-                outputs={"demo-api": replacement},
-                data_root=self.root,
-                target=target,
-            )
-
-        self.assertEqual(current.read_bytes(), replacement.encode("utf-8"))
-        self.assertEqual(
-            [
-                entry.name
-                for entry in target.iterdir()
-                if entry.name.startswith(".index-")
-            ],
-            [],
-        )
-
-    def test_long_project_recovery_sidecars_map_backup_and_quarantine(self):
-        existing_project = "a" * 240
-        absent_project = "z" * 240
-        target = self.root / "index"
-        previous = b"previous long project bytes\r\n"
-        existing = target / (existing_project + ".md")
-        existing.write_bytes(previous)
-        existing.chmod(0o640)
-        outputs = {
-            existing_project: GENERATED_NOTICE + "\n# replacement a\n",
-            absent_project: GENERATED_NOTICE + "\n# replacement z\n",
-        }
-        original_replace = (
-            knowledge_index.replace_regular_file_at_if_unchanged_with_info
-        )
-
-        def fail_existing_restore(parent_descriptor, name, *args, **kwargs):
-            if name == existing_project + ".md":
-                raise OSError("synthetic rollback restore failure")
-            return original_replace(
-                parent_descriptor,
-                name,
-                *args,
-                **kwargs,
-            )
-
-
-        with mock.patch.object(
-            knowledge_index,
-            "_require_projects_unchanged",
-            side_effect=[
-                None,
-                knowledge_index.KnowledgeIndexError(
-                    "forced postcheck failure"
-                ),
-            ],
-        ), mock.patch.object(
-            knowledge_index,
-            "replace_regular_file_at_if_unchanged_with_info",
-            side_effect=fail_existing_restore,
-        ), self.assertRaisesRegex(
-            knowledge_index.KnowledgeIndexError,
-            "KNOWLEDGE_INDEX_ROLLBACK_FAILED",
-        ) as caught:
-            knowledge_index.write_all(
-                outputs=outputs,
-                data_root=self.root,
-                target=target,
-            )
-
-        self.assertNotIn(str(self.temporary), str(caught.exception))
-        metadata = [
-            entry
-            for entry in target.iterdir()
-            if entry.suffix == ".name"
-        ]
-        self.assertEqual(len(metadata), 1)
-        quarantine = metadata[0].with_suffix(".tmp")
-        self.assertTrue(quarantine.is_file())
-        self.assertLessEqual(len(os.fsencode(quarantine.name)), 255)
-        self.assertLessEqual(len(os.fsencode(metadata[0].name)), 255)
-        self.assertEqual(
-            metadata[0].read_text(encoding="utf-8"),
-            absent_project + ".md\n",
-        )
-        self.assertTrue(quarantine.name.startswith(".index-quarantine-"))
-
-        recovery = [
-            entry
-            for entry in target.iterdir()
-            if (
-                entry.name.startswith(".index-recovery-")
-                and entry.suffix == ".json"
-            )
-        ]
-        self.assertEqual(len(recovery), 1)
-        self.assertLessEqual(len(os.fsencode(recovery[0].name)), 255)
-        record = json.loads(recovery[0].read_text(encoding="utf-8"))
-        self.assertEqual(record["logical_name"], existing_project + ".md")
-        self.assertEqual(record["mode"], 0o640)
-        self.assertEqual(
-            base64.b64decode(record["data_base64"]),
-            previous,
-        )
-
-
-    def test_stale_index_removal_preserves_concurrent_writer(self):
-        self.write("lessons/demo-api/rule.md", LESSON)
-        target = self.root / "index"
-        stale = target / "obsolete.md"
-        stale.write_text(
-            GENERATED_NOTICE + "\n# obsolete\n",
+    def test_output_path_swap_to_regular_before_stage_preserves_replacement(self):
+        target = self.root / "index" / "output-regular-race"
+        target.mkdir()
+        existing = target / "demo-api.md"
+        existing.write_text(
+            GENERATED_NOTICE + "\n# previous\n",
             encoding="utf-8",
         )
-        concurrent = self.temporary / "concurrent-stale"
-        concurrent.write_bytes(b"concurrent stale bytes\n")
-        original_read = knowledge_index.read_regular_file_at
-        writer_published = False
-
-        def publish_writer_after_quarantine_read(parent, name, maximum_bytes):
-            nonlocal writer_published
-            data = original_read(parent, name, maximum_bytes)
-            if not writer_published and name.startswith(".index-retired-"):
-                os.replace(concurrent, stale.name, dst_dir_fd=parent)
-                writer_published = True
-            return data
-
-        with mock.patch.object(
-            knowledge_index,
-            "read_regular_file_at",
-            side_effect=publish_writer_after_quarantine_read,
-        ), self.assertRaisesRegex(
-            knowledge_index.KnowledgeIndexError,
-            "KNOWLEDGE_INDEX_ROLLBACK_FAILED",
-        ):
-            knowledge_index.write_all(data_root=self.root, target=target)
-
-        self.assertTrue(writer_published)
-        self.assertEqual(stale.read_bytes(), b"concurrent stale bytes\n")
-        self.assertFalse((target / "demo-api.md").exists())
-
-    def test_stale_quarantine_open_descriptor_write_is_preserved(self):
-        self.write("lessons/demo-api/rule.md", LESSON)
-        target = self.root / "index"
-        stale = target / "obsolete.md"
-        stale.write_text(
-            GENERATED_NOTICE + "\n# obsolete\n",
-            encoding="utf-8",
-        )
-        original_read = knowledge_index.read_regular_file_at
-        mutated = False
-
-        def mutate_renamed_inode_after_read(parent, name, maximum_bytes):
-            nonlocal mutated
-            if not mutated and name.startswith(".index-retired-"):
-                descriptor = os.open(name, os.O_WRONLY, dir_fd=parent)
-                try:
-                    data = original_read(parent, name, maximum_bytes)
-                    os.write(descriptor, b"open descriptor bytes\n")
-                    os.ftruncate(descriptor, len(b"open descriptor bytes\n"))
-                    os.fsync(descriptor)
-                finally:
-                    os.close(descriptor)
-                mutated = True
-                return data
-            return original_read(parent, name, maximum_bytes)
-
-        with mock.patch.object(
-            knowledge_index,
-            "read_regular_file_at",
-            side_effect=mutate_renamed_inode_after_read,
-        ), self.assertRaisesRegex(
-            knowledge_index.KnowledgeIndexError,
-            "KNOWLEDGE_INDEX_ROLLBACK_FAILED",
-        ):
-            knowledge_index.write_all(data_root=self.root, target=target)
-
-        self.assertTrue(mutated)
-        self.assertEqual(stale.read_bytes(), b"open descriptor bytes\n")
-        self.assertFalse((target / "demo-api.md").exists())
-
-    def test_stale_quarantine_path_replacement_is_preserved(self):
-        self.write("lessons/demo-api/rule.md", LESSON)
-        target = self.root / "index"
-        stale = target / "obsolete.md"
-        stale.write_text(
-            GENERATED_NOTICE + "\n# obsolete\n",
-            encoding="utf-8",
-        )
-        concurrent = self.temporary / "concurrent-quarantine"
-        concurrent.write_bytes(b"quarantine replacement bytes\n")
-        original_read = knowledge_index.read_regular_file_at
+        replacement_bytes = b"user replacement bytes\n"
+        replacement = self.temporary / "replacement-output.md"
+        replacement.write_bytes(replacement_bytes)
+        original_snapshot = personal_render._snapshot_output_entry
         replaced = False
 
-        def replace_quarantine_after_read(parent, name, maximum_bytes):
+        def snapshot_then_replace(parent, name):
             nonlocal replaced
-            data = original_read(parent, name, maximum_bytes)
-            if not replaced and name.startswith(".index-retired-"):
-                os.replace(concurrent, name, dst_dir_fd=parent)
+            snapshot = original_snapshot(parent, name)
+            if name == existing.name and not replaced:
+                os.replace(replacement, existing)
                 replaced = True
-            return data
+            return snapshot
 
         with mock.patch.object(
-            knowledge_index,
-            "read_regular_file_at",
-            side_effect=replace_quarantine_after_read,
-        ), self.assertRaisesRegex(
-            knowledge_index.KnowledgeIndexError,
-            "KNOWLEDGE_INDEX_ROLLBACK_FAILED",
-        ):
-            knowledge_index.write_all(data_root=self.root, target=target)
+            personal_render,
+            "_snapshot_output_entry",
+            side_effect=snapshot_then_replace,
+        ), self.assertRaises(knowledge_index.KnowledgeIndexError):
+            knowledge_index.write_all(
+                outputs={
+                    "demo-api": GENERATED_NOTICE + "\n# replacement\n"
+                },
+                data_root=self.root,
+                target=target,
+            )
 
         self.assertTrue(replaced)
-        self.assertEqual(stale.read_bytes(), b"quarantine replacement bytes\n")
-        self.assertFalse((target / "demo-api.md").exists())
+        self.assertEqual(existing.read_bytes(), replacement_bytes)
+        self.assertEqual(
+            {entry.name for entry in target.iterdir()},
+            {"demo-api.md"},
+        )
+
+    def test_generator_owned_stale_index_is_removed_when_unchanged(self):
+        target = self.root / "index"
+        stale = target / "obsolete.md"
+        stale.write_text(
+            GENERATED_NOTICE + "\n# obsolete\n",
+            encoding="utf-8",
+        )
+        output = GENERATED_NOTICE + "\n# current\n"
+
+        knowledge_index.write_all(
+            outputs={"demo-api": output},
+            data_root=self.root,
+            target=target,
+        )
+
+        self.assertFalse(stale.exists())
+        self.assertEqual(
+            {
+                entry.name: entry.read_bytes()
+                for entry in target.iterdir()
+            },
+            {"demo-api.md": output.encode("utf-8")},
+        )
+
+    def test_stale_index_removal_preserves_open_descriptor_mutation(self):
+        target = self.root / "index"
+        stale = target / "obsolete.md"
+        stale.write_text(
+            GENERATED_NOTICE + "\n# obsolete\n",
+            encoding="utf-8",
+        )
+        user_bytes = b"user open-descriptor bytes\n"
+        descriptor = os.open(stale, os.O_WRONLY)
+        original_rename = personal_render._rename_entry_no_replace
+        mutated = False
+        output = GENERATED_NOTICE + "\n# current\n"
+
+        def mutate_before_stale_removal(parent, source, destination):
+            nonlocal mutated
+            if source == stale.name and not mutated:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                os.write(descriptor, user_bytes)
+                os.ftruncate(descriptor, len(user_bytes))
+                os.fsync(descriptor)
+                mutated = True
+            return original_rename(parent, source, destination)
+
+        try:
+            with mock.patch.object(
+                personal_render,
+                "_rename_entry_no_replace",
+                side_effect=mutate_before_stale_removal,
+            ), self.assertRaises(knowledge_index.KnowledgeIndexError):
+                knowledge_index.write_all(
+                    outputs={"demo-api": output},
+                    data_root=self.root,
+                    target=target,
+                )
+        finally:
+            os.close(descriptor)
+
+        self.assertTrue(mutated)
+        self.assertEqual(stale.read_bytes(), user_bytes)
+        self.assertEqual(
+            (target / "demo-api.md").read_bytes(),
+            output.encode("utf-8"),
+        )
+        self.assertEqual(
+            {entry.name for entry in target.iterdir()},
+            {"demo-api.md", "obsolete.md"},
+        )
+
+    def test_stale_index_removal_preserves_path_replacement(self):
+        target = self.root / "index"
+        stale = target / "obsolete.md"
+        stale.write_text(
+            GENERATED_NOTICE + "\n# obsolete\n",
+            encoding="utf-8",
+        )
+        user_bytes = b"user replacement bytes\n"
+        replacement = self.temporary / "stale-replacement"
+        replacement.write_bytes(user_bytes)
+        original_rename = personal_render._rename_entry_no_replace
+        replaced = False
+        output = GENERATED_NOTICE + "\n# current\n"
+
+        def replace_before_stale_removal(parent, source, destination):
+            nonlocal replaced
+            if source == stale.name and not replaced:
+                os.replace(replacement, source, dst_dir_fd=parent)
+                replaced = True
+            return original_rename(parent, source, destination)
+
+        with mock.patch.object(
+            personal_render,
+            "_rename_entry_no_replace",
+            side_effect=replace_before_stale_removal,
+        ), self.assertRaises(knowledge_index.KnowledgeIndexError):
+            knowledge_index.write_all(
+                outputs={"demo-api": output},
+                data_root=self.root,
+                target=target,
+            )
+
+        self.assertTrue(replaced)
+        self.assertEqual(stale.read_bytes(), user_bytes)
+        self.assertEqual(
+            (target / "demo-api.md").read_bytes(),
+            output.encode("utf-8"),
+        )
+        self.assertEqual(
+            {entry.name for entry in target.iterdir()},
+            {"demo-api.md", "obsolete.md"},
+        )
+
+    def test_unknown_stale_symlink_and_directory_are_preserved(self):
+        output = GENERATED_NOTICE + "\n# current\n"
+        outside = self.temporary / "outside-stale.md"
+        outside.write_bytes(b"user linked bytes\n")
+
+        for case_name in ("symlink", "directory"):
+            with self.subTest(case=case_name):
+                target = self.root / "index" / ("stale-" + case_name)
+                target.mkdir()
+                stale = target / "obsolete.md"
+                if case_name == "symlink":
+                    stale.symlink_to(outside)
+                else:
+                    stale.mkdir()
+                    (stale / "keep.txt").write_bytes(b"directory bytes\n")
+
+                with self.assertRaises(knowledge_index.KnowledgeIndexError):
+                    knowledge_index.write_all(
+                        outputs={"demo-api": output},
+                        data_root=self.root,
+                        target=target,
+                    )
+
+                if case_name == "symlink":
+                    self.assertTrue(stale.is_symlink())
+                    self.assertEqual(outside.read_bytes(), b"user linked bytes\n")
+                else:
+                    self.assertTrue(stale.is_dir())
+                    self.assertEqual(
+                        (stale / "keep.txt").read_bytes(),
+                        b"directory bytes\n",
+                    )
 
     def test_project_link_change_during_scan_preserves_existing_index(self):
         external = self.temporary / "external"
@@ -2254,6 +1985,18 @@ body
         self.assertEqual(returned, target)
         self.assertEqual((target / "demo-api.md").read_bytes(), outputs["demo-api"].encode("utf-8"))
         self.assertEqual((target / "_global.md").read_bytes(), outputs["_global"].encode("utf-8"))
+        self.assertEqual(
+            {entry.name for entry in target.iterdir()},
+            {"_global.md", "demo-api.md"},
+        )
+        self.assertEqual(
+            {
+                entry.name
+                for entry in target.parent.iterdir()
+                if entry.name.startswith(".index-directory-")
+            },
+            set(),
+        )
 
 
     def test_lesson_publish_cannot_be_overwritten_by_an_older_index_snapshot(self):
@@ -2311,37 +2054,57 @@ body
         self.assertIn("작업 규칙", output)
         self.assertNotIn("작업 문서", output)
 
-    def test_check_accepts_valid_resolved_and_retired_history(self):
+    def test_check_classifies_valid_legacy_artifacts_without_removing_them(self):
         self.write("lessons/demo-api/one.md", LESSON)
         target = self.root / "index"
         knowledge_index.write_all(data_root=self.root, target=target)
         current = target / "demo-api.md"
         current_data = current.read_bytes()
         current_mode = stat.S_IMODE(current.stat().st_mode)
-        resolved_name = knowledge_index._recovery_name(
+        resolved_name = _legacy_artifact_name(
             "resolved",
             current.name,
             ".json",
+            "b" * 24,
         )
         (target / resolved_name).write_bytes(
-            knowledge_index._recovery_record_bytes(
+            _legacy_recovery_record_bytes(
                 current.name,
                 current_data,
                 current_mode,
             )
         )
-        retired_name = knowledge_index._recovery_name(
-            "retired",
-            current.name,
-            ".tmp",
-        )
-        (target / retired_name).write_bytes(b"retired history\n")
-        (target / retired_name).with_suffix(".name").write_text(
-            current.name + "\n",
-            encoding="utf-8",
-        )
+        for artifact_number, kind in enumerate(
+            ("retired", "quarantine"),
+            start=12,
+        ):
+            artifact_name = _legacy_artifact_name(
+                kind,
+                current.name,
+                ".tmp",
+                "{:x}".format(artifact_number) * 24,
+            )
+            (target / artifact_name).write_bytes(current_data)
+            (target / artifact_name).with_suffix(".name").write_text(
+                current.name + "\n",
+                encoding="utf-8",
+            )
+        temporary = target / (".index-" + "e" * 24 + ".tmp")
+        temporary.write_bytes(current_data)
+        before = {
+            entry.name: entry.read_bytes()
+            for entry in target.iterdir()
+        }
 
         self.assertEqual(knowledge_index.check(self.root, target), 0)
+
+        self.assertEqual(
+            {
+                entry.name: entry.read_bytes()
+                for entry in target.iterdir()
+            },
+            before,
+        )
 
     def test_check_rejects_missing_outdated_extra_and_non_lf_index_bytes(self):
         self.write("lessons/demo-api/one.md", LESSON)
