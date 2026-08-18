@@ -211,6 +211,22 @@ Rebuild the indexes for all personal knowledge and the current Git project.
 didim index
 ```
 
+The personal index treats only these Markdown paths as source content:
+
+```text
+lessons/<project>/*.md
+docs/<project>/**/*.md
+book/<project>/*.md
+```
+
+Entries outside these patterns, such as `.DS_Store`, images, and editor temporary files, are ignored. Each project directory directly below `lessons/`, `docs/`, or `book/` may be a single symlink to an external directory.
+
+```text
+lessons/my-project -> /path/to/external-lessons
+```
+
+Symlinks for individual Markdown files or nested project directories are rejected. Indexes and CLI output use logical paths such as `lessons/my-project/...` even when the source is external. If a source is invalid, `didim --explain-errors index` shows the logical path under `무엇:` and the cause under `이유:`.
+
 To verify that the source content and indexes match without changing files, use:
 
 ```sh

@@ -211,6 +211,22 @@ Git commit에 포함된 원본은 `artifact_sha256` 대신 `artifact_git`에 완
 didim index
 ```
 
+개인 index는 다음 Markdown만 원본으로 처리합니다.
+
+```text
+lessons/<project>/*.md
+docs/<project>/**/*.md
+book/<project>/*.md
+```
+
+`.DS_Store`, 이미지, 편집기 임시 파일처럼 이 패턴에 들지 않는 항목은 무시합니다. `lessons/<project>`, `docs/<project>`, `book/<project>` 위치의 프로젝트 디렉터리는 한 단계 symlink로 외부 실제 디렉터리를 가리킬 수 있습니다.
+
+```text
+lessons/my-project -> /path/to/external-lessons
+```
+
+개별 Markdown 파일과 프로젝트 내부 디렉터리의 symlink는 거부합니다. 외부 프로젝트에서 읽거나 쓴 파일도 index와 CLI에는 `lessons/my-project/...` 같은 논리 경로로 표시됩니다. 원본 형식이 잘못되면 `didim --explain-errors index`가 `무엇:`에 논리 경로를, `이유:`에 실패 원인을 표시합니다.
+
 파일을 바꾸지 않고 원문과 index가 일치하는지만 검사하려면 다음 명령을 사용합니다.
 
 ```sh

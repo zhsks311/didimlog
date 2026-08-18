@@ -13,6 +13,7 @@ from unittest import mock
 
 from didimlog import cli, version as didimlog_version
 from didimlog.errors import DidimError, EXIT_GIT
+from didimlog.personal.index import KnowledgeSourceError
 from didimlog.personal.lesson_writing import LessonSecret
 from didimlog.project.capture import CaptureRequest
 
@@ -523,6 +524,38 @@ class CliCommandSurfaceTests(unittest.TestCase):
         self.assertEqual(stderr, "")
         self.assertIn(current.personal, stdout)
         self.assertIn(current.project, stdout)
+
+    def test_index_reports_invalid_personal_source_without_absolute_paths(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            home = root / "home"
+            external = root / "external-knowledge"
+            with mock.patch.dict("os.environ", {"HOME": str(home)}), mock.patch(
+                "didimlog.cli.run_index",
+                side_effect=KnowledgeSourceError(
+                    "docs/work/invalid.md",
+                    "missing title or find_when",
+                ),
+            ):
+                explained_code, explained_stdout, explained_stderr = invoke(
+                    ["--explain-errors", "index"]
+                )
+                plain_code, plain_stdout, plain_stderr = invoke(["index"])
+
+        self.assertEqual(explained_code, 3)
+        self.assertEqual(explained_stdout, "")
+        self.assertEqual(
+            explained_stderr,
+            "PERSONAL_INDEX_INVALID_SOURCE\n"
+            "무엇: docs/work/invalid.md\n"
+            "이유: missing title or find_when\n"
+            "도움말: 표시된 개인 지식 원본을 고친 뒤 didim index를 다시 실행하세요.\n",
+        )
+        self.assertNotIn(str(home), explained_stderr)
+        self.assertNotIn(str(external), explained_stderr)
+        self.assertEqual(plain_code, 3)
+        self.assertEqual(plain_stdout, "")
+        self.assertEqual(plain_stderr, "PERSONAL_INDEX_INVALID_SOURCE\n")
 
     def test_hook_session_start_delegates_raw_streams_and_stays_zero(self):
         with mock.patch("didimlog.cli.session_start", return_value=0) as hook:

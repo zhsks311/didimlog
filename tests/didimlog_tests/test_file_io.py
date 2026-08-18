@@ -11,6 +11,7 @@ from didimlog.file_io import (
     open_directory_path,
     read_regular_file_at,
     replace_regular_file_at_if_unchanged,
+    write_all_and_sync,
 )
 
 
@@ -29,6 +30,45 @@ def stale_revision(info):
 
 
 class FileIoContractTests(unittest.TestCase):
+    def test_write_all_and_sync_retries_short_positive_writes(self):
+        real_write = os.write
+
+        def short_write(descriptor, data):
+            return real_write(descriptor, data[:2])
+
+        with tempfile.TemporaryFile() as target, mock.patch.object(
+            file_io.os,
+            "write",
+            side_effect=short_write,
+        ) as write:
+            write_all_and_sync(target.fileno(), b"abcdef")
+            target.seek(0)
+            self.assertEqual(target.read(), b"abcdef")
+
+        self.assertEqual(write.call_count, 3)
+
+    def test_write_all_and_sync_rejects_zero_write(self):
+        with tempfile.TemporaryFile() as target, mock.patch.object(
+            file_io.os,
+            "write",
+            return_value=0,
+        ), mock.patch.object(file_io.os, "fsync") as sync:
+            with self.assertRaises(OSError):
+                write_all_and_sync(target.fileno(), b"data")
+
+        sync.assert_not_called()
+
+    def test_write_all_and_sync_writes_final_bytes_then_syncs(self):
+        with tempfile.TemporaryFile() as target, mock.patch.object(
+            file_io.os,
+            "fsync",
+            wraps=os.fsync,
+        ) as sync:
+            write_all_and_sync(target.fileno(), b"complete")
+            target.seek(0)
+            self.assertEqual(target.read(), b"complete")
+            sync.assert_called_once_with(target.fileno())
+
     def test_read_is_bounded_to_maximum_plus_one_byte(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
