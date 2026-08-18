@@ -34,12 +34,6 @@ uv tool install didimlog
 didim --version
 ```
 
-The current version prints:
-
-```text
-Didimlog 0.0.2
-```
-
 If you use `pipx`, install it with `pipx install didimlog`.
 
 ### 2. Review the Change Plan and Set Up
@@ -69,7 +63,6 @@ didim status
 If setup completed successfully, you can verify the following status. The project name is the name of the current Git top-level directory.
 
 ```text
-Didimlog 0.0.2
 개인 지식: 최신
 현재 프로젝트: <프로젝트 이름>
 프로젝트 근거: 최신
