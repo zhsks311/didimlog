@@ -13,65 +13,50 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read
     outputs:
-      release: ${{ steps.version.outputs.release }}
-      version: ${{ steps.version.outputs.version }}
+      verdict: ${{ steps.classify.outputs.verdict }}
+      version: ${{ steps.classify.outputs.version }}
+      kind: ${{ steps.classify.outputs.kind }}
+      reason: ${{ steps.classify.outputs.reason }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Detect a prepared version increase
-        id: version
-        env:
-          BEFORE: ${{ github.event.before }}
-          GH_TOKEN: ${{ github.token }}
+      - name: Classify the immutable merge evidence
+        id: classify
         run: |
           set -euo pipefail
-          git show "${BEFORE}:pyproject.toml" > "${RUNNER_TEMP}/previous-pyproject.toml"
-          previous="$(python -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' "${RUNNER_TEMP}/previous-pyproject.toml")"
-          current="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
-          if test "${current}" = "${previous}"; then
-            echo "release=false" >> "${GITHUB_OUTPUT}"
-            echo "version=${current}" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-          python .github/scripts/release.py check-release \
-            --previous-pyproject "${RUNNER_TEMP}/previous-pyproject.toml" \
-            --current-pyproject pyproject.toml \
-            --lock uv.lock
-          associated_prs="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls")"
-          release_pr_number="$(jq -er '
-            [
-              .[] | select(
-                .state == "closed" and
-                .merged_at != null and
-                .base.ref == "main" and
-                .head.ref == "develop" and
-                (([.labels[].name | select(test("^release:(patch|minor|major)$"))] | length) == 1) and
-                (([.labels[].name] | index("release:ready")) != null) and
-                (([.labels[].name] | index("release:none")) == null)
-              )
-            ] |
-            if length == 1 then .[0].number
-            else error("expected one ready develop-to-main release PR")
-            end
-          ' <<<"${associated_prs}")"
-          release_commits="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/pulls/${release_pr_number}/commits?per_page=100")"
-          prepared_count="$(jq -r '.[][] | .commit.message' <<<"${release_commits}" | grep -Fxc "Didimlog-Release-Prep: v${current}" || true)"
-          test "${prepared_count}" -eq 1 || {
-            echo "Release PR does not contain exactly one matching preparation commit." >&2
-            exit 1
-          }
-          grep -Fq "## [${current}] - " CHANGELOG.md
-          grep -Fq "[${current}]: https://github.com/zhsks311/didimlog/releases/tag/v${current}" CHANGELOG.md
-          echo "release=true" >> "${GITHUB_OUTPUT}"
-          echo "version=${current}" >> "${GITHUB_OUTPUT}"
+          result="$(python .github/scripts/release.py classify-merge --repo . --merge-sha "${GITHUB_SHA}")"
+          verdict="$(jq -er '.verdict' <<<"${result}")"
+          version="$(jq -r '.version // ""' <<<"${result}")"
+          kind="$(jq -r '.kind // ""' <<<"${result}")"
+          reason="$(jq -er '.reason' <<<"${result}")"
+          {
+            echo "verdict=${verdict}"
+            echo "version=${version}"
+            echo "kind=${kind}"
+            echo "reason=${reason}"
+          } >> "${GITHUB_OUTPUT}"
+
+          case "${verdict}" in
+            PUBLISH)
+              ;;
+            NO_RELEASE)
+              ;;
+            ERROR)
+              echo "Release classification failed: ${reason}" >&2
+              exit 1
+              ;;
+            *)
+              echo "Unknown release classification: ${verdict}" >&2
+              exit 1
+              ;;
+          esac
 
   publish:
     needs: detect
-    if: needs.detect.outputs.release == 'true'
+    if: needs.detect.outputs.verdict == 'PUBLISH'
     concurrency:
       group: publish-release-${{ needs.detect.outputs.version }}
       cancel-in-progress: false
@@ -203,3 +188,176 @@ jobs:
         with:
           packages-dir: dist/packages/
           attestations: true
+
+  sync-hotfix-to-develop:
+    needs: [detect, publish]
+    if: >-
+      ${{
+        needs.publish.result == 'success' &&
+        needs.detect.outputs.kind == 'hotfix'
+      }}
+    concurrency:
+      group: sync-hotfix-to-develop
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      VERSION: ${{ needs.detect.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Sync published hotfix to develop
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh auth setup-git
+          git config core.hooksPath "/dev/null"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch --no-tags origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/heads/develop:refs/remotes/origin/develop"
+          develop_base_oid="$(git rev-parse origin/develop)"
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "Deployed commit is not contained in the latest main branch" >&2
+            exit 1
+          fi
+          if git merge-base --is-ancestor origin/main origin/develop; then
+            echo "Latest main is already included in develop"
+            exit 0
+          fi
+
+          git switch -C hotfix-sync origin/develop
+          if git merge --no-ff --no-edit origin/main; then
+            git fetch --no-tags origin \
+              "+refs/heads/develop:refs/remotes/origin/develop"
+            remote_develop_oid="$(git rev-parse origin/develop)"
+            if test "${remote_develop_oid}" = "${develop_base_oid}"; then
+              if git push origin HEAD:refs/heads/develop; then
+                echo "Merged the published hotfix into develop"
+                exit 0
+              fi
+            else
+              echo "Develop advanced before the direct hotfix sync push"
+            fi
+          else
+            git merge --abort
+          fi
+
+          git fetch --no-tags origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/heads/develop:refs/remotes/origin/develop"
+          main_oid="$(git rev-parse origin/main)"
+          develop_oid="$(git rev-parse origin/develop)"
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" "${main_oid}"; then
+            echo "Deployed commit is not contained in the refreshed main branch" >&2
+            exit 1
+          fi
+          if git merge-base --is-ancestor "${main_oid}" "${develop_oid}"; then
+            echo "Latest main was included in develop while direct sync was attempted"
+            exit 0
+          fi
+
+          repository_id="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .id)"
+          pull_requests="$(
+            gh api --paginate --slurp \
+              "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=develop&head=${GITHUB_REPOSITORY_OWNER}%3Amain&per_page=100"
+          )"
+          if ! jq -e \
+            --argjson repo_id "${repository_id}" \
+            --arg main_oid "${main_oid}" \
+            'all(.[][];
+              .state == "open" and
+              .base.repo.id == $repo_id and
+              .head.repo.id == $repo_id and
+              .base.ref == "develop" and
+              .head.ref == "main" and
+              .head.sha == $main_oid
+            )' <<<"${pull_requests}" >/dev/null; then
+            echo "Refusing a hotfix sync PR with mismatched repository, ref, or head OID" >&2
+            exit 1
+          fi
+
+          candidate_count="$(jq -er '[.[][]] | length' <<<"${pull_requests}")"
+          title="Sync hotfix ${VERSION} from main to develop"
+          body="$(
+            printf '%s\n\n%s\n%s\n' \
+              "Sync published hotfix ${VERSION} from \`main\` to \`develop\`." \
+              "Deployed commit: \`${GITHUB_SHA}\`" \
+              "Current main: \`${main_oid}\`"
+          )"
+          case "${candidate_count}" in
+            0)
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/pulls" \
+                -f "title=${title}" \
+                -f "body=${body}" \
+                -f "head=main" \
+                -f "base=develop" >/dev/null
+              ;;
+            1)
+              pr_number="$(jq -er '.[][] | .number' <<<"${pull_requests}")"
+              gh api --method PATCH \
+                "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" \
+                -f "title=${title}" \
+                -f "body=${body}" >/dev/null
+              ;;
+            *)
+              echo "Refusing ambiguous hotfix sync PR candidates" >&2
+              exit 1
+              ;;
+          esac
+
+  reconcile-open-prs:
+    needs: [detect, publish]
+    if: >-
+      ${{
+        always() &&
+        (needs.detect.result == 'success' || needs.detect.result == 'failure') &&
+        (
+          needs.publish.result == 'success' ||
+          needs.publish.result == 'skipped' ||
+          needs.publish.result == 'failure'
+        )
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Reconcile every eligible open pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch)"
+          repository_id="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .id)"
+
+          pull_requests="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=main&per_page=100")"
+          pr_numbers="${RUNNER_TEMP}/release-pr-numbers"
+          jq -r --argjson repo_id "${repository_id}" '
+
+            .[][] |
+            select(
+              .state == "open" and
+              .base.ref == "main" and
+              .base.repo.id == $repo_id and
+              .head.repo.id == $repo_id and
+              (
+                .head.ref == "develop" or
+                (.head.ref | startswith("hotfix/"))
+              )
+            ) |
+            .number
+          ' <<<"${pull_requests}" > "${pr_numbers}"
+          while IFS= read -r pr_number; do
+            gh workflow run prepare-release.yml --repo "${GITHUB_REPOSITORY}" \
+              --ref "${default_branch}" \
+              -f "pr_number=${pr_number}"
+          done < "${pr_numbers}"

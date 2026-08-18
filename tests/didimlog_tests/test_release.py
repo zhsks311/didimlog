@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -20,6 +21,7 @@ PUBLIC_SOURCE_FILES = {
     "CONTRIBUTING.md",
     "LICENSE",
     "README.md",
+    "README.ko.md",
     "SECURITY.md",
     "THIRD_PARTY_NOTICES.md",
     "pyproject.toml",
@@ -61,6 +63,13 @@ class ReleaseContractTests(unittest.TestCase):
         for name in ("CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md"):
             self.assertTrue((REPO / name).is_file(), name)
 
+    def test_readmes_expose_language_switches(self):
+        english = (REPO / "README.md").read_text(encoding="utf-8")
+        korean = (REPO / "README.ko.md").read_text(encoding="utf-8")
+
+        self.assertIn("English | [한국어](README.ko.md)", english)
+        self.assertIn("[English](README.md) | 한국어", korean)
+
     def test_ci_covers_supported_matrix_canonical_suite_build_and_wheel_smoke(self):
         workflow = (REPO / ".github/workflows/ci.yml").read_text(encoding="utf-8")
 
@@ -96,6 +105,106 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIn("gh release create", workflow_text)
         self.assertIn("pypa/gh-action-pypi-publish@release/v1", workflow_text)
         self.assertNotIn("PYPI_API_TOKEN", workflow_text)
+
+    def test_release_guide_matches_reconciliation_and_delivery_workflows(self):
+        readme = (REPO / "README.md").read_text(encoding="utf-8")
+        release_guide = readme.split("### Release", 1)[1].split("\n## ", 1)[0]
+        changelog = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
+        unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
+        reconcile = yaml.safe_load(
+            (REPO / ".github/workflows/prepare-release.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        delivery = yaml.safe_load(
+            (REPO / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        )
+        reconcile_triggers = reconcile.get("on", reconcile.get(True))
+        delivery_triggers = delivery.get("on", delivery.get(True))
+
+        self.assertEqual(
+            reconcile_triggers["pull_request_target"]["types"],
+            ["opened", "reopened", "synchronize", "labeled", "unlabeled"],
+        )
+        self.assertEqual(delivery_triggers, {"push": {"branches": ["main"]}})
+        self.assertIn("must apply the following settings manually", release_guide)
+        self.assertIn(
+            "Merging the workflow file alone does not create these settings.",
+            release_guide,
+        )
+
+        final_check = next(
+            step["run"]
+            for step in reconcile["jobs"]["check-final"]["steps"]
+            if step.get("id") == "final-check"
+        )
+        check_name_match = re.search(r'"name": "([^"]+)"', final_check)
+        self.assertIsNotNone(check_name_match)
+        check_name = check_name_match.group(1)
+        self.assertEqual(check_name, "release-state")
+        self.assertIn('--head-sha "${FINAL_HEAD_SHA}"', final_check)
+        self.assertIn('"head_sha": $head_sha', final_check)
+        self.assertIn(f"`{check_name}` check passes", release_guide)
+        self.assertIn("Git history of the current PR commit", release_guide)
+        self.assertIn("that exact commit", release_guide)
+        self.assertIn(
+            "include the latest `main` before they can be merged",
+            release_guide,
+        )
+
+        classify = next(
+            step["run"]
+            for step in delivery["jobs"]["detect"]["steps"]
+            if step.get("name") == "Classify the immutable merge evidence"
+        )
+        self.assertIn("classify-merge", classify)
+        self.assertIn("merge commit on `main` with two parents", release_guide)
+        for unsupported_merge in ("squash", "rebase", "direct push"):
+            self.assertIn(unsupported_merge, release_guide)
+
+        reconcile_open_prs = delivery["jobs"]["reconcile-open-prs"]
+        self.assertEqual(reconcile_open_prs["needs"], ["detect", "publish"])
+        self.assertIn("commit is added to the PR after preparation", release_guide)
+        self.assertIn(
+            "cancels the previous preparation and prepares again from the new commit",
+            release_guide,
+        )
+        self.assertIn("`main` advances", release_guide)
+        self.assertIn("waits until the PR branch includes the latest `main`", release_guide)
+
+        hotfix_sync = delivery["jobs"]["sync-hotfix-to-develop"]
+        self.assertEqual(hotfix_sync["needs"], ["detect", "publish"])
+        self.assertIn("needs.publish.result == 'success'", hotfix_sync["if"])
+        self.assertIn("needs.detect.outputs.kind == 'hotfix'", hotfix_sync["if"])
+        sync_run = next(
+            step["run"]
+            for step in hotfix_sync["steps"]
+            if step.get("name") == "Sync published hotfix to develop"
+        )
+        self.assertIn('-f "base=develop"', sync_run)
+        self.assertIn('-f "head=main"', sync_run)
+        self.assertIn("After a successful patch release", release_guide)
+        self.assertIn(
+            "`hotfix/*` → `main` PR supports only `release:patch`",
+            release_guide,
+        )
+        self.assertIn("`main` → `develop` synchronization PR", release_guide)
+
+        documented_outcomes = (
+            "PR별로 준비·취소 기록",
+            "취소가 먼저 오든 병합이 먼저 오든",
+            "여러 릴리스 PR을 최신 기준으로 다시 계산",
+            "`main` → `develop` 동기화 PR",
+            "취소 과정은 후속 변경을 보존",
+            "hotfix 동기화는 한 번에 하나씩",
+        )
+        matching_items = [
+            line
+            for line in changelog.splitlines()
+            if line.startswith("- ")
+            and all(outcome in line for outcome in documented_outcomes)
+        ]
+        self.assertEqual(len(matching_items), 1)
 
     def test_release_generates_a_verified_manifest_for_exactly_wheel_and_sdist(self):
         workflow = yaml.safe_load(

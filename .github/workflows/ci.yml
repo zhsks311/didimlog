@@ -3,12 +3,13 @@ name: CI
 on:
   workflow_dispatch:
   push:
-    branches: [main, develop]
+    branches: [main]
   pull_request:
     branches: [main, develop]
 
 permissions:
   contents: read
+  statuses: write
 
 jobs:
   test:
@@ -36,3 +37,16 @@ jobs:
           uv venv .wheel-venv --python ${{ matrix.python-version }}
           uv pip install --python .wheel-venv/bin/python dist/*.whl
           .wheel-venv/bin/didim --version
+      - name: Publish exact-head required status
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATUS_CONTEXT: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+          TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            -f state=success \
+            -f context="${STATUS_CONTEXT}" \
+            -f description="Exact-head CI passed" \
+            -f target_url="${TARGET_URL}"
