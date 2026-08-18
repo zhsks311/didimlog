@@ -70,6 +70,11 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIn("English | [한국어](README.ko.md)", english)
         self.assertIn("[English](README.md) | 한국어", korean)
 
+    def test_readmes_do_not_pin_release_version(self):
+        for name in ("README.md", "README.ko.md"):
+            readme = (REPO / name).read_text(encoding="utf-8")
+            self.assertNotRegex(readme, r"\bDidimlog \d+\.\d+\.\d+\b")
+
     def test_ci_covers_supported_matrix_canonical_suite_build_and_wheel_smoke(self):
         workflow = (REPO / ".github/workflows/ci.yml").read_text(encoding="utf-8")
 
