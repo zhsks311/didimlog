@@ -7,12 +7,15 @@ from pathlib import Path
 from unittest import mock
 
 from didimlog.personal.paths import (
+    ProjectDirectoryError,
     book_dir,
     data_home,
     docs_dir,
     index_dir,
     lessons_dir,
+    project_directory_unchanged,
     resolve_project,
+    resolve_project_directory,
     validate_project,
 )
 
@@ -34,6 +37,12 @@ def isolated_git_environment(home, ceiling):
 
 
 class PersonalPathTests(unittest.TestCase):
+    def create_symlink(self, link, target, *, target_is_directory=True):
+        try:
+            link.symlink_to(target, target_is_directory=target_is_directory)
+        except (NotImplementedError, OSError) as error:
+            self.skipTest("symlinks unavailable: {}".format(error))
+
     def test_data_home_uses_injected_home(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             home = Path(temporary_directory) / "home"
@@ -97,6 +106,171 @@ class PersonalPathTests(unittest.TestCase):
                 resolve_project("_global", cwd=missing_cwd, allow_global=True),
                 "_global",
             )
+
+    def test_project_directory_resolves_real_and_linked_directories(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            base = root / "knowledge" / "lessons"
+            real = base / "real"
+            external = root / "external"
+            real.mkdir(parents=True)
+            external.mkdir()
+            self.create_symlink(base / "linked", external)
+
+            resolved_real = resolve_project_directory(base, "real")
+            resolved_link = resolve_project_directory(base, "linked")
+
+            self.assertEqual(resolved_real.logical, real)
+            self.assertEqual(resolved_real.physical, real)
+            self.assertEqual(resolved_link.logical, base / "linked")
+            self.assertEqual(resolved_link.physical, external.resolve(strict=True))
+            self.assertTrue(project_directory_unchanged(resolved_real))
+            self.assertTrue(project_directory_unchanged(resolved_link))
+
+    def test_project_directory_returns_none_when_project_is_missing(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base = Path(temporary_directory) / "knowledge" / "lessons"
+            base.mkdir(parents=True)
+
+            self.assertIsNone(resolve_project_directory(base, "missing"))
+
+    def test_project_directory_rejects_base_replaced_during_lookup(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            base = root / "knowledge" / "lessons"
+            base.mkdir(parents=True)
+            logical = base / "missing"
+            original_lstat = Path.lstat
+
+            def replace_base_before_child_lstat(path):
+                if path == logical:
+                    base.rename(root / "original-lessons")
+                    base.mkdir()
+                return original_lstat(path)
+
+            with mock.patch.object(
+                Path,
+                "lstat",
+                replace_base_before_child_lstat,
+            ):
+                with self.assertRaises(ProjectDirectoryError) as caught:
+                    resolve_project_directory(base, "missing")
+
+            self.assertEqual(caught.exception.logical, base)
+            self.assertEqual(
+                caught.exception.reason,
+                "source category must be a real directory",
+            )
+
+    def test_project_directory_rejects_base_replaced_by_file_during_lookup(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            base = root / "knowledge" / "lessons"
+            base.mkdir(parents=True)
+            logical = base / "missing"
+            original_lstat = Path.lstat
+
+            def replace_base_with_file_before_child_lstat(path):
+                if path == logical:
+                    base.rename(root / "original-lessons")
+                    base.write_text("not a directory", encoding="utf-8")
+                return original_lstat(path)
+
+            with mock.patch.object(
+                Path,
+                "lstat",
+                replace_base_with_file_before_child_lstat,
+            ):
+                with self.assertRaises(ProjectDirectoryError) as caught:
+                    resolve_project_directory(base, "missing")
+
+            self.assertEqual(caught.exception.logical, base)
+            self.assertEqual(
+                caught.exception.reason,
+                "source category must be a real directory",
+            )
+
+    def test_project_directory_rejects_symlink_base(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            real_base = root / "real-lessons"
+            real_base.mkdir()
+            base = root / "knowledge" / "lessons"
+            base.parent.mkdir()
+            self.create_symlink(base, real_base)
+
+            with self.assertRaises(ProjectDirectoryError) as caught:
+                resolve_project_directory(base, "demo")
+
+            self.assertEqual(caught.exception.logical, base)
+            self.assertEqual(
+                caught.exception.reason,
+                "source category must be a real directory",
+            )
+
+    def test_project_directory_rejects_dangling_link(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base = Path(temporary_directory) / "knowledge" / "lessons"
+            base.mkdir(parents=True)
+            linked = base / "linked"
+            self.create_symlink(linked, base / "missing")
+
+            with self.assertRaises(ProjectDirectoryError) as caught:
+                resolve_project_directory(base, "linked")
+
+            self.assertEqual(caught.exception.logical, linked)
+            self.assertEqual(caught.exception.reason, "project link target is missing")
+
+    def test_project_directory_rejects_link_cycle(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            base = Path(temporary_directory) / "knowledge" / "lessons"
+            base.mkdir(parents=True)
+            linked = base / "linked"
+            self.create_symlink(linked, linked)
+
+            with self.assertRaises(ProjectDirectoryError) as caught:
+                resolve_project_directory(base, "linked")
+
+            self.assertEqual(caught.exception.logical, linked)
+            self.assertEqual(caught.exception.reason, "project link cannot be resolved")
+
+    def test_project_directory_rejects_link_to_file(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            base = root / "knowledge" / "lessons"
+            base.mkdir(parents=True)
+            target = root / "target.txt"
+            target.write_text("not a directory", encoding="utf-8")
+            linked = base / "linked-file"
+            self.create_symlink(linked, target, target_is_directory=False)
+
+            with self.assertRaises(ProjectDirectoryError) as caught:
+                resolve_project_directory(base, "linked-file")
+
+            self.assertEqual(caught.exception.logical, linked)
+            self.assertEqual(
+                caught.exception.reason,
+                "project entry must point to a directory",
+            )
+
+    def test_project_directory_detects_retargeted_link(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            base = root / "knowledge" / "lessons"
+            base.mkdir(parents=True)
+            first = root / "first"
+            second = root / "second"
+            first.mkdir()
+            second.mkdir()
+            linked = base / "linked"
+            self.create_symlink(linked, first)
+            resolved = resolve_project_directory(base, "linked")
+
+            linked.unlink()
+            self.create_symlink(linked, second)
+
+            self.assertFalse(project_directory_unchanged(resolved))
+
 
 
 @unittest.skipUnless(GIT, "git is required for project discovery tests")

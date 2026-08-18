@@ -127,40 +127,16 @@ def _personal_check_locked(root: Path) -> str:
     except (personal_index.KnowledgeIndexError, OSError, UnicodeError):
         return "PERSONAL_INDEX_INVALID_SOURCE"
 
-    if destination.is_symlink() or (
-        destination.exists() and not destination.is_dir()
-    ):
-        return "PERSONAL_INDEX_EXTRA"
-    if not destination.is_dir():
-        return "PERSONAL_INDEX_MISSING"
     try:
-        entries = tuple(destination.iterdir())
-    except OSError:
-        return "PERSONAL_INDEX_EXTRA"
-    expected_names = {project + ".md" for project in outputs}
-    actual_names = {entry.name for entry in entries}
-    if expected_names - actual_names:
+        state = personal_index.inspect_index(outputs, destination)
+    except (personal_index.KnowledgeIndexError, UnicodeError):
+        return "PERSONAL_INDEX_INVALID_SOURCE"
+    if state is personal_index.IndexCheckState.MISSING:
         return "PERSONAL_INDEX_MISSING"
-    if actual_names - expected_names:
+    if state is personal_index.IndexCheckState.EXTRA:
         return "PERSONAL_INDEX_EXTRA"
-    for project, text in outputs.items():
-        path = destination / (project + ".md")
-        try:
-            linked = path.lstat()
-            if stat.S_ISLNK(linked.st_mode) or not stat.S_ISREG(linked.st_mode):
-                return "PERSONAL_INDEX_EXTRA"
-            expected = text.encode("utf-8")
-            if (
-                read_regular_file_beneath(
-                    root,
-                    Path("index") / path.name,
-                    len(expected),
-                )
-                != expected
-            ):
-                return "PERSONAL_INDEX_STALE"
-        except (OSError, UnsafePathError):
-            return "PERSONAL_INDEX_MISSING"
+    if state is personal_index.IndexCheckState.STALE:
+        return "PERSONAL_INDEX_STALE"
     return PERSONAL_INDEX_CURRENT
 
 

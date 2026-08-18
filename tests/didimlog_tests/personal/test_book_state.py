@@ -1,5 +1,7 @@
+import errno
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -8,6 +10,7 @@ from unittest import mock
 
 from didimlog import file_io
 from didimlog.personal import book_state
+from didimlog.personal.paths import ProjectDirectoryError
 
 
 GIT = shutil.which("git")
@@ -97,6 +100,391 @@ class BookStateTests(unittest.TestCase):
             [("different-topic", "jpa"), ("new", "kafka")],
         )
         self.assertTrue(all(Path(row["path"]).parent == self.lessons_root / "app" for row in rows))
+
+    def test_candidates_read_linked_project_and_return_logical_paths(self):
+        external = self.temporary_root / "external-lessons"
+        external.mkdir()
+        (external / "one.md").write_bytes(lesson_bytes())
+        logical = self.lessons_root / "app"
+        logical.rmdir()
+        logical.symlink_to(external, target_is_directory=True)
+
+        rows = book_state.candidates(project="app", root=self.lessons_root)
+
+        self.assertEqual([row["id"] for row in rows], ["one"])
+        self.assertEqual(rows[0]["path"], str(logical / "one.md"))
+        self.assertNotIn(str(external), rows[0]["path"])
+
+    def test_candidates_stop_when_link_changes_after_snapshot(self):
+        external = self.temporary_root / "external-lessons"
+        external.mkdir()
+        (external / "one.md").write_bytes(lesson_bytes())
+        replacement = self.temporary_root / "replacement-lessons"
+        replacement.mkdir()
+        (replacement / "other.md").write_bytes(lesson_bytes(topic="jpa"))
+        logical = self.lessons_root / "app"
+        logical.rmdir()
+        logical.symlink_to(external, target_is_directory=True)
+        real_parse = book_state._parse_lesson
+
+        def parse_and_retarget(path, data):
+            parsed = real_parse(path, data)
+            logical.unlink()
+            logical.symlink_to(replacement, target_is_directory=True)
+            return parsed
+
+        with mock.patch.object(
+            book_state,
+            "_parse_lesson",
+            side_effect=parse_and_retarget,
+        ), self.assertRaises(ProjectDirectoryError) as caught:
+            book_state.candidates(project="app", root=self.lessons_root)
+
+        self.assertEqual(caught.exception.logical, logical)
+        self.assertEqual(
+            caught.exception.reason,
+            "project link changed during operation",
+        )
+
+    def test_candidates_pin_link_target_during_pathname_swap(self):
+        external = self.temporary_root / "external-lessons"
+        external.mkdir()
+        original = lesson_bytes(title="원래 대상")
+        (external / "one.md").write_bytes(original)
+        replacement = self.temporary_root / "replacement-lessons"
+        replacement.mkdir()
+        replacement_bytes = lesson_bytes(topic="jpa", title="교체 대상")
+        (replacement / "other.md").write_bytes(replacement_bytes)
+        displaced = self.temporary_root / "displaced-lessons"
+        logical = self.lessons_root / "app"
+        logical.rmdir()
+        logical.symlink_to(external, target_is_directory=True)
+        real_scan = book_state._lessons
+
+        def scan_while_path_swapped(source):
+            external.rename(displaced)
+            replacement.rename(external)
+            try:
+                yield from real_scan(source)
+            finally:
+                external.rename(replacement)
+                displaced.rename(external)
+
+        with mock.patch.object(
+            book_state,
+            "_lessons",
+            side_effect=scan_while_path_swapped,
+        ):
+            rows = book_state.candidates(project="app", root=self.lessons_root)
+
+        self.assertEqual(
+            [(row["id"], row["topic"], row["title"]) for row in rows],
+            [("one", "kafka", "원래 대상")],
+        )
+        self.assertEqual(rows[0]["path"], str(logical / "one.md"))
+        self.assertEqual((external / "one.md").read_bytes(), original)
+        self.assertEqual(
+            (replacement / "other.md").read_bytes(),
+            replacement_bytes,
+        )
+
+    def test_candidates_open_and_close_one_pinned_descriptor(self):
+        external = self.temporary_root / "external-lessons"
+        external.mkdir()
+        (external / "one.md").write_bytes(lesson_bytes())
+        (external / "two.md").write_bytes(lesson_bytes(topic="jpa"))
+        logical = self.lessons_root / "app"
+        logical.rmdir()
+        logical.symlink_to(external, target_is_directory=True)
+        real_open = file_io.open_directory_path
+        opened = []
+
+        def track_open(path):
+            descriptor = real_open(path)
+            opened.append(descriptor)
+            return descriptor
+
+        with mock.patch.object(
+            file_io,
+            "open_directory_path",
+            side_effect=track_open,
+        ):
+            rows = book_state.candidates(project="app", root=self.lessons_root)
+
+        self.assertEqual([row["id"] for row in rows], ["one", "two"])
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(OSError) as caught:
+            os.fstat(opened[0])
+        self.assertEqual(caught.exception.errno, errno.EBADF)
+
+    def test_mark_booked_updates_linked_project_with_logical_result(self):
+        external = self.temporary_root / "external-lessons"
+        external.mkdir()
+        original = lesson_bytes()
+        external_path = external / "one.md"
+        external_path.write_bytes(original)
+        logical = self.lessons_root / "app"
+        logical.rmdir()
+        logical.symlink_to(external, target_is_directory=True)
+
+        result = book_state.mark_booked(
+            ["one"],
+            project="app",
+            root=self.lessons_root,
+        )
+
+        self.assertEqual(result["marked"], [str(logical / "one.md")])
+        self.assertEqual(result["skipped"], [])
+        self.assertEqual(
+            external_path.read_bytes(),
+            original.replace(b"\n---\n", b"\nbooked: [kafka]\n---\n", 1),
+        )
+
+    def test_mark_booked_reuses_one_project_descriptor_for_multiple_lessons(self):
+        external = self.temporary_root / "external-lessons"
+        external.mkdir()
+        first_original = lesson_bytes(title="첫 번째")
+        second_original = lesson_bytes(title="두 번째")
+        first_path = external / "one.md"
+        second_path = external / "two.md"
+        first_path.write_bytes(first_original)
+        second_path.write_bytes(second_original)
+        logical = self.lessons_root / "app"
+        logical.rmdir()
+        logical.symlink_to(external, target_is_directory=True)
+        real_open = file_io.open_directory_path
+        open_calls = 0
+
+        def fail_on_second_open(path):
+            nonlocal open_calls
+            open_calls += 1
+            if open_calls > 1:
+                raise OSError(errno.EMFILE, os.strerror(errno.EMFILE))
+            return real_open(path)
+
+        with mock.patch.object(
+            file_io,
+            "open_directory_path",
+            side_effect=fail_on_second_open,
+        ):
+            result = book_state.mark_booked(
+                ["one", "two"],
+                project="app",
+                root=self.lessons_root,
+            )
+
+        self.assertEqual(open_calls, 1)
+        self.assertEqual(
+            result,
+            {
+                "marked": [
+                    str(logical / "one.md"),
+                    str(logical / "two.md"),
+                ],
+                "skipped": [],
+            },
+        )
+        self.assertIn(b"booked: [kafka]", first_path.read_bytes())
+        self.assertIn(b"booked: [kafka]", second_path.read_bytes())
+
+    def test_mark_booked_skips_target_replaced_before_descriptor_open(self):
+        external = self.temporary_root / "external-lessons"
+        external.mkdir()
+        original = lesson_bytes(title="검증된 원본")
+        (external / "one.md").write_bytes(original)
+        displaced = self.temporary_root / "displaced-lessons"
+        replacement = lesson_bytes(title="교체 대상")
+        logical = self.lessons_root / "app"
+        logical.rmdir()
+        logical.symlink_to(external, target_is_directory=True)
+        real_open = file_io.open_directory_path
+
+        def replace_target_before_open(path):
+            external.rename(displaced)
+            external.mkdir()
+            (external / "one.md").write_bytes(replacement)
+            return real_open(path)
+
+        with mock.patch.object(
+            file_io,
+            "open_directory_path",
+            side_effect=replace_target_before_open,
+        ):
+            result = book_state.mark_booked(
+                ["one"],
+                project="app",
+                root=self.lessons_root,
+            )
+
+        self.assertEqual(result, {"marked": [], "skipped": ["one"]})
+        self.assertEqual((displaced / "one.md").read_bytes(), original)
+        self.assertEqual((external / "one.md").read_bytes(), replacement)
+
+    def test_mark_booked_skips_link_retargeted_after_descriptor_open(self):
+        external = self.temporary_root / "external-lessons"
+        external.mkdir()
+        original = lesson_bytes(title="검증된 원본")
+        external_path = external / "one.md"
+        external_path.write_bytes(original)
+        replacement = self.temporary_root / "replacement-lessons"
+        replacement.mkdir()
+        replacement_bytes = lesson_bytes(title="교체 대상")
+        replacement_path = replacement / "one.md"
+        replacement_path.write_bytes(replacement_bytes)
+        logical = self.lessons_root / "app"
+        logical.rmdir()
+        logical.symlink_to(external, target_is_directory=True)
+        real_open = file_io.open_directory_path
+
+        def open_and_retarget(path):
+            descriptor = real_open(path)
+            logical.unlink()
+            logical.symlink_to(replacement, target_is_directory=True)
+            return descriptor
+
+        with mock.patch.object(
+            file_io,
+            "open_directory_path",
+            side_effect=open_and_retarget,
+        ):
+            result = book_state.mark_booked(
+                ["one"],
+                project="app",
+                root=self.lessons_root,
+            )
+
+        self.assertEqual(result, {"marked": [], "skipped": ["one"]})
+        self.assertEqual(external_path.read_bytes(), original)
+        self.assertEqual(replacement_path.read_bytes(), replacement_bytes)
+
+    def test_mark_booked_rolls_back_when_link_retargets_at_publish(self):
+        external = self.temporary_root / "external-lessons"
+        external.mkdir()
+        original = lesson_bytes(title="검증된 원본")
+        external_path = external / "one.md"
+        external_path.write_bytes(original)
+        replacement = self.temporary_root / "replacement-lessons"
+        external_path.chmod(0o640)
+        replacement.mkdir()
+        replacement_bytes = lesson_bytes(topic="jpa", title="교체 대상")
+        replacement_path = replacement / "one.md"
+        replacement_path.write_bytes(replacement_bytes)
+        logical = self.lessons_root / "app"
+        logical.rmdir()
+        logical.symlink_to(external, target_is_directory=True)
+        real_publish = file_io.replace_regular_file_at_if_unchanged_with_ownership
+        publish_calls = 0
+
+        def publish_and_retarget(*args, **kwargs):
+            nonlocal publish_calls
+            publication = real_publish(*args, **kwargs)
+            publish_calls += 1
+            if publish_calls == 1 and publication is not None:
+                logical.unlink()
+                logical.symlink_to(replacement, target_is_directory=True)
+            return publication
+
+        with mock.patch.object(
+            file_io,
+            "replace_regular_file_at_if_unchanged_with_ownership",
+            side_effect=publish_and_retarget,
+        ):
+            result = book_state.mark_booked(
+                ["one"],
+                project="app",
+                root=self.lessons_root,
+            )
+
+        self.assertEqual(result, {"marked": [], "skipped": ["one"]})
+        self.assertEqual(external_path.read_bytes(), original)
+        self.assertEqual(stat.S_IMODE(external_path.stat().st_mode), 0o640)
+        self.assertEqual(replacement_path.read_bytes(), replacement_bytes)
+
+    def test_mark_booked_preserves_concurrent_change_after_publish_retarget(self):
+        external = self.temporary_root / "external-lessons"
+        external.mkdir()
+        original = lesson_bytes(title="검증된 원본")
+        external_path = external / "one.md"
+        external_path.write_bytes(original)
+        replacement = self.temporary_root / "replacement-lessons"
+        replacement.mkdir()
+        replacement_bytes = lesson_bytes(topic="jpa", title="교체 대상")
+        replacement_path = replacement / "one.md"
+        replacement_path.write_bytes(replacement_bytes)
+        concurrent = lesson_bytes(title="사용자 최신 변경")
+        logical = self.lessons_root / "app"
+        logical.rmdir()
+        logical.symlink_to(external, target_is_directory=True)
+        real_publish = file_io.replace_regular_file_at_if_unchanged_with_ownership
+        publish_calls = 0
+
+        def publish_retarget_and_save(*args, **kwargs):
+            nonlocal publish_calls
+            publication = real_publish(*args, **kwargs)
+            publish_calls += 1
+            if publish_calls == 1 and publication is not None:
+                logical.unlink()
+                logical.symlink_to(replacement, target_is_directory=True)
+                external_path.write_bytes(concurrent)
+            return publication
+
+        with mock.patch.object(
+            file_io,
+            "replace_regular_file_at_if_unchanged_with_ownership",
+            side_effect=publish_retarget_and_save,
+        ):
+            result = book_state.mark_booked(
+                ["one"],
+                project="app",
+                root=self.lessons_root,
+            )
+
+        self.assertEqual(result, {"marked": [], "skipped": ["one"]})
+        self.assertEqual(external_path.read_bytes(), concurrent)
+        self.assertEqual(replacement_path.read_bytes(), replacement_bytes)
+
+    def test_mark_booked_skips_when_retarget_rollback_fails(self):
+        external = self.temporary_root / "external-lessons"
+        external.mkdir()
+        original = lesson_bytes(title="검증된 원본")
+        external_path = external / "one.md"
+        external_path.write_bytes(original)
+        replacement = self.temporary_root / "replacement-lessons"
+        replacement.mkdir()
+        replacement_bytes = lesson_bytes(topic="jpa", title="교체 대상")
+        replacement_path = replacement / "one.md"
+        replacement_path.write_bytes(replacement_bytes)
+        logical = self.lessons_root / "app"
+        logical.rmdir()
+        logical.symlink_to(external, target_is_directory=True)
+        real_publish = file_io.replace_regular_file_at_if_unchanged_with_ownership
+        publish_calls = 0
+
+        def publish_then_fail_rollback(*args, **kwargs):
+            nonlocal publish_calls
+            publish_calls += 1
+            if publish_calls == 2:
+                return None
+            publication = real_publish(*args, **kwargs)
+            if publication is not None:
+                logical.unlink()
+                logical.symlink_to(replacement, target_is_directory=True)
+            return publication
+
+        with mock.patch.object(
+            file_io,
+            "replace_regular_file_at_if_unchanged_with_ownership",
+            side_effect=publish_then_fail_rollback,
+        ):
+            result = book_state.mark_booked(
+                ["one"],
+                project="app",
+                root=self.lessons_root,
+            )
+
+        self.assertEqual(result, {"marked": [], "skipped": ["one"]})
+        self.assertIn(b"booked: [kafka]", external_path.read_bytes())
+        self.assertEqual(replacement_path.read_bytes(), replacement_bytes)
 
     def test_mark_booked_inserts_one_field_and_is_idempotent(self):
         body = "## 교훈\n첫 줄  \n마지막 줄".encode("utf-8")
