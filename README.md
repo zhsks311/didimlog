@@ -198,27 +198,27 @@ For an artifact included in a Git commit, put the full commit object ID in `arti
 
 ### Rebuild the Indexes
 
-Rebuild the indexes for all personal knowledge and the current Git project.
+Rebuild the indexes for every personal knowledge scope and the current Git project.
 
 ```sh
 didim index
 ```
 
-The personal index treats only these Markdown paths as source content:
+The personal index treats only these Markdown paths as source content. `<scope>` is a name that groups related personal knowledge:
 
 ```text
-lessons/<project>/*.md
-docs/<project>/**/*.md
-book/<project>/*.md
+lessons/<scope>/*.md
+docs/<scope>/**/*.md
+book/<scope>/*.md
 ```
 
-Entries outside these patterns, such as `.DS_Store`, images, and editor temporary files, are ignored. Each project directory directly below `lessons/`, `docs/`, or `book/` may be a single symlink to an external directory.
+Entries outside these patterns, such as `.DS_Store`, images, and editor temporary files, are ignored. Each scope directory directly below `lessons/`, `docs/`, or `book/` may be a single symlink to an external directory.
 
 ```text
 lessons/my-project -> /path/to/external-lessons
 ```
 
-Symlinks for individual Markdown files or nested project directories are rejected. Indexes and CLI output use logical paths such as `lessons/my-project/...` even when the source is external. If a source is invalid, `didim --explain-errors index` shows the logical path under `무엇:` and the cause under `이유:`.
+Symlinks for individual Markdown files or nested scope directories are rejected. Indexes and CLI output use logical paths such as `lessons/my-scope/...` even when the source is external. If a source is invalid, `didim --explain-errors index` shows the logical path under `무엇:` and the cause under `이유:`.
 
 To verify that the source content and indexes match without changing files, use:
 
@@ -304,24 +304,45 @@ The English token on the first error line and the exit code are stable behaviors
 
 ## Storage Model and Safety Rules
 
-Personal knowledge is stored in the home directory.
+Personal knowledge is stored in named scopes under the home directory.
 
 ```text
 ~/knowledge/
-├── lessons/<project>/
-├── docs/<project>/
-├── book/<project>/
+├── lessons/<scope>/
+├── docs/<scope>/
+├── book/<scope>/
 ├── lessons/_global/
 ├── docs/_global/
 ├── book/_global/
-└── index/<project>.md
+├── index/<scope>.md
+└── index/_global.md
 ```
 
+- `scope`: A user-selected group of related knowledge, such as `personal`, `network`, or `career`
 - `lessons`: Verified lessons that should change behavior in future tasks
 - `docs`: Precise procedures, plans, and research results
 - `book`: Explanations that connect background information and examples from multiple sources
-- `_global`: Material that applies unchanged across multiple projects
+- `_global`: Material that applies unchanged across multiple scopes
 - `index`: A regenerable list containing only titles, when-to-use guidance, and detailed file paths
+
+A scope does not have to match a Git repository name. Scope names use letters, digits, and single hyphens. If you do not specify one, Didimlog uses the current Git top-level directory name. Save a lesson to an explicit scope with:
+
+```sh
+didim add lesson <slug> --project <scope>
+```
+
+The `--project` option name is retained for compatibility; its value can be any valid scope. There is no `didim add doc` or `didim add book` command. Create those Markdown files directly under `docs/<scope>/` or `book/<scope>/`, include the metadata required by the index, and rebuild it:
+
+```yaml
+---
+title: Document title
+find_when: [search term, trigger]
+---
+```
+
+```sh
+didim index
+```
 
 Project knowledge is stored at the top level of the Git repository.
 
@@ -362,7 +383,7 @@ didim connect claude --yes
 didim disconnect claude
 ```
 
-A newly connected Claude session automatically reads only the short retrieval procedure in `KNOWLEDGE_USAGE.md`. During actual work, it searches the current project and `_global` indexes and reads up to five relevant source documents. It does not load the complete indexes or every lesson body into the session-start context.
+A newly connected Claude session automatically reads only the short retrieval procedure in `KNOWLEDGE_USAGE.md`. When the user names a knowledge scope, Claude searches that scope and `_global`; otherwise it searches the current Git project scope and `_global`. A missing explicitly named scope is not replaced with the current project. Claude reads up to five relevant source documents and does not load complete indexes or every lesson body into the session-start context.
 
 ## Uninstallation
 

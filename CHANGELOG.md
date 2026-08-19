@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.0.5] - 2026-08-19
+
+### 변경
+
+- 개인 지식을 현재 Git 프로젝트뿐 아니라 사용자가 지정한 이름의 공간으로 묶어 저장·조회할 수 있음을 명확히 했습니다. 공간을 명시하면 현재 프로젝트보다 우선하며, 명시한 공간이 없더라도 현재 프로젝트로 바꾸지 않습니다.
+
 ## [0.0.4] - 2026-08-18
 
 ### 수정
@@ -51,7 +57,8 @@
 - macOS·Linux 및 Python 3.11~3.14 지원 계약.
 
 
-[Unreleased]: https://github.com/zhsks311/didimlog/compare/v0.0.4...HEAD
+[Unreleased]: https://github.com/zhsks311/didimlog/compare/v0.0.5...HEAD
+[0.0.5]: https://github.com/zhsks311/didimlog/releases/tag/v0.0.5
 [0.0.4]: https://github.com/zhsks311/didimlog/releases/tag/v0.0.4
 [0.0.3]: https://github.com/zhsks311/didimlog/releases/tag/v0.0.3
 [0.0.2]: https://github.com/zhsks311/didimlog/releases/tag/v0.0.2

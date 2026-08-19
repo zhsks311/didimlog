@@ -10,6 +10,8 @@ from pathlib import Path
 
 import yaml
 
+from didimlog.personal.lesson import parse_frontmatter_text, parse_inline_list
+
 
 REPO = Path(__file__).resolve().parents[2]
 VERSION = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))[
@@ -74,6 +76,45 @@ class ReleaseContractTests(unittest.TestCase):
         for name in ("README.md", "README.ko.md"):
             readme = (REPO / name).read_text(encoding="utf-8")
             self.assertNotRegex(readme, r"\bDidimlog \d+\.\d+\.\d+\b")
+
+    def test_readmes_explain_custom_knowledge_scopes(self):
+        readmes = {
+            "README.md": (
+                "A scope does not have to match a Git repository name.",
+                "find_when: [search term, trigger]",
+            ),
+            "README.ko.md": (
+                "지식 공간 이름은 Git 저장소 이름일 필요가 없습니다.",
+                "find_when: [검색어, 찾을 때]",
+            ),
+        }
+        shared_markers = (
+            "lessons/<scope>/*.md",
+            "docs/<scope>/**/*.md",
+            "book/<scope>/*.md",
+            "index/<scope>.md",
+            "didim add lesson <slug> --project <scope>",
+            "didim index",
+            "_global",
+        )
+
+        for name, language_markers in readmes.items():
+            with self.subTest(name=name):
+                readme = (REPO / name).read_text(encoding="utf-8")
+                for marker in (*shared_markers, *language_markers):
+                    self.assertIn(marker, readme)
+                self.assertNotIn("find_when: [search term, search term]", readme)
+                metadata = readme.split("```yaml\n", 1)[1].split("\n```", 1)[0]
+                parsed = parse_frontmatter_text(
+                    "example.md",
+                    metadata,
+                    ("title", "find_when"),
+                )
+                self.assertIsNotNone(parsed)
+                fields, _, _ = parsed
+                self.assertIsNotNone(
+                    parse_inline_list(fields["find_when"], canonical=True)
+                )
 
     def test_ci_covers_supported_matrix_canonical_suite_build_and_wheel_smoke(self):
         workflow = (REPO / ".github/workflows/ci.yml").read_text(encoding="utf-8")
