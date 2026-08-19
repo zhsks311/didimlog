@@ -198,27 +198,27 @@ Git commit에 포함된 원본은 `artifact_sha256` 대신 `artifact_git`에 완
 
 ### index 다시 만들기
 
-개인 지식 전체와 현재 Git 프로젝트의 index를 다시 만듭니다.
+개인 지식의 모든 공간과 현재 Git 프로젝트의 index를 다시 만듭니다.
 
 ```sh
 didim index
 ```
 
-개인 index는 다음 Markdown만 원본으로 처리합니다.
+개인 index는 다음 Markdown만 원본으로 처리합니다. `<scope>`는 서로 관련된 개인 지식을 묶는 이름입니다.
 
 ```text
-lessons/<project>/*.md
-docs/<project>/**/*.md
-book/<project>/*.md
+lessons/<scope>/*.md
+docs/<scope>/**/*.md
+book/<scope>/*.md
 ```
 
-`.DS_Store`, 이미지, 편집기 임시 파일처럼 이 패턴에 들지 않는 항목은 무시합니다. `lessons/<project>`, `docs/<project>`, `book/<project>` 위치의 프로젝트 디렉터리는 한 단계 symlink로 외부 실제 디렉터리를 가리킬 수 있습니다.
+`.DS_Store`, 이미지, 편집기 임시 파일처럼 이 패턴에 들지 않는 항목은 무시합니다. `lessons/<scope>`, `docs/<scope>`, `book/<scope>` 바로 아래의 지식 공간 디렉터리는 한 단계 symlink로 외부 실제 디렉터리를 가리킬 수 있습니다.
 
 ```text
 lessons/my-project -> /path/to/external-lessons
 ```
 
-개별 Markdown 파일과 프로젝트 내부 디렉터리의 symlink는 거부합니다. 외부 프로젝트에서 읽거나 쓴 파일도 index와 CLI에는 `lessons/my-project/...` 같은 논리 경로로 표시됩니다. 원본 형식이 잘못되면 `didim --explain-errors index`가 `무엇:`에 논리 경로를, `이유:`에 실패 원인을 표시합니다.
+개별 Markdown 파일과 지식 공간 내부 디렉터리의 symlink는 거부합니다. 외부 디렉터리에서 읽거나 쓴 파일도 index와 CLI에는 `lessons/my-scope/...` 같은 논리 경로로 표시됩니다. 원본 형식이 잘못되면 `didim --explain-errors index`가 `무엇:`에 논리 경로를, `이유:`에 실패 원인을 표시합니다.
 
 파일을 바꾸지 않고 원문과 index가 일치하는지만 검사하려면 다음 명령을 사용합니다.
 
@@ -304,24 +304,45 @@ CLI 표준 입력의 상한은 64 KiB입니다. 생성된 프로젝트 record는
 
 ## 저장 방식과 안전 규칙
 
-개인 지식은 홈 디렉터리에 저장됩니다.
+개인 지식은 홈 디렉터리 아래의 이름 있는 지식 공간에 저장됩니다.
 
 ```text
 ~/knowledge/
-├── lessons/<project>/
-├── docs/<project>/
-├── book/<project>/
+├── lessons/<scope>/
+├── docs/<scope>/
+├── book/<scope>/
 ├── lessons/_global/
 ├── docs/_global/
 ├── book/_global/
-└── index/<project>.md
+├── index/<scope>.md
+└── index/_global.md
 ```
 
+- `scope`: `personal`, `network`, `career`처럼 사용자가 관련 지식을 묶는 이름
 - `lessons`: 다음 작업에서 행동을 바꿀 검증된 교훈
 - `docs`: 정확한 절차, 계획, 조사 결과
 - `book`: 여러 자료의 배경과 사례를 엮은 해설
-- `_global`: 여러 프로젝트에 그대로 적용되는 자료
+- `_global`: 여러 지식 공간에 그대로 적용되는 자료
 - `index`: 제목, 찾을 때, 상세 파일 경로만 담은 재생성 가능한 목록
+
+지식 공간 이름은 Git 저장소 이름일 필요가 없습니다. 영문자, 숫자, 단일 하이픈을 사용할 수 있습니다. 사용자가 이름을 지정하지 않으면 현재 Git 최상위 디렉터리 이름을 기본값으로 사용합니다. 특정 공간에 교훈을 저장하려면 다음 명령을 실행합니다.
+
+```sh
+didim add lesson <slug> --project <scope>
+```
+
+`--project` 옵션 이름은 호환성을 위해 유지하지만 값에는 유효한 지식 공간 이름을 넣을 수 있습니다. `didim add doc`이나 `didim add book` 명령은 없습니다. 해당 Markdown 파일을 `docs/<scope>/` 또는 `book/<scope>/` 아래에 직접 만들고 index에 필요한 메타데이터를 넣은 뒤 목록을 다시 만듭니다.
+
+```yaml
+---
+title: 문서 제목
+find_when: [검색어, 찾을 때]
+---
+```
+
+```sh
+didim index
+```
 
 프로젝트 지식은 Git 최상위 디렉터리에 저장됩니다.
 
@@ -362,7 +383,7 @@ didim connect claude --yes
 didim disconnect claude
 ```
 
-연결된 새 Claude 세션은 `KNOWLEDGE_USAGE.md`의 짧은 조회 절차만 자동으로 읽습니다. 실제 작업에서는 현재 프로젝트와 `_global` index를 검색하고 관련 상세 자료를 최대 5건 읽습니다. 전체 index나 모든 교훈 본문을 세션 시작 context에 싣지 않습니다.
+연결된 새 Claude 세션은 `KNOWLEDGE_USAGE.md`의 짧은 조회 절차만 자동으로 읽습니다. 사용자가 지식 공간을 지정하면 해당 공간과 `_global`을 검색하고, 지정하지 않으면 현재 Git 프로젝트 공간과 `_global`을 검색합니다. 명시한 공간이 없더라도 현재 프로젝트로 대체하지 않습니다. 관련 상세 자료는 최대 5건만 읽으며 전체 index나 모든 교훈 본문을 세션 시작 context에 싣지 않습니다.
 
 ## 제거
 

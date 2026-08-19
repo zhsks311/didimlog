@@ -764,6 +764,17 @@ class UsageContractTests(unittest.TestCase):
         self.assertIn("한 작업에서 한 번", self.text)
         self.assertNotIn("한 세션에서 한 번", self.text)
 
+    def test_explicit_scope_overrides_current_git_project_without_fallback(self):
+        for phrase in (
+            "지식 공간 이름이 명시됐으면 그 이름을 `<scope>`로 선택한다",
+            "명시하지 않았으면 현재 Git 최상위 디렉터리 이름을 `<scope>`로 선택한다",
+            "`~/knowledge/index/<scope>.md`와 `~/knowledge/index/_global.md`",
+            "명시한 `<scope>`의 index가 없어도 현재 Git 프로젝트로 바꾸지 않는다",
+            "자료를 저장할 때도 같은 `<scope>`를 사용한다",
+        ):
+            self.assertIn(phrase, self.text)
+        self.assertNotIn("index/<project>.md", self.text)
+
     def test_always_loaded_resource_does_not_embed_entries(self):
         self.assertNotIn("찾을 때:", self.text)
         self.assertNotIn("zeta-out", self.text)
