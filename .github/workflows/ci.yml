@@ -33,6 +33,8 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked --python ${{ matrix.python-version }}
       - name: Run canonical suite
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: uv run --project . python -m unittest discover -s tests -v
       - name: Build wheel and source distribution
         run: uv build --out-dir dist

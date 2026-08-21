@@ -145,6 +145,15 @@ class ReleaseContractTests(unittest.TestCase):
             job["strategy"]["matrix"]["python-version"],
             ["3.11", "3.12", "3.13", "3.14"],
         )
+        canonical_suite = next(
+            step
+            for step in job["steps"]
+            if step.get("name") == "Run canonical suite"
+        )
+        self.assertEqual(
+            canonical_suite["env"],
+            {"TMPDIR": "${{ runner.temp }}"},
+        )
         self.assertIn(
             "STATUS_CONTEXT: ${{ matrix.platform.os }} / Python "
             "${{ matrix.python-version }}",
