@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### 변경
+
+- GitHub Actions의 Linux·macOS 지원 검증과 릴리스 자동화를 OS별 Namespace runner profile에서 실행하도록 전환했습니다. 기존 필수 검사 이름과 Python 3.11~3.14 지원 matrix는 유지합니다.
+
 ## [0.0.5] - 2026-08-19
 
 ### 변경

@@ -13,12 +13,16 @@ permissions:
 
 jobs:
   test:
-    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
-    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.platform.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        platform:
+          - os: ubuntu-latest
+            runner: namespace-profile-linux-x86-4-8
+          - os: macos-latest
+            runner: namespace-profile-macos
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
@@ -41,7 +45,7 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          STATUS_CONTEXT: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+          STATUS_CONTEXT: ${{ matrix.platform.os }} / Python ${{ matrix.python-version }}
           TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           gh api --method POST \
