@@ -20,7 +20,7 @@ concurrency:
 jobs:
   snapshot:
     if: github.event_name == 'pull_request_target' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-linux-x86-4-8
     permissions:
       contents: read
       pull-requests: read
@@ -113,7 +113,7 @@ jobs:
 
   check-start:
     needs: [snapshot]
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-linux-x86-4-8
     permissions:
       checks: write
       contents: read
@@ -147,7 +147,7 @@ jobs:
 
   compute:
     needs: [snapshot, check-start]
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-linux-x86-4-8
     permissions:
       contents: read
       pull-requests: read
@@ -306,7 +306,7 @@ jobs:
       needs.compute.result == 'success' &&
       needs.compute.outputs.changed == 'true' &&
       needs.snapshot.outputs.mutation_allowed == 'true'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-linux-x86-4-8
     permissions:
       contents: write
     outputs:
@@ -495,7 +495,7 @@ jobs:
       needs.snapshot.result == 'success' &&
       needs.compute.result == 'success' &&
       (needs.mutate.result == 'success' || needs.mutate.result == 'skipped')
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-linux-x86-4-8
     permissions:
       pull-requests: write
     outputs:
@@ -572,7 +572,7 @@ jobs:
       needs.mutate.result == 'success' &&
       needs.mutate.outputs.changed == 'true' &&
       needs.project-ready.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-linux-x86-4-8
     permissions:
       actions: write
       contents: read
@@ -596,7 +596,7 @@ jobs:
     needs:
       [snapshot, check-start, compute, mutate, project-ready, dispatch-ci]
     if: always() && needs.snapshot.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-linux-x86-4-8
     permissions:
       checks: write
       contents: read

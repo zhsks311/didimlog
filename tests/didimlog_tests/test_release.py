@@ -117,16 +117,68 @@ class ReleaseContractTests(unittest.TestCase):
                 )
 
     def test_ci_covers_supported_matrix_canonical_suite_build_and_wheel_smoke(self):
-        workflow = (REPO / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        workflow_text = (REPO / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
+        workflow = yaml.safe_load(workflow_text)
+        job = workflow["jobs"]["test"]
 
-        self.assertIn("ubuntu-latest", workflow)
-        self.assertIn("macos-latest", workflow)
-        for minor in range(11, 15):
-            self.assertIn(f'"3.{minor}"', workflow)
-        self.assertIn("python -m unittest discover -s tests -v", workflow)
-        self.assertIn("uv build", workflow)
-        self.assertIn("didim --version", workflow)
-        self.assertIn("permissions:\n  contents: read", workflow)
+        self.assertEqual(
+            job["name"],
+            "${{ matrix.platform.os }} / Python ${{ matrix.python-version }}",
+        )
+        self.assertEqual(job["runs-on"], "${{ matrix.platform.runner }}")
+        self.assertEqual(
+            job["strategy"]["matrix"]["platform"],
+            [
+                {
+                    "os": "ubuntu-latest",
+                    "runner": "namespace-profile-linux-x86-4-8",
+                },
+                {
+                    "os": "macos-latest",
+                    "runner": "namespace-profile-macos",
+                },
+            ],
+        )
+        self.assertEqual(
+            job["strategy"]["matrix"]["python-version"],
+            ["3.11", "3.12", "3.13", "3.14"],
+        )
+        canonical_suite = next(
+            step
+            for step in job["steps"]
+            if step.get("name") == "Run canonical suite"
+        )
+        self.assertEqual(
+            canonical_suite["env"],
+            {"TMPDIR": "${{ runner.temp }}"},
+        )
+        self.assertIn(
+            "STATUS_CONTEXT: ${{ matrix.platform.os }} / Python "
+            "${{ matrix.python-version }}",
+            workflow_text,
+        )
+        self.assertIn("python -m unittest discover -s tests -v", workflow_text)
+        self.assertIn("uv build", workflow_text)
+        self.assertIn("didim --version", workflow_text)
+        self.assertIn("permissions:\n  contents: read", workflow_text)
+
+    def test_every_workflow_job_uses_an_os_specific_namespace_profile(self):
+        workflow_dir = REPO / ".github/workflows"
+
+        for path in sorted(workflow_dir.glob("*.yml")):
+            workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+            for job_name, job in workflow["jobs"].items():
+                with self.subTest(workflow=path.name, job=job_name):
+                    if path.name == "ci.yml":
+                        self.assertEqual(
+                            job["runs-on"], "${{ matrix.platform.runner }}"
+                        )
+                    else:
+                        self.assertEqual(
+                            job["runs-on"], "namespace-profile-linux-x86-4-8"
+                        )
 
     def test_release_uses_main_push_oidc_and_protected_environment(self):
         workflow_text = (REPO / ".github/workflows/release.yml").read_text(
