@@ -248,6 +248,31 @@ If you also need error explanations in automation logs, place the global option 
 didim --explain-errors index --check
 ```
 
+### Check for Updates
+
+After a successful interactive command, Didimlog checks PyPI for a newer stable
+release at most once every 24 hours. When one is available, it appends one line
+to stderr without changing the command's stdout or exit code.
+
+```text
+Didimlog X.Y.Z 업데이트 가능 — uv tool upgrade didimlog
+```
+
+Help, `--version`, `didim hook session-start`, `didim setup --dry-run`, failed
+commands, and non-interactive output do not perform the automatic check.
+Network, response, and cache failures do not block the original command.
+
+The request is limited to `https://pypi.org/pypi/didimlog/json`; it contains no
+knowledge content, local path, project name, credential, or user identifier.
+Only the last successful check time and confirmed stable version are cached in
+`$XDG_CACHE_HOME/didimlog/update.json` when `XDG_CACHE_HOME` is absolute, or
+`~/.cache/didimlog/update.json` otherwise. To disable both the request and cache
+write, set:
+
+```sh
+export DIDIM_NO_UPDATE_CHECK=1
+```
+
 ## Command Summary
 
 The following table summarizes commands intended to be run directly by users. See `didim <command> --help` in the installed version for every available option.
