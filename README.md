@@ -155,8 +155,8 @@ checks. The browser receives logical paths and opaque resource IDs rather than
 absolute filesystem paths, and it cannot submit arbitrary file paths.
 
 GUI book rendering retains the existing 4 MiB source limit and also limits
-each image to 4 MiB, aggregate raw images to 16 MiB, rendered UTF-8 body HTML
-to 24 MiB, and the serialized book response to 32 MiB. Oversized rendering
+each image to 16 MiB, aggregate raw images to 64 MiB, rendered UTF-8 body HTML
+to 96 MiB, and the serialized book response to 128 MiB. Oversized rendering
 fails with the redacted `BOOK_RENDER_TOO_LARGE` response and does not stop
 later requests.
 

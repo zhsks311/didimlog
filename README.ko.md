@@ -152,8 +152,8 @@ Bearer capability를 요구합니다. browser에는 absolute filesystem path 대
 logical path와 opaque resource ID만 전달하며 임의 file path를 제출할 수
 없습니다.
 
-GUI book render는 기존 source 4 MiB 제한을 유지하고 image당 4 MiB, raw image
-합계 16 MiB, UTF-8 body HTML 24 MiB, serialized book response 32 MiB로
+GUI book render는 기존 source 4 MiB 제한을 유지하고 image당 16 MiB, raw image
+합계 64 MiB, UTF-8 body HTML 96 MiB, serialized book response 128 MiB로
 제한합니다. 너무 큰 render는 세부 내용이 가려진 `BOOK_RENDER_TOO_LARGE`로
 실패하며 이후 요청은 계속 처리합니다.
 

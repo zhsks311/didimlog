@@ -41,11 +41,11 @@ _PERSONAL_INDEX_TOKENS = {
 }
 _GUI_BOOK_RENDER_LIMITS = BookRenderLimits(
     source_bytes=personal_index.SOURCE_MAX_BYTES,
-    image_bytes=4 * 1024 * 1024,
-    aggregate_image_bytes=16 * 1024 * 1024,
-    body_html_bytes=24 * 1024 * 1024,
+    image_bytes=16 * 1024 * 1024,
+    aggregate_image_bytes=64 * 1024 * 1024,
+    body_html_bytes=96 * 1024 * 1024,
 )
-_GUI_BOOK_RESPONSE_MAX_BYTES = 32 * 1024 * 1024
+_GUI_BOOK_RESPONSE_MAX_BYTES = 128 * 1024 * 1024
 
 _SECURITY_HEADERS = {
     "Content-Security-Policy": (
