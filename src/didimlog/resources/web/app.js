@@ -39,6 +39,38 @@ const views = {
   lessons: document.querySelector("#lessons-view"),
 };
 
+function configureMermaid() {
+  if (!window.mermaid) return null;
+  window.mermaid.initialize({
+    startOnLoad: false,
+    securityLevel: "strict",
+    theme: "neutral",
+  });
+  return window.mermaid;
+}
+
+const mermaidScript = document.querySelector('script[src="/assets/mermaid.min.js"]');
+const mermaidReady = new Promise((resolve) => {
+  if (window.mermaid) {
+    resolve(configureMermaid());
+    return;
+  }
+  if (!mermaidScript) {
+    resolve(null);
+    return;
+  }
+  mermaidScript.addEventListener(
+    "load",
+    () => resolve(configureMermaid()),
+    { once: true },
+  );
+  mermaidScript.addEventListener(
+    "error",
+    () => resolve(null),
+    { once: true },
+  );
+});
+
 function element(tag, options = {}, children = []) {
   const node = document.createElement(tag);
   if (options.className) node.className = options.className;
@@ -345,14 +377,17 @@ async function renderReader(identifier, generation, hash) {
   root.append(element("div", { className: "reader-grid" }, [toc, article, rail]));
   show("reader");
 
-  if (
-    routeIsCurrent(generation, hash)
-    && window.mermaid
-    && article.querySelector(".mermaid")
-  ) {
-    window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "neutral" });
+  const diagrams = article.querySelectorAll(".mermaid");
+  if (diagrams.length) {
+    const mermaid = await mermaidReady;
+    if (!routeIsCurrent(generation, hash) || !mermaid) return;
+    mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: "strict",
+      theme: "neutral",
+    });
     try {
-      await window.mermaid.run({ nodes: article.querySelectorAll(".mermaid") });
+      await mermaid.run({ nodes: diagrams });
       if (!routeIsCurrent(generation, hash)) return;
     } catch (_) {
       if (!routeIsCurrent(generation, hash)) return;
@@ -416,7 +451,7 @@ function filteredLessons() {
 }
 
 function renderLessonList() {
-  const list = document.querySelector("#lesson-list");
+  const list = views.lessons.querySelector("#lesson-list");
   clear(list);
   const lessons = filteredLessons();
   list.append(element("div", { className: "lesson-result-count", text: `${lessons.length}개 교훈 · metadata exact filter` }));
@@ -448,7 +483,7 @@ async function selectLesson(
   const generation = ++state.lessonGeneration;
   state.selectedLesson = identifier;
   renderLessonList();
-  const detail = document.querySelector("#lesson-detail");
+  const detail = views.lessons.querySelector("#lesson-detail");
   clear(detail);
   detail.append(element("p", { className: "loading", text: "교훈 원문을 확인하고 있습니다." }));
   try {
@@ -514,7 +549,7 @@ async function renderLessons(generation, hash) {
 
   const filterNames = ["scope", "topic", "tag", "booked", "date", "review"];
   for (const name of filterNames) {
-    const control = document.querySelector(`#filter-${name}`);
+    const control = root.querySelector(`#filter-${name}`);
     const selected = state.lessonFilters[name];
     if (
       control.tagName !== "SELECT"
@@ -526,7 +561,7 @@ async function renderLessons(generation, hash) {
     }
   }
   const requestedScope = selectedScopeFromHash();
-  const scopeSelect = document.querySelector("#filter-scope");
+  const scopeSelect = root.querySelector("#filter-scope");
   if (
     requestedScope
     && [...scopeSelect.options].some((item) => item.value === requestedScope)
@@ -537,7 +572,7 @@ async function renderLessons(generation, hash) {
   for (const control of filters.querySelectorAll("select, input")) {
     control.addEventListener("change", () => {
       for (const name of filterNames) {
-        state.lessonFilters[name] = document.querySelector(`#filter-${name}`).value;
+        state.lessonFilters[name] = root.querySelector(`#filter-${name}`).value;
       }
       if (
         state.selectedLesson
@@ -545,7 +580,7 @@ async function renderLessons(generation, hash) {
       ) {
         state.lessonGeneration += 1;
         state.selectedLesson = null;
-        const detail = document.querySelector("#lesson-detail");
+        const detail = root.querySelector("#lesson-detail");
         clear(detail);
         detail.append(element("p", { className: "empty-state", text: "왼쪽 목록에서 읽을 교훈을 선택하세요." }));
       }
