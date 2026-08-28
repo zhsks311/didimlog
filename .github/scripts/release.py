@@ -7,10 +7,12 @@ import argparse
 from dataclasses import asdict, dataclass
 from datetime import date
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import tomllib
 
 
@@ -126,13 +128,23 @@ class ReleaseEvidence:
     head_is_preparation: bool
 
 
-def _git(repo: Path, *arguments: str, strip: bool = True) -> str:
+def _git(
+    repo: Path,
+    *arguments: str,
+    strip: bool = True,
+    environment: dict[str, str] | None = None,
+) -> str:
     try:
         result = subprocess.run(
             ["git", "-C", str(repo), *arguments],
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT_SECONDS,
+            env=(
+                {**os.environ, **environment}
+                if environment is not None
+                else None
+            ),
         )
     except subprocess.TimeoutExpired as error:
         raise ReleaseError(f"git_timeout:{arguments[0]}") from error
@@ -402,6 +414,39 @@ def _expected_release_kind(head_ref: str) -> str | None:
     return None
 
 
+def _three_way_merge_tree(
+    repo: Path,
+    base_sha: str,
+    ours_sha: str,
+    theirs_sha: str,
+) -> str:
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        temporary = Path(temporary_directory)
+        work_tree = temporary / "work-tree"
+        work_tree.mkdir()
+        environment = {
+            "GIT_INDEX_FILE": str(temporary / "index"),
+            "GIT_WORK_TREE": str(work_tree),
+        }
+        _git(
+            repo,
+            "read-tree",
+            "--reset",
+            ours_sha,
+            environment=environment,
+        )
+        _git(
+            repo,
+            "merge-recursive",
+            base_sha,
+            "--",
+            ours_sha,
+            theirs_sha,
+            environment=environment,
+        )
+        return _git(repo, "write-tree", environment=environment)
+
+
 def _validate_cancel_tree(
     repo: Path,
     cancel: CancelMarker,
@@ -423,12 +468,8 @@ def _validate_cancel_tree(
         preparation.commit_sha,
     )[0]
     try:
-        expected_tree = _git(
+        expected_tree = _three_way_merge_tree(
             repo,
-            "merge-tree",
-            "--write-tree",
-            "--no-messages",
-            "--merge-base",
             preparation.commit_sha,
             cancel_parents[0],
             preparation_parent,
