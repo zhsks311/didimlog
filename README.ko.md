@@ -250,9 +250,10 @@ didim --explain-errors index --check
 
 ### 업데이트 확인하기
 
-Didimlog는 성공한 대화형 명령 뒤 최대 24시간에 한 번 PyPI에서 더 최신
-stable 버전을 확인합니다. 새 버전이 있으면 기존 stdout과 종료 코드를
-바꾸지 않고 stderr 끝에 한 줄을 추가합니다.
+Didimlog는 성공한 대화형 명령 뒤 PyPI에서 더 최신 stable 버전을 확인합니다.
+성공한 확인 뒤에는 24시간 동안 다시 요청하지 않으며, 확인에 실패하면 다음
+대상 명령에서 재시도할 수 있습니다. 새 버전이 있으면 기존 stdout과 종료
+코드를 바꾸지 않고 stderr 끝에 한 줄을 추가합니다.
 
 ```text
 Didimlog X.Y.Z 업데이트 가능 — uv tool upgrade didimlog

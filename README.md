@@ -251,8 +251,9 @@ didim --explain-errors index --check
 ### Check for Updates
 
 After a successful interactive command, Didimlog checks PyPI for a newer stable
-release at most once every 24 hours. When one is available, it appends one line
-to stderr without changing the command's stdout or exit code.
+release. A successful check suppresses another request for 24 hours; a failed
+check may be retried by the next eligible command. When an update is available,
+Didimlog appends one line to stderr without changing stdout or the exit code.
 
 ```text
 Didimlog X.Y.Z 업데이트 가능 — uv tool upgrade didimlog

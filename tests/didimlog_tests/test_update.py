@@ -111,6 +111,26 @@ class AutomaticUpdateNoticeTests(unittest.TestCase):
         self.assertEqual(cache_mode, 0o600)
         self.assertEqual(directory_mode, 0o700)
 
+    def test_growing_project_metadata_above_64_kib_still_allows_notice(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve() / "home"
+            home.mkdir()
+            payload = json.dumps(
+                {
+                    "info": {
+                        "version": "0.0.6",
+                        "description": "x" * (96 * 1024),
+                    }
+                }
+            ).encode("utf-8")
+            opener = RecordingOpener(payload)
+
+            output, _ = self.run_notice(home, opener=opener)
+
+        self.assertGreater(len(payload), 64 * 1024)
+        self.assertLess(len(payload), update.RESPONSE_MAX_BYTES)
+        self.assertIn("Didimlog 0.0.6 업데이트 가능", output)
+
     def test_absolute_xdg_cache_home_selects_the_cache_location(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
