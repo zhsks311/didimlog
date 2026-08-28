@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from didimlog import cli
+from didimlog import gui as gui_module
 from didimlog.gui import GuiApplication, LOOPBACK_HOST, create_server
 from didimlog.personal import index as personal_index
 
@@ -80,14 +81,17 @@ class GuiBehaviorTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=5)
 
-    def request(self, method, path, *, headers=None):
+    def request(self, method, path, *, headers=None, authorized=True):
+        selected_headers = dict(headers or {})
+        if authorized and "Authorization" not in selected_headers:
+            selected_headers["Authorization"] = "Bearer " + self.server._capability
         connection = http.client.HTTPConnection(
             LOOPBACK_HOST,
             self.server.server_port,
             timeout=5,
         )
         try:
-            connection.request(method, path, headers=headers or {})
+            connection.request(method, path, headers=selected_headers)
             response = connection.getresponse()
             body = response.read()
             content_type = response.getheader("Content-Type", "")
@@ -151,6 +155,206 @@ class GuiBehaviorTests(unittest.TestCase):
         )
         self.assertEqual(status, 403)
         self.assertEqual(payload["error"]["token"], "GUI_LOCAL_REQUEST_REQUIRED")
+
+    def test_private_apis_require_the_per_launch_bearer_after_local_checks(self):
+        status, headers, _ = self.request("GET", "/", authorized=False)
+        self.assertEqual(status, 200)
+        self.assertEqual(dict(headers)["Referrer-Policy"], "no-referrer")
+        for path in ("/assets/app.css", "/assets/app.js"):
+            asset_status, _, _ = self.request(
+                "GET",
+                path,
+                authorized=False,
+            )
+            self.assertEqual(asset_status, 200)
+
+        submitted = (
+            {},
+            {"Authorization": "Basic local"},
+            {"Authorization": "Bearer wrong-capability"},
+            {"Cookie": "cap=" + self.server._capability},
+        )
+        for headers in submitted:
+            with self.subTest(headers=tuple(headers)):
+                status, _, payload = self.request(
+                    "GET",
+                    "/api/v1/health?cap=" + self.server._capability,
+                    headers=headers,
+                    authorized=False,
+                )
+                self.assertEqual(status, 401)
+                self.assertEqual(
+                    payload["error"]["token"],
+                    "GUI_CAPABILITY_REQUIRED",
+                )
+                self.assertNotIn(
+                    self.server._capability,
+                    json.dumps(payload),
+                )
+                self.assertNotIn("wrong-capability", json.dumps(payload))
+
+        status, _, payload = self.request(
+            "GET",
+            "/api/v1/health",
+            headers={
+                "Host": "attacker.example",
+                "Authorization": "Bearer wrong-capability",
+            },
+            authorized=False,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"]["token"], "GUI_LOCAL_REQUEST_REQUIRED")
+
+        status, _, payload = self.request(
+            "GET",
+            "/api/v1/health",
+            headers={
+                "Origin": "http://attacker.example",
+                "Authorization": "Bearer " + self.server._capability,
+            },
+            authorized=False,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"]["token"], "GUI_LOCAL_REQUEST_REQUIRED")
+
+    def test_write_auth_precedence_and_allow_header_are_uniform(self):
+        for headers in ({}, {"Authorization": "Bearer wrong-capability"}):
+            with self.subTest(headers=headers):
+                status, response_headers, payload = self.request(
+                    "POST",
+                    "/api/v1/library",
+                    headers=headers,
+                    authorized=False,
+                )
+                self.assertEqual(status, 401)
+                self.assertNotIn("Allow", dict(response_headers))
+                self.assertEqual(
+                    payload["error"]["token"],
+                    "GUI_CAPABILITY_REQUIRED",
+                )
+
+        status, headers, payload = self.request("DELETE", "/api/v1/library")
+        self.assertEqual(status, 405)
+        self.assertEqual(dict(headers)["Allow"], "GET, HEAD")
+        self.assertEqual(payload["error"]["token"], "GUI_READ_ONLY")
+
+    def test_each_server_uses_a_new_32_byte_urlsafe_capability(self):
+        with mock.patch(
+            "didimlog.gui.secrets.token_urlsafe",
+            side_effect=("first-capability", "second-capability"),
+        ) as token_urlsafe:
+            first = create_server(self.application, port=0)
+            second = create_server(self.application, port=0)
+        self.addCleanup(first.server_close)
+        self.addCleanup(second.server_close)
+
+        self.assertEqual(first._capability, "first-capability")
+        self.assertEqual(second._capability, "second-capability")
+        self.assertNotEqual(first._capability, second._capability)
+        self.assertEqual(
+            token_urlsafe.call_args_list,
+            [mock.call(32), mock.call(32)],
+        )
+        thread = threading.Thread(
+            target=second.serve_forever,
+            daemon=True,
+        )
+        thread.start()
+
+        def status_for(capability):
+            connection = http.client.HTTPConnection(
+                LOOPBACK_HOST,
+                second.server_port,
+                timeout=5,
+            )
+            try:
+                connection.request(
+                    "GET",
+                    "/api/v1/health",
+                    headers={"Authorization": "Bearer " + capability},
+                )
+                response = connection.getresponse()
+                response.read()
+                return response.status
+            finally:
+                connection.close()
+
+        try:
+            self.assertEqual(status_for(first._capability), 401)
+            self.assertEqual(status_for(second._capability), 200)
+        finally:
+            second.shutdown()
+            second.server_close()
+            thread.join(timeout=5)
+
+
+    def test_open_handoff_keeps_capability_out_of_output(self):
+        capability = "test-open-capability"
+        server = mock.Mock(
+            server_port=8123,
+            _capability=capability,
+        )
+        server.serve_forever.side_effect = KeyboardInterrupt
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch("didimlog.gui.create_server", return_value=server),
+            mock.patch("didimlog.gui.webbrowser.open", return_value=True) as opened,
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(gui_module.serve_gui(open_browser=True), 0)
+
+        opened.assert_called_once_with(
+            "http://127.0.0.1:8123/#cap=" + capability,
+            new=2,
+        )
+        self.assertIn("http://127.0.0.1:8123/", stdout.getvalue())
+        self.assertNotIn(capability, stdout.getvalue())
+        self.assertNotIn(capability, stderr.getvalue())
+        server.server_close.assert_called_once_with()
+
+    def test_browser_open_failure_does_not_print_private_fallback(self):
+        capability = "test-failed-open-capability"
+        server = mock.Mock(
+            server_port=8123,
+            _capability=capability,
+        )
+        server.serve_forever.side_effect = KeyboardInterrupt
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch("didimlog.gui.create_server", return_value=server),
+            mock.patch("didimlog.gui.webbrowser.open", return_value=False),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(gui_module.serve_gui(open_browser=True), 0)
+
+        self.assertNotIn(capability, stdout.getvalue())
+        self.assertNotIn(capability, stderr.getvalue())
+        self.assertIn("GUI_BROWSER_OPEN_FAILED", stderr.getvalue())
+        self.assertIn("--open", stderr.getvalue())
+
+
+    def test_manual_handoff_prints_the_private_url_once_as_sensitive(self):
+        capability = "test-manual-capability"
+        server = mock.Mock(
+            server_port=8123,
+            _capability=capability,
+        )
+        server.serve_forever.side_effect = KeyboardInterrupt
+        stdout = io.StringIO()
+        with (
+            mock.patch("didimlog.gui.create_server", return_value=server),
+            contextlib.redirect_stdout(stdout),
+        ):
+            self.assertEqual(gui_module.serve_gui(open_browser=False), 0)
+
+        output = stdout.getvalue()
+        self.assertEqual(output.count(capability), 1)
+        self.assertIn("sensitive; do not share", output)
+
 
     def test_closed_server_port_can_be_reused_immediately(self):
         first = create_server(self.application, port=0)
@@ -252,10 +456,14 @@ class GuiBehaviorTests(unittest.TestCase):
             "/api/v1/lessons/" + lesson_id,
         )
         health_status, _, health = self.request("GET", "/api/v1/health")
-        write_status, _, write_error = self.request("POST", "/api/v1/library")
+        write_status, write_headers, write_error = self.request(
+            "POST",
+            "/api/v1/library",
+        )
 
         self.assertEqual((book_status, lesson_status, health_status), (200, 200, 200))
         self.assertEqual(write_status, 405)
+        self.assertEqual(dict(write_headers)["Allow"], "GET, HEAD")
         self.assertEqual(write_error["error"]["token"], "GUI_READ_ONLY")
         self.assertEqual(before, self.snapshot())
         payload = json.dumps(
@@ -271,6 +479,7 @@ class GuiBehaviorTests(unittest.TestCase):
         changed = BOOK.replace("안전한 로컬 책", "바뀐 원문 책")
         (self.knowledge / "book/demo/reader.md").write_text(changed, encoding="utf-8")
 
+
         library = self.library()
 
         self.assertEqual(
@@ -280,6 +489,122 @@ class GuiBehaviorTests(unittest.TestCase):
         self.assertFalse(library["health"]["personal_index"]["current"])
         self.assertEqual(library["source_snapshot"]["state"], "validated")
         self.assertEqual(library["scopes"][0]["books"][0]["title"], "바뀐 원문 책")
+
+    def test_gui_source_limit_accepts_exact_bytes_and_rejects_one_over(self):
+        identifier = self.library()["scopes"][0]["books"][0]["id"]
+        source = self.knowledge / "book/demo/reader.md"
+        prefix = (
+            b"---\n"
+            b"title: bounded source\n"
+            b"find_when: [safe, test]\n"
+            b"---\n"
+            b"# bounded\n\n"
+        )
+        exact = prefix + (
+            b"x" * (personal_index.SOURCE_MAX_BYTES - len(prefix))
+        )
+        source.write_bytes(exact)
+
+        exact_status, _, _ = self.request(
+            "GET",
+            "/api/v1/books/" + identifier,
+        )
+        source.write_bytes(exact + b"x")
+        overflow_status, _, overflow = self.request(
+            "GET",
+            "/api/v1/books/" + identifier,
+        )
+        source.write_text(BOOK, encoding="utf-8")
+        recovery_status, _, _ = self.request(
+            "GET",
+            "/api/v1/books/" + identifier,
+        )
+
+        self.assertEqual(exact_status, 200)
+        self.assertEqual(overflow_status, 413)
+        self.assertEqual(
+            overflow["error"]["token"],
+            "BOOK_RENDER_TOO_LARGE",
+        )
+        self.assertNotIn(str(self.root), json.dumps(overflow))
+        self.assertEqual(recovery_status, 200)
+
+    def test_book_render_limit_error_is_redacted_and_server_recovers(self):
+        identifier = self.library()["scopes"][0]["books"][0]["id"]
+        source_size = len(
+            (self.knowledge / "book/demo/reader.md").read_bytes()
+        )
+        limits = gui_module.BookRenderLimits(
+            source_bytes=source_size - 1,
+            image_bytes=4 * 1024 * 1024,
+            aggregate_image_bytes=16 * 1024 * 1024,
+            body_html_bytes=24 * 1024 * 1024,
+        )
+        with mock.patch.object(gui_module, "_GUI_BOOK_RENDER_LIMITS", limits):
+            status, _, payload = self.request(
+                "GET",
+                "/api/v1/books/" + identifier,
+            )
+
+        self.assertEqual(status, 413)
+        self.assertEqual(payload["error"]["token"], "BOOK_RENDER_TOO_LARGE")
+        self.assertNotIn(str(self.root), json.dumps(payload))
+        recovered, _, _ = self.request("GET", "/api/v1/books/" + identifier)
+        self.assertEqual(recovered, 200)
+
+    def test_serialized_book_response_exact_limit_and_overflow_recovery(self):
+        book = {
+            "id": "a" * 64,
+            "title": "bounded",
+            "body_html": "private-body-sentinel",
+        }
+        serialized_size = len(
+            json.dumps(
+                book,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        path = "/api/v1/books/" + ("a" * 64)
+        with (
+            mock.patch.object(self.application, "book", return_value=book),
+            mock.patch.object(
+                gui_module,
+                "_GUI_BOOK_RESPONSE_MAX_BYTES",
+                serialized_size,
+            ),
+        ):
+            exact_status, _, exact = self.request("GET", path)
+
+        with (
+            mock.patch.object(self.application, "book", return_value=book),
+            mock.patch.object(
+                gui_module,
+                "_GUI_BOOK_RESPONSE_MAX_BYTES",
+                serialized_size - 1,
+            ),
+        ):
+            overflow_status, _, overflow = self.request("GET", path)
+
+        with (
+            mock.patch.object(self.application, "book", return_value=book),
+            mock.patch.object(
+                gui_module,
+                "_GUI_BOOK_RESPONSE_MAX_BYTES",
+                serialized_size,
+            ),
+        ):
+            recovery_status, _, _ = self.request("GET", path)
+
+        self.assertEqual(exact_status, 200)
+        self.assertEqual(exact, book)
+        self.assertEqual(overflow_status, 413)
+        self.assertEqual(
+            overflow["error"]["token"],
+            "BOOK_RENDER_TOO_LARGE",
+        )
+        self.assertNotIn("private-body-sentinel", json.dumps(overflow))
+        self.assertEqual(recovery_status, 200)
 
     def test_book_reader_rejects_raw_html_and_unsafe_link_schemes(self):
         unsafe_bodies = (

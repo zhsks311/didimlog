@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import hashlib
+import hmac
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
@@ -12,14 +13,22 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
+import sys
 from urllib.parse import urlsplit
 import webbrowser
 
 from didimlog.claude.status import StatusSnapshot, status_snapshot
 from didimlog.errors import DidimError, EXIT_POLICY
+from didimlog.file_io import UnsafePathError
 from didimlog.personal import index as personal_index
 from didimlog.personal.paths import data_home
-from didimlog.personal.render import load_verified_mermaid, render_book_view
+from didimlog.personal.render import (
+    BookRenderLimits,
+    BookRenderTooLarge,
+    load_verified_mermaid,
+    render_book_view,
+)
 
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -30,6 +39,14 @@ _PERSONAL_INDEX_TOKENS = {
     personal_index.IndexCheckState.MISSING: "PERSONAL_INDEX_MISSING",
     personal_index.IndexCheckState.STALE: "PERSONAL_INDEX_STALE",
 }
+_GUI_BOOK_RENDER_LIMITS = BookRenderLimits(
+    source_bytes=personal_index.SOURCE_MAX_BYTES,
+    image_bytes=4 * 1024 * 1024,
+    aggregate_image_bytes=16 * 1024 * 1024,
+    body_html_bytes=24 * 1024 * 1024,
+)
+_GUI_BOOK_RESPONSE_MAX_BYTES = 32 * 1024 * 1024
+
 _SECURITY_HEADERS = {
     "Content-Security-Policy": (
         "default-src 'self'; base-uri 'none'; connect-src 'self'; "
@@ -232,15 +249,47 @@ class GuiApplication:
             "요청한 자료가 현재 source snapshot에 없습니다.",
         )
 
+    @staticmethod
+    def _source_exceeded_index_limit(
+        error: personal_index.KnowledgeSourceError,
+        identifier: str,
+    ) -> bool:
+        # The index preserves this descriptor-safe limit failure as its cause.
+        # Keep every other unreadable-source case on the existing conflict path.
+        cause = error.__cause__
+        return (
+            error.logical_path.startswith("book/")
+            and _resource_id(error.logical_path) == identifier
+            and isinstance(cause, UnsafePathError)
+            and str(cause) == "source exceeds read limit"
+        )
+
     def book(self, identifier: str) -> dict[str, object]:
-        scope, item = self._find_item(identifier, "book")
+        try:
+            scope, item = self._find_item(identifier, "book")
+        except personal_index.KnowledgeSourceError as error:
+            if self._source_exceeded_index_limit(error, identifier):
+                raise GuiRequestError(
+                    "BOOK_RENDER_TOO_LARGE",
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    "책 reader 결과가 local GUI의 안전한 크기 제한을 넘었습니다.",
+                ) from error
+            raise
         source_name = PurePosixPath(str(item["path"])).name
         try:
             view = render_book_view(
                 project=scope,
                 source_name=source_name,
                 data_root=self.personal_root,
+                limits=_GUI_BOOK_RENDER_LIMITS,
+                namespace_headings=True,
             )
+        except BookRenderTooLarge as error:
+            raise GuiRequestError(
+                "BOOK_RENDER_TOO_LARGE",
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                "책 reader 결과가 local GUI의 안전한 크기 제한을 넘었습니다.",
+            ) from error
         except (OSError, UnicodeError, ValueError) as error:
             raise GuiRequestError(
                 "BOOK_RENDER_REJECTED",
@@ -326,6 +375,37 @@ def _handler(application: GuiApplication):
                 return None
             return host
 
+        @staticmethod
+        def _api_path(path: str) -> bool:
+            return path.startswith("/api/")
+
+        def _authorized(self) -> bool:
+            values = self.headers.get_all("Authorization", ())
+            candidate = b""
+            if len(values) == 1 and values[0].startswith("Bearer "):
+                candidate = values[0].removeprefix("Bearer ").encode(
+                    "utf-8",
+                    "surrogatepass",
+                )
+            return hmac.compare_digest(
+                candidate,
+                self.server._capability.encode("ascii"),
+            )
+
+        def _require_capability(self, *, head_only: bool = False) -> bool:
+            if self._authorized():
+                return True
+            self._error(
+                GuiRequestError(
+                    "GUI_CAPABILITY_REQUIRED",
+                    HTTPStatus.UNAUTHORIZED,
+                    "이 local GUI launch의 browser capability가 필요합니다.",
+                ),
+                head_only=head_only,
+            )
+            return False
+
+
         def _send(
             self,
             status: HTTPStatus,
@@ -333,11 +413,14 @@ def _handler(application: GuiApplication):
             content_type: str,
             *,
             head_only: bool = False,
+            allow: str | None = None,
         ) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if allow is not None:
+                self.send_header("Allow", allow)
             for name, value in _SECURITY_HEADERS.items():
                 self.send_header(name, value)
             self.end_headers()
@@ -350,24 +433,40 @@ def _handler(application: GuiApplication):
             payload: dict[str, object],
             *,
             head_only: bool = False,
+            allow: str | None = None,
+            maximum_bytes: int | None = None,
         ) -> None:
             body = json.dumps(
                 payload,
                 ensure_ascii=False,
                 separators=(",", ":"),
             ).encode("utf-8")
+            if maximum_bytes is not None and len(body) > maximum_bytes:
+                raise GuiRequestError(
+                    "BOOK_RENDER_TOO_LARGE",
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    "책 reader 결과가 local GUI의 안전한 크기 제한을 넘었습니다.",
+                )
             self._send(
                 status,
                 body,
                 "application/json; charset=utf-8",
                 head_only=head_only,
+                allow=allow,
             )
 
-        def _error(self, error: GuiRequestError, *, head_only: bool = False) -> None:
+        def _error(
+            self,
+            error: GuiRequestError,
+            *,
+            head_only: bool = False,
+            allow: str | None = None,
+        ) -> None:
             self._json(
                 error.status,
                 {"error": {"token": error.token, "message": error.message}},
                 head_only=head_only,
+                allow=allow,
             )
 
         def _dispatch(self, *, head_only: bool) -> None:
@@ -382,6 +481,10 @@ def _handler(application: GuiApplication):
                 )
                 return
             path = urlsplit(self.path).path
+            if self._api_path(path) and not self._require_capability(
+                head_only=head_only
+            ):
+                return
             try:
                 if path == "/api/v1/health":
                     self._json(HTTPStatus.OK, application.health(), head_only=head_only)
@@ -395,6 +498,7 @@ def _handler(application: GuiApplication):
                         HTTPStatus.OK,
                         application.book(identifier),
                         head_only=head_only,
+                        maximum_bytes=_GUI_BOOK_RESPONSE_MAX_BYTES,
                     )
                     return
                 if path.startswith("/api/v1/lessons/"):
@@ -466,12 +570,16 @@ def _handler(application: GuiApplication):
                     )
                 )
                 return
+            path = urlsplit(self.path).path
+            if self._api_path(path) and not self._require_capability():
+                return
             self._error(
                 GuiRequestError(
                     "GUI_READ_ONLY",
                     HTTPStatus.METHOD_NOT_ALLOWED,
                     "Milestone A local GUI는 읽기 전용입니다.",
-                )
+                ),
+                allow="GET, HEAD",
             )
 
         do_PUT = do_POST
@@ -484,6 +592,10 @@ def _handler(application: GuiApplication):
 class GuiServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    def __init__(self, server_address, request_handler) -> None:
+        self._capability = secrets.token_urlsafe(32)
+        super().__init__(server_address, request_handler)
 
 
 def create_server(
@@ -509,13 +621,27 @@ def serve_gui(*, port: int = 0, open_browser: bool = False) -> int:
             help_text="다른 --port 값을 선택하거나 사용 중인 local server를 종료하세요.",
         ) from error
     url = "http://{}:{}/".format(LOOPBACK_HOST, server.server_port)
+    bootstrap_url = url + "#cap=" + server._capability
     try:
         print("Didimlog local GUI: " + url, flush=True)
         if open_browser:
+            opened = False
             try:
-                webbrowser.open(url, new=2)
+                opened = webbrowser.open(bootstrap_url, new=2)
             except (OSError, webbrowser.Error):
                 pass
+            if not opened:
+                print(
+                    "GUI_BROWSER_OPEN_FAILED: --open 없이 다시 실행해 private handoff URL을 여세요.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        else:
+            print(
+                "Didimlog private GUI handoff (sensitive; do not share): "
+                + bootstrap_url,
+                flush=True,
+            )
         server.serve_forever()
     except KeyboardInterrupt:
         return 0

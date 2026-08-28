@@ -126,9 +126,18 @@ Start the read-only local web app from any directory:
 didim gui --open
 ```
 
-`didim gui` binds only to IPv4 loopback (`127.0.0.1`), chooses an available
-port, and prints the local URL. Opening a browser is opt-in through `--open`.
-To request a specific loopback port, use `didim gui --port 8765 --open`.
+`didim gui` binds only to IPv4 loopback (`127.0.0.1`) and chooses an available
+port. Every launch creates a new private browser capability. With `--open`,
+stdout contains only the non-secret base URL; the capability is handed to the
+browser in a URL fragment, moved into same-origin `sessionStorage`, and removed
+from the address bar immediately. To request a specific loopback port, use
+`didim gui --port 8765 --open`.
+
+Without `--open`, the terminal prints the private handoff URL once, marked
+sensitive, so you can open it manually. Do not share, record, or paste that
+line. If automatic browser opening fails, Didimlog prints a token-free
+instruction to relaunch without `--open`; it never prints the failed private
+URL as a fallback.
 
 The first screen is the Bookshelf. It groups validated canonical books by
 scope, opens each book through Didimlog's safe in-memory Markdown renderer,
@@ -139,9 +148,17 @@ an invalid source, the GUI never labels it current.
 
 Milestone A performs no book, lesson, index, setup, or Claude configuration
 writes. It has no remote binding, hosted service, account, telemetry, cloud
-sync, book authoring, or new-lesson form. The browser receives logical paths
-and opaque resource IDs rather than absolute filesystem paths, and it cannot
-submit arbitrary file paths.
+sync, book authoring, or new-lesson form. Static shell assets contain no
+personal data and remain anonymous; every private API read and write attempt
+requires the per-launch Bearer capability after loopback Host and Origin
+checks. The browser receives logical paths and opaque resource IDs rather than
+absolute filesystem paths, and it cannot submit arbitrary file paths.
+
+GUI book rendering retains the existing 4 MiB source limit and also limits
+each image to 4 MiB, aggregate raw images to 16 MiB, rendered UTF-8 body HTML
+to 24 MiB, and the serialized book response to 32 MiB. Oversized rendering
+fails with the redacted `BOOK_RENDER_TOO_LARGE` response and does not stop
+later requests.
 
 ### Share Project Knowledge with the Team
 
@@ -419,7 +436,7 @@ Didimlog enforces the following safety rules:
 - If setup fails, Didimlog rolls back only content created by the current run that remains unchanged. Concurrent user changes are not modified.
 - If only the index update fails after creating a record file, Didimlog preserves the source content and provides a recovery command.
 - Evidence backed by Git objects is verified only against the object database of the repository identified when the command starts. Didimlog does not use the current shell's Git environment variables or external alternates to locate other objects.
-- The local GUI binds only to `127.0.0.1`, validates the HTTP host/origin, accepts only opaque IDs for book and lesson reads, and exposes no write methods.
+- The local GUI binds only to `127.0.0.1`, validates the HTTP host/origin before a constant-time per-launch capability check, accepts only opaque IDs for book and lesson reads, applies finite render/response limits, and exposes no authenticated write methods.
 
 ## Claude Code Integration
 

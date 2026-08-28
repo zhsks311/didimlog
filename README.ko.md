@@ -127,9 +127,16 @@ didim gui --open
 ```
 
 `didim gui`는 IPv4 loopback(`127.0.0.1`)에만 bind하고 충돌 없는 port를
-선택한 뒤 local URL을 출력합니다. browser는 `--open`을 명시했을 때만
-엽니다. 특정 loopback port가 필요하면
+선택합니다. launch마다 새 private browser capability를 만듭니다. `--open`을
+쓰면 stdout에는 secret이 없는 base URL만 출력하고, capability는 URL fragment로
+browser에 넘긴 뒤 same-origin `sessionStorage`로 옮기고 주소창에서 즉시
+지웁니다. 특정 loopback port가 필요하면
 `didim gui --port 8765 --open`을 사용합니다.
+
+`--open`을 쓰지 않으면 수동으로 열 수 있도록 sensitive 표시가 붙은 private
+handoff URL을 terminal에 한 번 출력합니다. 그 줄을 공유·기록·붙여넣지 마세요.
+자동 browser 열기가 실패하면 Didimlog는 private URL을 다시 출력하지 않고
+`--open` 없이 재실행하라는 token-free 안내만 출력합니다.
 
 첫 화면은 책장입니다. 검증한 canonical book을 scope별로 묶어 보여 주고,
 Didimlog의 기존 안전한 Markdown renderer로 메모리에서 책을 엽니다. 교훈
@@ -137,11 +144,18 @@ Didimlog의 기존 안전한 Markdown renderer로 메모리에서 책을 엽니�
 panel은 개인 index, 현재 프로젝트 index, Claude 연결을 따로 표시합니다.
 개인 index가 stale, missing, extra, invalid source 상태이면 current라고
 표시하지 않습니다.
+Milestone A는 book, lesson, index, setup, Claude 설정을 쓰지 않습니다. remote
+bind, hosted service, account, telemetry, cloud sync, book authoring, 새 lesson
+form도 없습니다. 개인 자료가 없는 static shell asset은 익명으로 제공하지만,
+모든 private API read와 write 시도는 loopback Host·Origin 검사 뒤 launch별
+Bearer capability를 요구합니다. browser에는 absolute filesystem path 대신
+logical path와 opaque resource ID만 전달하며 임의 file path를 제출할 수
+없습니다.
 
-Milestone A는 book·lesson·index·setup·Claude 설정을 쓰지 않습니다. 원격
-bind, hosted service, 계정, telemetry, cloud sync, book authoring, 새 교훈
-form도 없습니다. browser에는 절대 filesystem path 대신 logical path와
-opaque resource ID만 보내며 임의 file path를 요청할 수 없습니다.
+GUI book render는 기존 source 4 MiB 제한을 유지하고 image당 4 MiB, raw image
+합계 16 MiB, UTF-8 body HTML 24 MiB, serialized book response 32 MiB로
+제한합니다. 너무 큰 render는 세부 내용이 가려진 `BOOK_RENDER_TOO_LARGE`로
+실패하며 이후 요청은 계속 처리합니다.
 
 ### 프로젝트 지식을 팀과 공유하기
 
@@ -419,7 +433,7 @@ Didimlog는 다음 안전 규칙을 적용합니다.
 - 설정 도중 실패하면 Didimlog가 이번 실행에서 만든 내용 중 그대로 남아 있는 것만 되돌립니다. 동시에 저장된 사용자 변경은 건드리지 않습니다.
 - 기록 파일 생성 뒤 index 갱신만 실패하면 원문은 보존하고 복구 명령을 안내합니다.
 - Git object 근거 자료는 명령 시작 시 확인한 저장소의 object database에서만 검증합니다. 현재 shell의 Git 환경 변수나 외부 alternates에서 다른 object를 찾지 않습니다.
-- local GUI는 `127.0.0.1`에만 bind하고 HTTP host/origin을 검사하며, book·lesson 조회에 opaque ID만 받고 write method를 제공하지 않습니다.
+- local GUI는 `127.0.0.1`에만 bind하고 HTTP host/origin을 먼저 검사한 뒤 launch별 capability를 constant-time으로 비교하며, book·lesson 조회에 opaque ID만 받고 finite render/response 제한을 적용하고 인증된 write method를 제공하지 않습니다.
 
 ## Claude Code 연결
 

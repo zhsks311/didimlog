@@ -1,9 +1,34 @@
 "use strict";
+const capabilityStorageKey = "didimlog.gui.capability";
+const bootstrapCapability = /^#cap=([A-Za-z0-9_-]+)$/.exec(window.location.hash);
+let capability = null;
+if (bootstrapCapability) {
+  try {
+    window.sessionStorage.setItem(capabilityStorageKey, bootstrapCapability[1]);
+    capability = bootstrapCapability[1];
+  } finally {
+    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+  }
+} else {
+  capability = window.sessionStorage.getItem(capabilityStorageKey);
+}
+
 
 const state = {
   library: null,
   health: null,
   selectedLesson: null,
+  routeGeneration: 0,
+  lessonGeneration: 0,
+  refreshGeneration: 0,
+  lessonFilters: {
+    scope: "",
+    topic: "",
+    tag: "",
+    booked: "",
+    date: "",
+    review: "",
+  },
 };
 
 const views = {
@@ -45,11 +70,29 @@ function setNavigation(current) {
   }
 }
 
+function routeHash() {
+  return window.location.hash || "#/bookshelf";
+}
+
+function routeIsCurrent(generation, hash) {
+  return generation === state.routeGeneration && hash === routeHash();
+}
+
+function lessonIsCurrent(generation, identifier, routeGeneration, hash) {
+  return (
+    generation === state.lessonGeneration
+    && identifier === state.selectedLesson
+    && routeIsCurrent(routeGeneration, hash)
+  );
+}
+
 async function api(path) {
+  const headers = { Accept: "application/json" };
+  if (capability) headers.Authorization = `Bearer ${capability}`;
   const response = await fetch(path, {
     method: "GET",
     credentials: "same-origin",
-    headers: { Accept: "application/json" },
+    headers,
   });
   let payload;
   try {
@@ -221,12 +264,15 @@ function renderBookshelf() {
   show("bookshelf");
 }
 
-async function renderReader(identifier) {
+async function renderReader(identifier, generation, hash) {
+  if (!routeIsCurrent(generation, hash)) return;
   setNavigation(null);
   const root = views.reader;
   clear(root);
   show("loading");
   const book = await api(`/api/v1/books/${encodeURIComponent(identifier)}`);
+  if (!routeIsCurrent(generation, hash)) return;
+
   const back = element("button", { className: "text-button", attrs: { type: "button" }, text: "← 책장으로" });
   back.addEventListener("click", () => { window.location.hash = "#/bookshelf"; });
   const lessonsLink = element("button", { className: "text-button", attrs: { type: "button" }, text: "이 scope의 교훈 보기 →" });
@@ -262,9 +308,26 @@ async function renderReader(identifier) {
   // body_html is produced only by the existing server-side safe book renderer.
   article.innerHTML = book.body_html;
   for (const link of article.querySelectorAll("a[href]")) {
-    if (/^(https?:|mailto:)/i.test(link.getAttribute("href"))) {
+    const href = link.getAttribute("href");
+    if (/^(https?:|mailto:)/i.test(href)) {
       link.setAttribute("target", "_blank");
       link.setAttribute("rel", "noopener noreferrer");
+    } else if (href.startsWith("#")) {
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        let anchor;
+        try {
+          anchor = decodeURIComponent(href.slice(1));
+        } catch (_) {
+          return;
+        }
+        const target = [...article.querySelectorAll("[id]")]
+          .find((node) => node.id === anchor);
+        if (!target) return;
+        if (!target.hasAttribute("tabindex")) target.setAttribute("tabindex", "-1");
+        target.focus({ preventScroll: true });
+        target.scrollIntoView({ block: "start" });
+      });
     }
   }
 
@@ -282,9 +345,19 @@ async function renderReader(identifier) {
   root.append(element("div", { className: "reader-grid" }, [toc, article, rail]));
   show("reader");
 
-  if (window.mermaid && article.querySelector(".mermaid")) {
+  if (
+    routeIsCurrent(generation, hash)
+    && window.mermaid
+    && article.querySelector(".mermaid")
+  ) {
     window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "neutral" });
-    try { await window.mermaid.run({ nodes: article.querySelectorAll(".mermaid") }); } catch (_) { /* Keep escaped source visible. */ }
+    try {
+      await window.mermaid.run({ nodes: article.querySelectorAll(".mermaid") });
+      if (!routeIsCurrent(generation, hash)) return;
+    } catch (_) {
+      if (!routeIsCurrent(generation, hash)) return;
+      // Keep escaped source visible.
+    }
   }
 }
 
@@ -324,14 +397,15 @@ function selectedScopeFromHash() {
 }
 
 function filteredLessons() {
-  const lessons = allLessons();
-  const scope = document.querySelector("#filter-scope")?.value || "";
-  const topic = document.querySelector("#filter-topic")?.value || "";
-  const tag = document.querySelector("#filter-tag")?.value || "";
-  const booked = document.querySelector("#filter-booked")?.value || "";
-  const date = document.querySelector("#filter-date")?.value || "";
-  const review = document.querySelector("#filter-review")?.value || "";
-  return lessons.filter((lesson) => (
+  const {
+    scope,
+    topic,
+    tag,
+    booked,
+    date,
+    review,
+  } = state.lessonFilters;
+  return allLessons().filter((lesson) => (
     (!scope || lesson.scope === scope)
     && (!topic || lesson.topic === topic)
     && (!tag || lesson.tags.includes(tag))
@@ -365,7 +439,13 @@ function renderLessonList() {
   if (!lessons.length) list.append(element("p", { className: "empty-state", text: "선택한 metadata와 정확히 일치하는 교훈이 없습니다." }));
 }
 
-async function selectLesson(identifier) {
+async function selectLesson(
+  identifier,
+  routeGeneration = state.routeGeneration,
+  hash = routeHash(),
+) {
+  if (!routeIsCurrent(routeGeneration, hash)) return;
+  const generation = ++state.lessonGeneration;
   state.selectedLesson = identifier;
   renderLessonList();
   const detail = document.querySelector("#lesson-detail");
@@ -373,6 +453,7 @@ async function selectLesson(identifier) {
   detail.append(element("p", { className: "loading", text: "교훈 원문을 확인하고 있습니다." }));
   try {
     const lesson = await api(`/api/v1/lessons/${encodeURIComponent(identifier)}`);
+    if (!lessonIsCurrent(generation, identifier, routeGeneration, hash)) return;
     clear(detail);
     detail.append(
       element("p", { className: "eyebrow", text: `${lesson.scope} · LESSON` }),
@@ -390,12 +471,14 @@ async function selectLesson(identifier) {
       element("p", { className: "readonly-note", text: "canonical Markdown 원문을 읽기 전용으로 표시합니다. booked는 이 lesson의 topic-level 표식이며 특정 책 문장의 provenance가 아닙니다." }),
     );
   } catch (error) {
+    if (!lessonIsCurrent(generation, identifier, routeGeneration, hash)) return;
     clear(detail);
     detail.append(element("p", { className: "error-view", text: error.payload?.message || error.message }));
   }
 }
 
-async function renderLessons() {
+async function renderLessons(generation, hash) {
+  if (!routeIsCurrent(generation, hash)) return;
   setNavigation("lessons");
   const root = views.lessons;
   clear(root);
@@ -428,6 +511,20 @@ async function renderLessons() {
       ]),
     ]),
   );
+
+  const filterNames = ["scope", "topic", "tag", "booked", "date", "review"];
+  for (const name of filterNames) {
+    const control = document.querySelector(`#filter-${name}`);
+    const selected = state.lessonFilters[name];
+    if (
+      control.tagName !== "SELECT"
+      || [...control.options].some((item) => item.value === selected)
+    ) {
+      control.value = selected;
+    } else {
+      state.lessonFilters[name] = "";
+    }
+  }
   const requestedScope = selectedScopeFromHash();
   const scopeSelect = document.querySelector("#filter-scope");
   if (
@@ -435,9 +532,25 @@ async function renderLessons() {
     && [...scopeSelect.options].some((item) => item.value === requestedScope)
   ) {
     scopeSelect.value = requestedScope;
+    state.lessonFilters.scope = requestedScope;
   }
   for (const control of filters.querySelectorAll("select, input")) {
-    control.addEventListener("change", renderLessonList);
+    control.addEventListener("change", () => {
+      for (const name of filterNames) {
+        state.lessonFilters[name] = document.querySelector(`#filter-${name}`).value;
+      }
+      if (
+        state.selectedLesson
+        && !filteredLessons().some((lesson) => lesson.id === state.selectedLesson)
+      ) {
+        state.lessonGeneration += 1;
+        state.selectedLesson = null;
+        const detail = document.querySelector("#lesson-detail");
+        clear(detail);
+        detail.append(element("p", { className: "empty-state", text: "왼쪽 목록에서 읽을 교훈을 선택하세요." }));
+      }
+      renderLessonList();
+    });
   }
   renderLessonList();
   show("lessons");
@@ -445,32 +558,39 @@ async function renderLessons() {
     state.selectedLesson
     && filteredLessons().some((lesson) => lesson.id === state.selectedLesson)
   ) {
-    await selectLesson(state.selectedLesson);
+    await selectLesson(state.selectedLesson, generation, hash);
   } else {
+    state.lessonGeneration += 1;
     state.selectedLesson = null;
   }
 }
 
 async function route() {
+  const generation = ++state.routeGeneration;
+  const hash = routeHash();
   try {
     if (!state.library) {
       show("loading");
-      state.library = await api("/api/v1/library");
-      renderHealth(state.library.health);
+      const library = await api("/api/v1/library");
+      if (!routeIsCurrent(generation, hash)) return;
+      state.library = library;
+      renderHealth(library.health);
     }
-    const hash = window.location.hash || "#/bookshelf";
+    if (!routeIsCurrent(generation, hash)) return;
     const bookMatch = /^#\/books\/([0-9a-f]{64})$/.exec(hash);
     if (bookMatch) {
-      await renderReader(bookMatch[1]);
+      await renderReader(bookMatch[1], generation, hash);
+      if (!routeIsCurrent(generation, hash)) return;
       return;
     }
     if (hash.startsWith("#/lessons")) {
-      await renderLessons();
+      await renderLessons(generation, hash);
+      if (!routeIsCurrent(generation, hash)) return;
       return;
     }
     renderBookshelf();
   } catch (error) {
-    showError(error);
+    if (routeIsCurrent(generation, hash)) showError(error);
   }
 }
 
@@ -487,12 +607,23 @@ document.querySelector("#health-close").addEventListener("click", () => {
   healthButton.focus();
 });
 document.querySelector("#health-refresh").addEventListener("click", async () => {
+  const generation = ++state.refreshGeneration;
+  const hash = routeHash();
+  const routeGeneration = ++state.routeGeneration;
   try {
-    state.library = await api("/api/v1/library");
-    renderHealth(state.library.health);
+    const library = await api("/api/v1/library");
+    if (
+      generation !== state.refreshGeneration
+      || !routeIsCurrent(routeGeneration, hash)
+    ) return;
+    state.library = library;
+    renderHealth(library.health);
     await route();
   } catch (error) {
-    showError(error);
+    if (
+      generation === state.refreshGeneration
+      && routeIsCurrent(routeGeneration, hash)
+    ) showError(error);
   }
 });
 

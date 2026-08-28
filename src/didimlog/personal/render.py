@@ -47,6 +47,12 @@ _RAW_HTML = re.compile(HTML_RE, re.DOTALL | re.UNICODE)
 _EXTERNAL_URI = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 _ALLOWED_LINK_SCHEMES = frozenset(("http", "https", "mailto"))
 _MERMAID_SHA256 = "70137e77bb273bb2ef972b86e8b0400cca8be53cb25bfc45911a186dc98665de"
+_GUI_HEADING_PREFIX = "didim-book-heading-"
+_HEADING_ID = re.compile(
+    r'(<h[1-6]\b[^>]*\bid=")([^"]*)(")',
+    re.IGNORECASE,
+)
+_FRAGMENT_HREF = re.compile(r'(\bhref=")#([^"]*)(")', re.IGNORECASE)
 
 
 _STYLE = r"""
@@ -72,6 +78,7 @@ def _read_source(
     project_descriptor: int,
     name: str,
     logical_path: str,
+    maximum_bytes: int | None,
 ) -> str:
     try:
         linked = os.stat(
@@ -91,10 +98,12 @@ def _read_source(
         data = file_io.read_regular_file_at(
             project_descriptor,
             name,
-            sys.maxsize,
+            sys.maxsize if maximum_bytes is None else maximum_bytes,
         )
     except OSError:
         raise ValueError("book markdown must be a regular file") from None
+    if maximum_bytes is not None and len(data) > maximum_bytes:
+        raise BookRenderTooLarge
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError:
@@ -116,6 +125,7 @@ def _read_image_at(
     project_descriptor: int,
     relative_path: Path,
     image_source: str,
+    maximum_bytes: int | None,
 ) -> bytes:
     descriptor = os.dup(project_descriptor)
     try:
@@ -139,13 +149,16 @@ def _read_image_at(
                 + image_source
             )
         try:
-            return file_io.read_regular_file_at(
+            data = file_io.read_regular_file_at(
                 descriptor,
                 relative_path.name,
-                sys.maxsize,
+                sys.maxsize if maximum_bytes is None else maximum_bytes,
             )
         except OSError:
             raise ValueError("image missing: " + image_source) from None
+        if maximum_bytes is not None and len(data) > maximum_bytes:
+            raise BookRenderTooLarge
+        return data
     except ValueError:
         raise
     except OSError:
@@ -180,8 +193,12 @@ def _inline_images(
     rendered: str,
     source_path: Path,
     project_descriptor: int,
+    limits: BookRenderLimits | None,
 ) -> str:
+    aggregate_bytes = 0
+
     def replace(match: re.Match[str]) -> str:
+        nonlocal aggregate_bytes
         before, rendered_source, after = match.groups()
         image_source = html.unescape(rendered_source)
         if _EXTERNAL_URI.match(image_source) or image_source.startswith("//"):
@@ -192,7 +209,11 @@ def _inline_images(
             project_descriptor,
             relative_path,
             image_source,
+            None if limits is None else limits.image_bytes,
         )
+        aggregate_bytes += len(data)
+        if limits is not None and aggregate_bytes > limits.aggregate_image_bytes:
+            raise BookRenderTooLarge
         mime = (
             mimetypes.guess_type(relative_path.name)[0]
             or "application/octet-stream"
@@ -206,7 +227,6 @@ def _inline_images(
             alt,
             after,
         )
-
     return _IMAGE.sub(replace, rendered)
 
 
@@ -280,6 +300,18 @@ def _load_mermaid() -> str:
         raise ValueError("vendored Mermaid runtime missing") from error
 
 
+class BookRenderTooLarge(ValueError):
+    """A GUI render exceeded a finite resource boundary."""
+
+
+@dataclass(frozen=True)
+class BookRenderLimits:
+    source_bytes: int
+    image_bytes: int
+    aggregate_image_bytes: int
+    body_html_bytes: int
+
+
 @dataclass(frozen=True)
 class BookHeading:
     level: int
@@ -300,15 +332,23 @@ def _heading_text(value: object) -> str:
     return html.unescape(re.sub(r"<[^>]*>", "", str(value)))
 
 
-def _book_headings(tokens) -> tuple[BookHeading, ...]:
+def _book_headings(
+    tokens,
+    anchors: dict[str, str] | None = None,
+) -> tuple[BookHeading, ...]:
     headings = []
 
     def append(items) -> None:
         for item in items:
+            source_anchor = str(item["id"])
             headings.append(
                 BookHeading(
                     level=int(item["level"]),
-                    anchor=str(item["id"]),
+                    anchor=(
+                        source_anchor
+                        if anchors is None
+                        else anchors[source_anchor]
+                    ),
                     text=_heading_text(item["name"]),
                 )
             )
@@ -318,18 +358,55 @@ def _book_headings(tokens) -> tuple[BookHeading, ...]:
     return tuple(headings)
 
 
+def _heading_anchors(tokens) -> dict[str, str]:
+    anchors = {}
+
+    def append(items) -> None:
+        for item in items:
+            source_anchor = str(item["id"])
+            anchors[source_anchor] = _GUI_HEADING_PREFIX + source_anchor
+            append(item.get("children", ()))
+
+    append(tokens)
+    return anchors
+
+
+def _namespace_heading_fragments(
+    rendered: str,
+    anchors: dict[str, str],
+) -> str:
+    def heading(match: re.Match[str]) -> str:
+        source_anchor = html.unescape(match.group(2))
+        replacement = anchors.get(source_anchor)
+        if replacement is None:
+            return match.group(0)
+        return match.group(1) + html.escape(replacement, quote=True) + match.group(3)
+
+    def fragment(match: re.Match[str]) -> str:
+        source_anchor = html.unescape(match.group(2))
+        replacement = anchors.get(source_anchor)
+        if replacement is None:
+            return match.group(0)
+        return match.group(1) + "#" + html.escape(replacement, quote=True) + match.group(3)
+
+    return _FRAGMENT_HREF.sub(fragment, _HEADING_ID.sub(heading, rendered))
+
+
 def _render_book_view_at(
     project_descriptor: int,
     *,
     project: str,
     source_name: str,
     include_toc: bool,
+    limits: BookRenderLimits | None = None,
+    namespace_headings: bool = False,
 ) -> RenderedBook:
     logical_path = "book/{}/{}".format(project, source_name)
     source_text = _read_source(
         project_descriptor,
         source_name,
         logical_path,
+        None if limits is None else limits.source_bytes,
     )
     parsed = parse_frontmatter_text(
         source_name,
@@ -371,15 +448,29 @@ def _render_book_view_at(
         body,
         Path(source_name),
         project_descriptor,
+        limits,
     )
+    tokens = getattr(converter, "toc_tokens", ())
+    anchors = (
+        _heading_anchors(tokens)
+        if include_toc and namespace_headings
+        else None
+    )
+    if anchors is not None:
+        body = _namespace_heading_fragments(body, anchors)
     _reject_unsafe_rendered_html(body)
+    if (
+        limits is not None
+        and len(body.encode("utf-8")) > limits.body_html_bytes
+    ):
+        raise BookRenderTooLarge
     return RenderedBook(
         title=title,
         find_when=tuple(find_when),
         logical_path=logical_path,
         body_html=body,
         headings=(
-            _book_headings(getattr(converter, "toc_tokens", ()))
+            _book_headings(tokens, anchors)
             if include_toc
             else ()
         ),
@@ -391,6 +482,8 @@ def render_book_view(
     project: str,
     source_name: str,
     data_root=None,
+    limits: BookRenderLimits | None = None,
+    namespace_headings: bool = False,
 ) -> RenderedBook:
     """Render a validated canonical book in memory without writing a derived file."""
     selected_project = validate_project(project, allow_global=True)
@@ -418,6 +511,8 @@ def render_book_view(
             project=selected_project,
             source_name=source_name,
             include_toc=True,
+            limits=limits,
+            namespace_headings=namespace_headings,
         )
         if not _project_directory_is_current(resolved, descriptor):
             raise ValueError("project book link changed during render")
