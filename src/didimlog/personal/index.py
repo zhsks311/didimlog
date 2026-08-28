@@ -256,6 +256,7 @@ def _lesson_item(
     relative: Path,
     *,
     read_relative: Path | None = None,
+    include_content: bool = False,
 ) -> dict[str, object]:
     logical_path = _logical_source_path(project, relative)
     try:
@@ -275,20 +276,36 @@ def _lesson_item(
         ) from exc
     if parsed is None:
         raise KnowledgeSourceError(logical_path, "invalid lesson metadata")
-    fields, _, _ = parsed
+    fields, lines, closing = parsed
     tags = parse_inline_list(fields.get("tags", "[]"), canonical=True)
     if tags is None:
         raise KnowledgeSourceError(logical_path, "invalid tags")
     find_when = sorted(set([fields["topic"], *tags]), key=_byte_key)
     if not find_when:
         raise KnowledgeSourceError(logical_path, "find_when is empty")
-    return {
+    item: dict[str, object] = {
         "kind": "lesson",
         "title": fields["title"],
         "find_when": find_when,
         "path": logical_path,
         "review_by": fields.get("review_by"),
     }
+    if include_content:
+        booked = parse_inline_list(fields.get("booked", "[]"))
+        if booked is None:
+            raise KnowledgeSourceError(logical_path, "invalid booked topics")
+        item.update(
+            {
+                "slug": relative.stem,
+                "topic": fields["topic"],
+                "summary": fields["summary"],
+                "tags": tags,
+                "date": fields["date"],
+                "booked": booked,
+                "body": "\n".join(lines[closing + 1 :]),
+            }
+        )
+    return item
 
 
 def _document_item(
@@ -481,6 +498,8 @@ def _require_projects_unchanged(
 
 def _collect_with_projects(
     data_root=None,
+    *,
+    include_content: bool = False,
 ) -> tuple[
     dict[str, list[dict[str, object]]],
     tuple[ProjectDirectory, ...],
@@ -524,6 +543,7 @@ def _collect_with_projects(
                                 current_descriptor,
                                 relative,
                                 read_relative=leaf,
+                                include_content=include_content,
                             )
                         ),
                     )
@@ -584,10 +604,37 @@ def _collect_with_projects(
     return collected, snapshots
 
 
-def collect(data_root=None) -> dict[str, list[dict[str, object]]]:
-    """선택한 Markdown을 검사하고 프로젝트별 인덱스 항목을 반환한다."""
-    collected, _ = _collect_with_projects(data_root)
+def collect(
+    data_root=None,
+    *,
+    include_content: bool = False,
+) -> dict[str, list[dict[str, object]]]:
+    """Return validated source rows, optionally including lesson view content."""
+    collected, _ = _collect_with_projects(
+        data_root,
+        include_content=include_content,
+    )
     return collected
+
+
+def collect_snapshot(
+    data_root=None,
+    *,
+    include_content: bool = False,
+) -> tuple[dict[str, list[dict[str, object]]], IndexCheckState]:
+    """Collect one source snapshot and inspect its exact derived index under one lock."""
+    root = Path(data_root) if data_root is not None else lessons_dir().parent
+    with path_lock(root, shared=True):
+        collected, _ = _collect_with_projects(
+            root,
+            include_content=include_content,
+        )
+        outputs = {
+            project: render_project(project, items)
+            for project, items in collected.items()
+        }
+        state = inspect_index(outputs, root / "index")
+        return collected, state
 
 
 def render_project(project: str, items: Iterable[Mapping[str, object]]) -> str:

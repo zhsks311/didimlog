@@ -2,7 +2,7 @@
 
 English | [한국어](README.ko.md)
 
-Didimlog is a CLI that stores **lessons, observations, experiments, and evidence** gathered while working with Claude Code in local files, then retrieves only what is needed for the next task.
+Didimlog is a local-first CLI with an optional loopback web reader. It stores **lessons, observations, experiments, and evidence** gathered while working with Claude Code in local files, then lets you browse existing books and lessons or retrieve only what is needed for the next task.
 
 It is well suited for the following use cases:
 
@@ -117,6 +117,31 @@ The lesson source now remains in `~/knowledge/lessons/<프로젝트 이름>/`. D
 - If the status differs from what you expect, see [Diagnose Problems](#diagnose-problems).
 
 ## Common Tasks
+
+### Browse Books and Lessons in the Local GUI
+
+Start the read-only local web app from any directory:
+
+```sh
+didim gui --open
+```
+
+`didim gui` binds only to IPv4 loopback (`127.0.0.1`), chooses an available
+port, and prints the local URL. Opening a browser is opt-in through `--open`.
+To request a specific loopback port, use `didim gui --port 8765 --open`.
+
+The first screen is the Bookshelf. It groups validated canonical books by
+scope, opens each book through Didimlog's safe in-memory Markdown renderer,
+and provides a read-only lesson list/detail view with exact metadata filters.
+The health panel reports the personal index, current project index, and Claude
+connection separately. If the personal index is stale, missing, extra, or has
+an invalid source, the GUI never labels it current.
+
+Milestone A performs no book, lesson, index, setup, or Claude configuration
+writes. It has no remote binding, hosted service, account, telemetry, cloud
+sync, book authoring, or new-lesson form. The browser receives logical paths
+and opaque resource IDs rather than absolute filesystem paths, and it cannot
+submit arbitrary file paths.
 
 ### Share Project Knowledge with the Team
 
@@ -259,9 +284,9 @@ Didimlog appends one line to stderr without changing stdout or the exit code.
 Didimlog X.Y.Z 업데이트 가능 — uv tool upgrade didimlog
 ```
 
-Help, `--version`, `didim hook session-start`, `didim setup --dry-run`, failed
-commands, and non-interactive output do not perform the automatic check.
-Network, response, and cache failures do not block the original command.
+Help, `--version`, `didim hook session-start`, `didim gui`,
+`didim setup --dry-run`, failed commands, and non-interactive output do not
+perform the automatic check.
 
 The request is limited to `https://pypi.org/pypi/didimlog/json`; it contains no
 knowledge content, local path, project name, credential, or user identifier.
@@ -287,6 +312,7 @@ The following table summarizes commands intended to be run directly by users. Se
 | `didim add observation` | Save a project observation record | JSON stdin, common record options |
 | `didim add experiment` | Save a project experiment record | JSON stdin, common record options |
 | `didim add evidence` | Link project evidence with its artifact | JSON stdin, common record options |
+| `didim gui` | Start the loopback-only, read-only Bookshelf and lesson reader | `--open`, `--port` |
 | `didim index` | Rebuild personal and project indexes | `--check` |
 | `didim status` | Summarize the current status | `--config-dir` |
 | `didim doctor` | Diagnose problems and remediation steps | `--config-dir` |
@@ -393,6 +419,7 @@ Didimlog enforces the following safety rules:
 - If setup fails, Didimlog rolls back only content created by the current run that remains unchanged. Concurrent user changes are not modified.
 - If only the index update fails after creating a record file, Didimlog preserves the source content and provides a recovery command.
 - Evidence backed by Git objects is verified only against the object database of the repository identified when the command starts. Didimlog does not use the current shell's Git environment variables or external alternates to locate other objects.
+- The local GUI binds only to `127.0.0.1`, validates the HTTP host/origin, accepts only opaque IDs for book and lesson reads, and exposes no write methods.
 
 ## Claude Code Integration
 

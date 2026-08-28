@@ -10,7 +10,7 @@ from importlib import resources
 from pathlib import Path
 
 from didimlog.personal import render as render_module
-from didimlog.personal.render import render_book
+from didimlog.personal.render import render_book, render_book_view
 
 
 PNG = base64.b64decode(
@@ -491,6 +491,59 @@ graph LR
                     self.render()
 
                 self.assertFalse(self.output.exists())
+
+    def test_attr_list_cannot_create_event_or_style_attributes(self):
+        self.write_source(
+            """# Safe heading {#chosen onclick="alert(1)" style="color:red"}
+
+Term
+: Definition
+
+| Value |
+| ---: |
+| 1 |
+
+Footnote reference.[^1]
+
+[^1]: Footnote body.
+"""
+        )
+
+        view = render_book_view(
+            project=PROJECT,
+            source_name=self.source.name,
+            data_root=self.data_root,
+        )
+        document = self.render().read_text(encoding="utf-8")
+        standalone_body = document.split("<body><main>", 1)[1].split(
+            '\n<p class="source">',
+            1,
+        )[0]
+
+        for rendered in (view.body_html, standalone_body):
+            self.assertNotRegex(
+                rendered,
+                r"<[^>]*\son[a-z0-9_-]*\s*=",
+            )
+            self.assertNotRegex(
+                rendered,
+                r'<[^>]*\sstyle="color:red"',
+            )
+            self.assertNotRegex(
+                rendered,
+                r'<[^>]*\sid="chosen"',
+            )
+            self.assertIn("<dl>", rendered)
+            self.assertIn('class="footnote"', rendered)
+            self.assertIn('style="text-align: right;"', rendered)
+
+        self.assertNotRegex(standalone_body, r"<h1[^>]*\sid=")
+        self.assertTrue(view.headings)
+        self.assertNotEqual(view.headings[0].anchor, "chosen")
+        self.assertIn(
+            'id="{}"'.format(view.headings[0].anchor),
+            view.body_html,
+        )
 
     def test_unsafe_markdown_link_schemes_are_rejected(self):
         for destination in (

@@ -26,7 +26,7 @@ from markdown.preprocessors import NormalizeWhitespace
 
 from didimlog import file_io
 
-from .lesson import parse_frontmatter_text
+from .lesson import parse_frontmatter_text, parse_inline_list, valid_index_title
 from .paths import (
     data_home,
     project_directory_unchanged,
@@ -210,12 +210,34 @@ def _inline_images(
     return _IMAGE.sub(replace, rendered)
 
 
-class _LinkValidator(HTMLParser):
+class _RenderedHtmlValidator(HTMLParser):
     def handle_starttag(self, tag: str, attributes) -> None:
-        if tag.lower() != "a":
-            return
+        normalized_tag = tag.lower()
         for name, value in attributes:
-            if name.lower() == "href" and value is not None:
+            normalized = name.lower()
+            if normalized == "style":
+                if (
+                    normalized_tag in ("th", "td")
+                    and value
+                    in (
+                        "text-align: center;",
+                        "text-align: left;",
+                        "text-align: right;",
+                    )
+                ):
+                    continue
+                raise ValueError(
+                    "unsafe rendered attribute is not allowed: " + normalized
+                )
+            if normalized.startswith("on"):
+                raise ValueError(
+                    "unsafe rendered attribute is not allowed: " + normalized
+                )
+            if (
+                normalized_tag == "a"
+                and normalized == "href"
+                and value is not None
+            ):
                 self._validate_href(value)
 
     def handle_startendtag(self, tag: str, attributes) -> None:
@@ -233,13 +255,14 @@ class _LinkValidator(HTMLParser):
                 raise ValueError("unsafe link destination is not allowed: " + href)
 
 
-def _reject_unsafe_links(rendered: str) -> None:
-    parser = _LinkValidator(convert_charrefs=True)
+def _reject_unsafe_rendered_html(rendered: str) -> None:
+    parser = _RenderedHtmlValidator(convert_charrefs=True)
     parser.feed(rendered)
     parser.close()
 
 
-def _load_mermaid() -> str:
+def load_verified_mermaid() -> bytes:
+    """Return the pinned vendored Mermaid runtime only after SHA-256 verification."""
     try:
         package = resources.files("didimlog.resources.personal")
         runtime = (package / "mermaid.min.js").read_bytes()
@@ -247,10 +270,161 @@ def _load_mermaid() -> str:
         raise ValueError("vendored Mermaid runtime missing") from error
     if hashlib.sha256(runtime).hexdigest() != _MERMAID_SHA256:
         raise ValueError("vendored Mermaid runtime failed integrity check")
+    return runtime
+
+
+def _load_mermaid() -> str:
     try:
-        return runtime.decode("utf-8")
+        return load_verified_mermaid().decode("utf-8")
     except UnicodeError as error:
         raise ValueError("vendored Mermaid runtime missing") from error
+
+
+@dataclass(frozen=True)
+class BookHeading:
+    level: int
+    anchor: str
+    text: str
+
+
+@dataclass(frozen=True)
+class RenderedBook:
+    title: str
+    find_when: tuple[str, ...]
+    logical_path: str
+    body_html: str
+    headings: tuple[BookHeading, ...]
+
+
+def _heading_text(value: object) -> str:
+    return html.unescape(re.sub(r"<[^>]*>", "", str(value)))
+
+
+def _book_headings(tokens) -> tuple[BookHeading, ...]:
+    headings = []
+
+    def append(items) -> None:
+        for item in items:
+            headings.append(
+                BookHeading(
+                    level=int(item["level"]),
+                    anchor=str(item["id"]),
+                    text=_heading_text(item["name"]),
+                )
+            )
+            append(item.get("children", ()))
+
+    append(tokens)
+    return tuple(headings)
+
+
+def _render_book_view_at(
+    project_descriptor: int,
+    *,
+    project: str,
+    source_name: str,
+    include_toc: bool,
+) -> RenderedBook:
+    logical_path = "book/{}/{}".format(project, source_name)
+    source_text = _read_source(
+        project_descriptor,
+        source_name,
+        logical_path,
+    )
+    parsed = parse_frontmatter_text(
+        source_name,
+        source_text,
+        ("title", "find_when"),
+    )
+    if parsed is None:
+        raise ValueError("book markdown metadata is invalid")
+    fields, lines, closing = parsed
+    title = fields["title"].strip()
+    find_when = parse_inline_list(fields["find_when"], canonical=True)
+    if not valid_index_title(title) or not find_when:
+        raise ValueError("book markdown metadata is invalid")
+    body_source = "\n".join(lines[closing + 1 :])
+
+    _reject_raw_html(body_source)
+    # ``extra`` includes attr_list, which would let source text add arbitrary
+    # HTML attributes. Keep its documented safe features explicit.
+    extensions = [
+        "abbr",
+        "def_list",
+        "fenced_code",
+        "footnotes",
+        "sane_lists",
+        "tables",
+    ]
+    if include_toc:
+        extensions.append("toc")
+    converter = markdown.Markdown(
+        extensions=extensions,
+        output_format="html5",
+    )
+    body = converter.convert(body_source)
+    body = _MERMAID_BLOCK.sub(
+        lambda match: '<pre class="mermaid">{}</pre>'.format(match.group(1)),
+        body,
+    )
+    body = _inline_images(
+        body,
+        Path(source_name),
+        project_descriptor,
+    )
+    _reject_unsafe_rendered_html(body)
+    return RenderedBook(
+        title=title,
+        find_when=tuple(find_when),
+        logical_path=logical_path,
+        body_html=body,
+        headings=(
+            _book_headings(getattr(converter, "toc_tokens", ()))
+            if include_toc
+            else ()
+        ),
+    )
+
+
+def render_book_view(
+    *,
+    project: str,
+    source_name: str,
+    data_root=None,
+) -> RenderedBook:
+    """Render a validated canonical book in memory without writing a derived file."""
+    selected_project = validate_project(project, allow_global=True)
+    if (
+        source_name != os.path.basename(source_name)
+        or not source_name.endswith(".md")
+        or source_name in (".md", "..md")
+    ):
+        raise ValueError("book source name is invalid")
+    root = _absolute(data_home() if data_root is None else Path(data_root))
+    resolved = resolve_project_directory(root / "book", selected_project)
+    if resolved is None:
+        raise ValueError("project book directory missing")
+
+    descriptor: int | None = None
+    try:
+        try:
+            descriptor = file_io.open_directory_path(resolved.physical)
+        except OSError as error:
+            raise ValueError("project book link changed during render") from error
+        if not _project_directory_is_current(resolved, descriptor):
+            raise ValueError("project book link changed during render")
+        view = _render_book_view_at(
+            descriptor,
+            project=selected_project,
+            source_name=source_name,
+            include_toc=True,
+        )
+        if not _project_directory_is_current(resolved, descriptor):
+            raise ValueError("project book link changed during render")
+        return view
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _directory_identity(info: os.stat_result) -> tuple[int, int, int]:
@@ -821,60 +995,23 @@ def render_book(
         if not _project_directory_is_current(resolved, project_descriptor):
             raise ValueError("project book link changed during render")
 
-        logical_source_display = "book/{}/{}.md".format(project, topic)
-        source_text = _read_source(
+        view = _render_book_view_at(
             project_descriptor,
-            source_path.name,
-            logical_source_display,
+            project=project,
+            source_name=source_path.name,
+            include_toc=False,
         )
-
-        source_title = topic
-        body_source = source_text
-        if source_text.startswith("---"):
-            parsed = parse_frontmatter_text(
-                source_path.name,
-                source_text,
-                ("title", "find_when"),
-            )
-            if parsed is None:
-                raise ValueError("book markdown metadata is invalid")
-            fields, lines, closing = parsed
-            source_title = fields["title"].strip()
-            if not source_title or not fields["find_when"].strip():
-                raise ValueError("book markdown metadata is invalid")
-            body_source = "\n".join(lines[closing + 1 :])
-
-        _reject_raw_html(body_source)
-        body = markdown.markdown(
-            body_source,
-            extensions=("extra", "fenced_code", "tables", "sane_lists"),
-            output_format="html5",
-        )
-        body = _MERMAID_BLOCK.sub(
-            lambda match: '<pre class="mermaid">{}</pre>'.format(match.group(1)),
-            body,
-        )
-        body = _inline_images(
-            body,
-            Path(source_path.name),
-            project_descriptor,
-        )
-        _reject_unsafe_links(body)
-
-        heading = re.search(r"^#\s+(.+)$", body_source, re.MULTILINE)
-        title = heading.group(1).strip() if heading else source_title
         mermaid = _load_mermaid()
         document = """<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title}</title><style>{style}</style></head><body><main>{body}
-<p class="source">원천: book/{project}/{topic}.md · 이 HTML은 재생성 가능한 파생 뷰입니다.</p></main>
+<p class="source">원천: {logical_path} · 이 HTML은 재생성 가능한 파생 뷰입니다.</p></main>
 <script>{mermaid}</script><script>mermaid.initialize({{startOnLoad:true,securityLevel:'strict',theme:'default'}});</script>
 </body></html>""".format(
-            title=html.escape(title),
+            title=html.escape(view.title),
             style=_STYLE,
-            body=body,
-            project=html.escape(project),
-            topic=html.escape(topic),
+            body=view.body_html,
+            logical_path=html.escape(view.logical_path),
             mermaid=mermaid,
         )
 

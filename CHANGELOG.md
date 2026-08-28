@@ -7,6 +7,7 @@
 ### 추가
 
 - 성공한 대화형 `didim` 명령 뒤 최대 하루에 한 번 PyPI의 새 stable 버전을 확인해 stderr로 알립니다. 원래 명령의 stdout과 종료 코드는 유지하며, `DIDIM_NO_UPDATE_CHECK=1`로 요청과 cache 저장을 모두 끌 수 있습니다.
+- `didim gui`로 `127.0.0.1`에만 bind하는 읽기 전용 local web app을 실행할 수 있습니다. 기존 parser·index·안전한 book renderer를 재사용해 책장, book reader, 교훈 metadata filter·원문 상세, surface별 health를 제공하며 browse 중 원문·index·설정을 쓰지 않습니다.
 
 ## [0.0.5] - 2026-08-19
 

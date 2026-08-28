@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Didimlog · Local bookshelf</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <a class="skip-link" href="#content">본문으로 건너뛰기</a>
+  <header class="app-header">
+    <div class="brand-block">
+      <a class="brand" href="#/bookshelf" aria-label="Didimlog 책장">Didimlog</a>
+      <span class="edition">LOCAL KNOWLEDGE</span>
+    </div>
+    <nav class="primary-nav" aria-label="주 메뉴">
+      <a data-nav="bookshelf" href="#/bookshelf">책장</a>
+      <a data-nav="lessons" href="#/lessons">교훈</a>
+      <span class="nav-readonly" title="Milestone A에서는 새 교훈 저장을 제공하지 않습니다.">새 교훈 <small>읽기 전용</small></span>
+    </nav>
+    <button id="health-button" class="health-button" type="button" aria-expanded="false" aria-controls="health-panel">
+      <span class="status-dot" aria-hidden="true"></span>
+      <span id="health-label">상태 확인 중</span>
+    </button>
+  </header>
+
+  <aside id="health-panel" class="health-panel" aria-label="상태 및 설정" hidden>
+    <div class="panel-heading">
+      <div>
+        <p class="eyebrow">READ-ONLY STATUS</p>
+        <h2>상태 및 설정</h2>
+      </div>
+      <button id="health-close" class="text-button" type="button">닫기</button>
+    </div>
+    <div id="health-content" aria-live="polite"></div>
+    <button id="health-refresh" class="secondary-button" type="button">상태 새로 확인</button>
+    <p class="panel-note">이 화면은 상태만 읽습니다. index 복구, setup, Claude 설정 변경은 실행하지 않습니다.</p>
+  </aside>
+
+  <main id="content" tabindex="-1">
+    <div id="loading" class="loading" role="status">로컬 지식을 확인하고 있습니다.</div>
+    <section id="error-view" class="error-view" hidden aria-live="assertive"></section>
+    <section id="bookshelf-view" hidden></section>
+    <section id="reader-view" hidden></section>
+    <section id="lessons-view" hidden></section>
+  </main>
+
+  <noscript>Didimlog local GUI를 사용하려면 브라우저에서 JavaScript를 허용해야 합니다.</noscript>
+  <script src="/assets/mermaid.min.js" defer></script>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

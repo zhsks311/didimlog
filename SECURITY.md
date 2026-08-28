@@ -27,3 +27,5 @@
 - Claude 설정의 사용자 소유 구간 변경
 - artifact digest 또는 Git object 검증 우회
 - 로그·상태 출력의 비밀정보 노출
+- local GUI의 loopback bind·host/origin 제한을 우회한 remote access
+- local GUI의 opaque resource ID를 우회한 임의 path 조회 또는 canonical Markdown의 script 실행
