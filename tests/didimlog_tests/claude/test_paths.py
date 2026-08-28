@@ -2,7 +2,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from didimlog.claude.paths import config_dir, config_target
+from didimlog.claude.paths import (
+    ConfigPathError,
+    config_dir,
+    config_target,
+)
 
 
 class ConfigDirTests(unittest.TestCase):
@@ -204,6 +208,96 @@ class ConfigTargetTests(unittest.TestCase):
                     "didimlog/KNOWLEDGE_USAGE.md",
                     home=home,
                 )
+
+
+class ConfigPathErrorTests(unittest.TestCase):
+    """A refused path must say why, so callers can explain it to the user."""
+
+    def test_config_path_error_is_a_value_error(self):
+        self.assertTrue(issubclass(ConfigPathError, ValueError))
+
+    def test_target_symlink_reports_reason_and_link_destination(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory) / "home"
+            config = home / ".claude"
+            config.mkdir(parents=True)
+            other_profile = home / ".claude-other"
+            other_profile.mkdir()
+            shared = other_profile / "CLAUDE.md"
+            shared.write_text("# shared rules\n", encoding="utf-8")
+            (config / "CLAUDE.md").symlink_to(shared)
+
+            with self.assertRaises(ConfigPathError) as raised:
+                config_target(config, "CLAUDE.md", home=home)
+
+            self.assertEqual(raised.exception.reason, "target-symlink")
+            self.assertEqual(raised.exception.name, "CLAUDE.md")
+            self.assertEqual(raised.exception.destination, shared.resolve())
+
+    def test_target_symlink_outside_home_reports_no_destination(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            home = root / "home"
+            config = home / ".claude"
+            config.mkdir(parents=True)
+            outside = root / "outside.md"
+            outside.write_text("# outside\n", encoding="utf-8")
+            (config / "CLAUDE.md").symlink_to(outside)
+
+            with self.assertRaises(ConfigPathError) as raised:
+                config_target(config, "CLAUDE.md", home=home)
+
+            self.assertEqual(raised.exception.reason, "target-symlink")
+            self.assertIsNone(raised.exception.destination)
+
+    def test_target_directory_reports_a_distinct_reason(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory) / "home"
+            config = home / ".claude"
+            (config / "CLAUDE.md").mkdir(parents=True)
+
+            with self.assertRaises(ConfigPathError) as raised:
+                config_target(config, "CLAUDE.md", home=home)
+
+            self.assertEqual(raised.exception.reason, "target-not-regular")
+            self.assertIsNone(raised.exception.destination)
+
+    def test_managed_parent_symlink_reports_its_own_reason(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory) / "home"
+            config = home / ".claude"
+            real_managed_directory = home / "managed-resources"
+            config.mkdir(parents=True)
+            real_managed_directory.mkdir()
+            (config / "didimlog").symlink_to(
+                real_managed_directory,
+                target_is_directory=True,
+            )
+
+            with self.assertRaises(ConfigPathError) as raised:
+                config_target(
+                    config,
+                    "didimlog/KNOWLEDGE_USAGE.md",
+                    home=home,
+                )
+
+            self.assertEqual(raised.exception.reason, "parent-not-regular")
+
+    def test_refused_paths_never_expose_the_link_destination_in_the_message(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory) / "home"
+            config = home / ".claude"
+            config.mkdir(parents=True)
+            other_profile = home / ".claude-other"
+            other_profile.mkdir()
+            shared = other_profile / "CLAUDE.md"
+            shared.write_text("# shared rules\n", encoding="utf-8")
+            (config / "CLAUDE.md").symlink_to(shared)
+
+            with self.assertRaises(ConfigPathError) as raised:
+                config_target(config, "CLAUDE.md", home=home)
+
+            self.assertNotIn(str(home), str(raised.exception))
 
 
 if __name__ == "__main__":

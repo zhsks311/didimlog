@@ -9,7 +9,7 @@ from unittest import mock
 
 from didimlog import version as didimlog_version
 
-from didimlog.claude.probe import _launcher_from_settings
+from didimlog.claude.probe import Problem, _launcher_from_settings
 from didimlog.claude.setup import apply_setup, plan_setup
 from didimlog.claude.status import _safe_label, doctor_text, status_text
 
@@ -187,9 +187,36 @@ class StatusDoctorTests(unittest.TestCase):
             "개인 지식: 최신\n"
             "현재 프로젝트: demo-project\n"
             "프로젝트 근거: 최신\n"
+            "Claude 프로필: .claude\n"
             "Claude 연결: 정상\n",
         )
         self.assertNotIn(str(self.home), text)
+
+    def test_status_names_the_selected_profile_without_the_home_path(self):
+        other = self.home / ".claude-work"
+        other.mkdir()
+
+        text = status_text(home=self.home, cwd=self.project, config=other)
+
+        self.assertIn("Claude 프로필: .claude-work\n", text)
+        self.assertNotIn(str(self.home), text)
+
+    def test_status_reports_an_unreadable_profile_without_raising(self):
+        missing = self.home / ".claude-missing"
+
+        text = status_text(home=self.home, cwd=self.project, config=missing)
+
+        self.assertIn("Claude 프로필: 확인 실패\n", text)
+        self.assertIn("Claude 연결: 문제 있음\n", text)
+        self.assertNotIn(str(self.home), text)
+
+    def test_status_sanitizes_control_characters_in_a_profile_name(self):
+        hostile = self.home / ".claude‮evil"
+        hostile.mkdir()
+
+        text = status_text(home=self.home, cwd=self.project, config=hostile)
+
+        self.assertIn("Claude 프로필: .claude?evil\n", text)
 
     def test_status_distinguishes_personal_stale_and_unconfigured_project(self):
         personal_index = self.home / "knowledge" / "index"
@@ -231,6 +258,163 @@ class StatusDoctorTests(unittest.TestCase):
         self.assertEqual(text.count("수정: "), problem_count)
         self.assertNotIn(str(self.home), text)
 
+
+    def test_doctor_leads_with_the_blocking_cause_and_groups_its_symptoms(self):
+        """A cause that blocks setup must not repeat its fix on every symptom."""
+        other_profile = self.home / ".claude-main"
+        other_profile.mkdir()
+        owner = other_profile / "CLAUDE.md"
+        owner.write_bytes((self.config / "CLAUDE.md").read_bytes())
+        linked = self.home / ".claude-work"
+        linked.mkdir()
+        (linked / "CLAUDE.md").symlink_to(owner)
+
+        code, text = doctor_text(home=self.home, cwd=self.project, config=linked)
+
+        self.assertEqual(code, 3)
+        self.assertIn("먼저 할 일", text)
+        self.assertIn("위를 고치면 함께 해결되는 증상", text)
+        cause_index = text.index("CLAUDE_IMPORT_LINKED")
+        symptom_index = text.index("CLAUDE_LAUNCHER_INVALID")
+        self.assertLess(cause_index, symptom_index)
+        self.assertEqual(text.count("수정: "), 1)
+        self.assertIn("수정: CLAUDE_CONFIG_DIR=~/.claude-main didim setup", text)
+        self.assertNotIn(str(self.home), text)
+
+    def test_doctor_keeps_an_independent_index_problem_outside_profile_symptoms(self):
+        other_profile = self.home / ".claude-main"
+        other_profile.mkdir()
+        owner = other_profile / "CLAUDE.md"
+        owner.write_bytes((self.config / "CLAUDE.md").read_bytes())
+        linked = self.home / ".claude-work"
+        linked.mkdir()
+        (linked / "CLAUDE.md").symlink_to(owner)
+        (self.home / "knowledge" / "index" / "extra.txt").write_bytes(b"extra\n")
+
+        code, text = doctor_text(home=self.home, cwd=self.project, config=linked)
+
+        self.assertEqual(code, 3)
+        symptom_heading = text.index("위를 고치면 함께 해결되는 증상")
+        independent_heading = text.index("별도로 확인할 문제")
+        personal_problem = text.index("무엇: PERSONAL_INDEX_EXTRA")
+        self.assertLess(symptom_heading, independent_heading)
+        self.assertLess(independent_heading, personal_problem)
+        self.assertIn("- CLAUDE_RESOURCE_INVALID:", text)
+        self.assertIn("- CLAUDE_LAUNCHER_INVALID:", text)
+        self.assertNotIn("- PERSONAL_INDEX_EXTRA:", text)
+        self.assertIn("수정: didim index", text[personal_problem:])
+        self.assertEqual(text.count("수정: "), 2)
+
+    def test_doctor_does_not_guess_symptom_cause_between_multiple_profiles(self):
+        problems = (
+            Problem(
+                token="CLAUDE_IMPORT_LINKED",
+                impact="첫 번째 연결을 수정해야 합니다.",
+                action="CLAUDE_CONFIG_DIR=~/.claude-main didim setup",
+                blocks_repair=True,
+            ),
+            Problem(
+                token="CLAUDE_SETTINGS_LINKED",
+                impact="두 번째 연결을 수정해야 합니다.",
+                action="CLAUDE_CONFIG_DIR=~/.claude-work didim setup",
+                blocks_repair=True,
+            ),
+            Problem(
+                token="CLAUDE_LAUNCHER_INVALID",
+                impact="세션 시작 확인을 실행할 수 없습니다.",
+                action="didim setup",
+            ),
+        )
+        with mock.patch(
+            "didimlog.claude.status._diagnostic_problems",
+            return_value=problems,
+        ):
+            code, text = doctor_text(
+                home=self.home,
+                cwd=self.project,
+                config=self.config,
+            )
+
+        self.assertEqual(code, 3)
+        self.assertNotIn("위를 고치면 함께 해결되는 증상", text)
+        independent_heading = text.index("별도로 확인할 문제")
+        self.assertLess(independent_heading, text.index("무엇: CLAUDE_LAUNCHER_INVALID"))
+        self.assertEqual(text.count("수정: "), 3)
+
+    def test_doctor_lists_every_blocking_cause_before_independent_problems(self):
+        problems = (
+            Problem(
+                token="CLAUDE_IMPORT_LINKED",
+                impact="첫 번째 연결을 수정해야 합니다.",
+                action="CLAUDE_CONFIG_DIR=~/.claude-main didim setup",
+                blocks_repair=True,
+            ),
+            Problem(
+                token="CLAUDE_SETTINGS_LINKED",
+                impact="두 번째 연결을 수정해야 합니다.",
+                action="CLAUDE_CONFIG_DIR=~/.claude-work didim setup",
+                blocks_repair=True,
+            ),
+            Problem(
+                token="PERSONAL_INDEX_EXTRA",
+                impact="개인 지식 목록을 갱신해야 합니다.",
+                action="didim index",
+            ),
+        )
+        with mock.patch(
+            "didimlog.claude.status._diagnostic_problems",
+            return_value=problems,
+        ):
+            code, text = doctor_text(
+                home=self.home,
+                cwd=self.project,
+                config=self.config,
+            )
+
+        self.assertEqual(code, 3)
+        independent_heading = text.index("별도로 확인할 문제")
+        self.assertLess(text.index("무엇: CLAUDE_IMPORT_LINKED"), independent_heading)
+        self.assertLess(text.index("무엇: CLAUDE_SETTINGS_LINKED"), independent_heading)
+        self.assertLess(independent_heading, text.index("무엇: PERSONAL_INDEX_EXTRA"))
+        self.assertEqual(text.count("수정: "), 3)
+
+    def test_doctor_without_a_blocking_cause_keeps_one_fix_per_problem(self):
+        (self.config / "CLAUDE.md").write_bytes(b"# disconnected\n")
+        (self.home / "knowledge" / "index" / "extra.txt").write_bytes(b"extra\n")
+
+        code, text = doctor_text(home=self.home, cwd=self.project, config=self.config)
+
+        self.assertEqual(code, 3)
+        self.assertNotIn("위를 고치면 함께 해결되는 증상", text)
+        self.assertEqual(text.count("무엇: "), text.count("수정: "))
+
+    def test_doctor_reports_an_unconfigured_git_project_without_failing(self):
+        """A Git project with no evidence store is worth saying, but is not a failure."""
+        bare = self.root / "bare-project"
+        bare.mkdir()
+        subprocess.run(
+            ["git", "init", "-q"],
+            cwd=bare,
+            check=True,
+            capture_output=True,
+        )
+
+        code, text = doctor_text(home=self.home, cwd=bare, config=self.config)
+
+        self.assertEqual(code, 0)
+        self.assertTrue(text.startswith("DOCTOR_OK\n"))
+        self.assertIn("PROJECT_NOT_CONFIGURED", text)
+        self.assertIn("didim setup", text)
+        self.assertNotIn(str(self.root), text)
+
+    def test_doctor_outside_a_git_project_stays_quiet(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+
+        code, text = doctor_text(home=self.home, cwd=outside, config=self.config)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(text, "DOCTOR_OK\n문제 없음\n")
 
     def test_status_and_doctor_are_read_only(self):
         before = self._snapshot()

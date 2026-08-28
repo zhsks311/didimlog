@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path
+import re
 import stat
 
 from didimlog.conditional_file import read_optional_regular_file
@@ -24,20 +25,103 @@ from .connect import (
     _packaged_resources,
     _resource_directory_exists,
 )
-from .paths import config_dir, config_target
+from .paths import ConfigPathError, config_dir, config_target
 
 _PROJECT_ROOT_UNSET = object()
+_SAFE_PROFILE_NAME = re.compile(r"[A-Za-z0-9._-]+\Z")
+_PROFILE_MISMATCH_SYMPTOMS = frozenset(
+    {
+        "CLAUDE_RESOURCE_INVALID",
+        "CLAUDE_LAUNCHER_INVALID",
+    }
+)
 
 
 @dataclass(frozen=True)
 class Problem:
+    """One actionable fault, optionally caused by another reported fault."""
+
     token: str
     impact: str
     action: str
+    blocks_repair: bool = False
+    caused_by: str | None = None
 
 
-def _problem(token: str, impact: str, action: str) -> Problem:
-    return Problem(token=token, impact=impact, action=action)
+def _problem(
+    token: str,
+    impact: str,
+    action: str,
+    *,
+    blocks_repair: bool = False,
+    caused_by: str | None = None,
+) -> Problem:
+    return Problem(
+        token=token,
+        impact=impact,
+        action=action,
+        blocks_repair=blocks_repair,
+        caused_by=caused_by,
+    )
+
+
+def _profile_setup_action(destination: Path | None, home: Path) -> str:
+    """Name the profile that owns a linked file, without exposing the home path."""
+
+    if destination is None:
+        return "didim setup"
+    try:
+        # ``destination`` is already resolved, so the home must be too;
+        # otherwise a symlinked home (``/var`` vs ``/private/var``) never matches.
+        resolved_home = home.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return "didim setup"
+    try:
+        profile = destination.parent.relative_to(resolved_home)
+    except ValueError:
+        return "didim setup"
+    if len(profile.parts) != 1 or _SAFE_PROFILE_NAME.fullmatch(profile.parts[0]) is None:
+        return "didim setup"
+    return "CLAUDE_CONFIG_DIR=~/{} didim setup".format(profile.parts[0])
+
+
+def _refused_target_problem(
+    error: ConfigPathError,
+    *,
+    home: Path,
+    linked_token: str,
+    linked_impact: str,
+    unreadable_token: str,
+    unreadable_impact: str,
+) -> Problem:
+    """Turn a refused path into one problem the user can act on.
+
+    A refused path is always repair-blocking: ``setup`` writes through the same
+    check, so it cannot fix this or anything downstream until the path changes.
+    """
+
+    if error.reason in ("target-symlink", "parent-not-regular") and (
+        error.destination is not None
+    ):
+        return _problem(
+            linked_token,
+            linked_impact,
+            _profile_setup_action(error.destination, home),
+            blocks_repair=True,
+        )
+    if error.reason == "target-symlink":
+        return _problem(
+            linked_token,
+            linked_impact,
+            "didim setup",
+            blocks_repair=True,
+        )
+    return _problem(
+        unreadable_token,
+        unreadable_impact,
+        "didim setup",
+        blocks_repair=True,
+    )
 
 
 def _valid_regular(path: Path, *, nonempty: bool) -> bool:
@@ -107,39 +191,80 @@ def inspect(
     selected_config = config_dir(config, home=selected_home)
     problems: list[Problem] = []
 
-    claude_path = config_target(
-        selected_config,
-        "CLAUDE.md",
-        home=selected_home,
-    )
-    claude_raw = read_optional_regular_file(
-        claude_path,
-        _MANAGED_FILE_MAXIMUM_BYTES,
-    )
-    expected_block = config_module.render_managed_block(selected_config)
-    if claude_raw is None or claude_raw.count(expected_block) != 1:
+    try:
+        claude_path = config_target(
+            selected_config,
+            "CLAUDE.md",
+            home=selected_home,
+        )
+    except ConfigPathError as error:
         problems.append(
-            _problem(
-                "CLAUDE_IMPORT_MISSING",
-                "Claude가 필요한 지식의 위치와 조회 절차를 받지 못합니다.",
-                "didim setup",
+            _refused_target_problem(
+                error,
+                home=selected_home,
+                linked_token="CLAUDE_IMPORT_LINKED",
+                linked_impact=(
+                    "이 프로필의 CLAUDE.md가 다른 위치를 가리키는 링크라서 "
+                    "Didimlog가 안전하게 수정할 수 없습니다."
+                ),
+                unreadable_token="CLAUDE_IMPORT_UNREADABLE",
+                unreadable_impact=(
+                    "이 프로필의 CLAUDE.md가 일반 파일이 아니라서 "
+                    "Didimlog가 읽고 쓸 수 없습니다."
+                ),
             )
         )
+    else:
+        claude_raw = read_optional_regular_file(
+            claude_path,
+            _MANAGED_FILE_MAXIMUM_BYTES,
+        )
+        expected_block = config_module.render_managed_block(selected_config)
+        if claude_raw is None or claude_raw.count(expected_block) != 1:
+            problems.append(
+                _problem(
+                    "CLAUDE_IMPORT_MISSING",
+                    "Claude가 필요한 지식의 위치와 조회 절차를 받지 못합니다.",
+                    "didim setup",
+                )
+            )
 
+    resource_refusal: ConfigPathError | None = None
     resource_invalid = not _resource_directory_exists(selected_config)
     if not resource_invalid:
         for name, expected in _packaged_resources():
-            path = config_target(
-                selected_config,
-                "didimlog/" + name,
-                home=selected_home,
-            )
+            try:
+                path = config_target(
+                    selected_config,
+                    "didimlog/" + name,
+                    home=selected_home,
+                )
+            except ConfigPathError as error:
+                resource_refusal = error
+                resource_invalid = True
+                break
             if (
                 read_optional_regular_file(path, _MANAGED_FILE_MAXIMUM_BYTES)
                 != expected
             ):
                 resource_invalid = True
-    if resource_invalid:
+    if resource_refusal is not None:
+        problems.append(
+            _refused_target_problem(
+                resource_refusal,
+                home=selected_home,
+                linked_token="CLAUDE_RESOURCE_LINKED",
+                linked_impact=(
+                    "Claude 지식 사용 지침이 다른 위치를 가리키는 링크라서 "
+                    "Didimlog가 안전하게 수정할 수 없습니다."
+                ),
+                unreadable_token="CLAUDE_RESOURCE_INVALID",
+                unreadable_impact=(
+                    "Claude 지식 사용 지침이 설치본과 일치하지 않습니다."
+                ),
+            )
+        )
+    elif resource_invalid:
         problems.append(
             _problem(
                 "CLAUDE_RESOURCE_INVALID",
@@ -148,18 +273,41 @@ def inspect(
             )
         )
 
-    settings_path = config_target(
-        selected_config,
-        "settings.json",
-        home=selected_home,
-    )
-    launcher = _launcher_from_settings(
-        read_optional_regular_file(
-            settings_path,
-            _MANAGED_FILE_MAXIMUM_BYTES,
+    try:
+        settings_path = config_target(
+            selected_config,
+            "settings.json",
+            home=selected_home,
+        )
+    except ConfigPathError as error:
+        problems.append(
+            _refused_target_problem(
+                error,
+                home=selected_home,
+                linked_token="CLAUDE_SETTINGS_LINKED",
+                linked_impact=(
+                    "이 프로필의 settings.json이 다른 위치를 가리키는 링크라서 "
+                    "SessionStart 확인을 연결할 수 없습니다."
+                ),
+                unreadable_token="CLAUDE_SETTINGS_UNREADABLE",
+                unreadable_impact=(
+                    "이 프로필의 settings.json이 일반 파일이 아니라서 "
+                    "SessionStart 확인을 연결할 수 없습니다."
+                ),
+            )
+        )
+        settings_path = None
+    launcher = (
+        None
+        if settings_path is None
+        else _launcher_from_settings(
+            read_optional_regular_file(
+                settings_path,
+                _MANAGED_FILE_MAXIMUM_BYTES,
+            )
         )
     )
-    if (
+    if settings_path is not None and (
         launcher is None
         or not launcher.is_absolute()
         or not _valid_regular(launcher, nonempty=True)
@@ -202,5 +350,20 @@ def inspect(
         )
         if project_problem is not None:
             problems.append(project_problem)
+
+    blocking_profile_problems = [
+        problem
+        for problem in problems
+        if problem.blocks_repair
+        and problem.action.startswith("CLAUDE_CONFIG_DIR=")
+    ]
+    if len(blocking_profile_problems) == 1:
+        cause = blocking_profile_problems[0]
+        problems = [
+            replace(problem, caused_by=cause.token)
+            if problem.token in _PROFILE_MISMATCH_SYMPTOMS
+            else problem
+            for problem in problems
+        ]
 
     return tuple(problems)

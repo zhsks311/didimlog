@@ -240,7 +240,15 @@ didim status
 didim doctor
 ```
 
-`status` summarizes the version, personal knowledge, current project, project evidence, and Claude integration. `doctor` shows the impact of each detected problem together with the next command to run.
+`status` summarizes the version, personal knowledge, current project, project evidence, the Claude profile in use, and Claude integration. `doctor` groups what it finds: the cause to fix first, the symptoms that clear once you fix it, and the problems to handle separately. Each independent problem lists its impact and the next command to run.
+
+Running `doctor` in a Git project you have not set up yet is not a failure. It reports `PROJECT_NOT_CONFIGURED` and shows the `didim setup` command. If you do not need to store evidence for that project, no action is required.
+
+With multiple Claude profiles, Didimlog connects to the one `CLAUDE_CONFIG_DIR` points at. When a file links to a different profile and Didimlog cannot repair it, `doctor` prints the command that connects to the profile actually holding that file.
+
+```sh
+CLAUDE_CONFIG_DIR=~/.claude didim setup
+```
 
 If you also need error explanations in automation logs, place the global option before the command.
 

@@ -494,6 +494,19 @@ class CliCommandSurfaceTests(unittest.TestCase):
         self.assertEqual(status.call_args.kwargs["config"], Path("/safe"))
         self.assertEqual(doctor.call_args.kwargs["config"], Path("/safe"))
 
+    def test_status_and_doctor_pass_the_working_directory_explicitly(self):
+        """The project surface must not depend on an implicit process directory."""
+        with mock.patch(
+            "didimlog.cli.status_text", return_value="status\n"
+        ) as status, mock.patch(
+            "didimlog.cli.doctor_text", return_value=(0, "doctor\n")
+        ) as doctor:
+            self.assertEqual(invoke(["status"])[0], 0)
+            self.assertEqual(invoke(["doctor"])[0], 0)
+
+        self.assertEqual(status.call_args.kwargs["cwd"], Path.cwd())
+        self.assertEqual(doctor.call_args.kwargs["cwd"], Path.cwd())
+
     def test_index_prints_both_surfaces_and_check_fails_on_any_noncurrent_configured_surface(self):
         stale = SimpleNamespace(
             personal="개인 지식: PERSONAL_INDEX_STALE",
