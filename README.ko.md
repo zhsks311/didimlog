@@ -248,6 +248,32 @@ didim doctor
 didim --explain-errors index --check
 ```
 
+### 업데이트 확인하기
+
+Didimlog는 성공한 대화형 명령 뒤 PyPI에서 더 최신 stable 버전을 확인합니다.
+성공한 확인 뒤에는 24시간 동안 다시 요청하지 않으며, 확인에 실패하면 다음
+대상 명령에서 재시도할 수 있습니다. 새 버전이 있으면 기존 stdout과 종료
+코드를 바꾸지 않고 stderr 끝에 한 줄을 추가합니다.
+
+```text
+Didimlog X.Y.Z 업데이트 가능 — uv tool upgrade didimlog
+```
+
+도움말, `--version`, `didim hook session-start`, `didim setup --dry-run`, 실패한
+명령, 비대화형 출력에서는 자동 확인하지 않습니다. 네트워크·응답·cache
+오류가 나도 원래 명령은 그대로 끝납니다.
+
+요청은 `https://pypi.org/pypi/didimlog/json`으로 제한하며 지식 본문, 로컬
+경로, 프로젝트명, credential, 사용자 식별자를 포함하지 않습니다. 마지막
+성공 확인 시각과 확인한 stable 버전만 `XDG_CACHE_HOME`이 절대 경로이면
+`$XDG_CACHE_HOME/didimlog/update.json`, 아니면
+`~/.cache/didimlog/update.json`에 저장합니다. 요청과 cache 쓰기를 모두
+끄려면 다음 환경 변수를 설정합니다.
+
+```sh
+export DIDIM_NO_UPDATE_CHECK=1
+```
+
 ## 명령 요약
 
 다음 표는 사용자가 직접 실행하는 명령의 요약입니다. 모든 옵션은 설치된 버전의 `didim <command> --help`에서 확인할 수 있습니다.

@@ -46,6 +46,8 @@ from didimlog.personal.lesson_writing import (
 )
 from didimlog.project.capture import CaptureRequest, capture
 from didimlog.project.git_exclude import discover_project_for_setup
+from didimlog.update import automatic_update_notice
+
 
 
 _EXPLAIN_ERRORS = "--explain-errors"
@@ -490,8 +492,19 @@ def _as_didim_error(error: Exception) -> DidimError:
     )
 
 
+def _automatic_update_eligible(parsed, *, real_invocation: bool) -> bool:
+    if not real_invocation or not _stderr_is_tty():
+        return False
+    if parsed.command == "hook":
+        return False
+    if parsed.command == "setup" and parsed.dry_run:
+        return False
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
-    arguments = list(sys.argv[1:] if argv is None else argv)
+    real_invocation = argv is None
+    arguments = list(sys.argv[1:] if real_invocation else argv)
     parser = build_parser()
     explain = _explain_requested(arguments)
     try:
@@ -506,13 +519,22 @@ def main(argv: list[str] | None = None) -> int:
         parsed._help_parser.print_help()
         return 0
     try:
-        return handler(parsed)
+        result = handler(parsed)
     except (DidimError, LessonError, OSError, UnicodeError, ValueError) as error:
         return emit_error(
             _as_didim_error(error),
             explain=explain,
             tty=_stderr_is_tty(),
         )
+    if result == 0 and _automatic_update_eligible(
+        parsed,
+        real_invocation=real_invocation,
+    ):
+        try:
+            automatic_update_notice(didimlog_version(), stderr=sys.stderr)
+        except Exception:
+            pass
+    return result
 
 
 if __name__ == "__main__":

@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### 추가
+
+- 성공한 대화형 `didim` 명령 뒤 최대 하루에 한 번 PyPI의 새 stable 버전을 확인해 stderr로 알립니다. 원래 명령의 stdout과 종료 코드는 유지하며, `DIDIM_NO_UPDATE_CHECK=1`로 요청과 cache 저장을 모두 끌 수 있습니다.
+
 ## [0.0.5] - 2026-08-19
 
 ### 변경
