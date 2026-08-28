@@ -420,31 +420,44 @@ def _three_way_merge_tree(
     ours_sha: str,
     theirs_sha: str,
 ) -> str:
+    object_directory = Path(
+        _git(repo, "rev-parse", "--git-path", "objects")
+    )
+    if not object_directory.is_absolute():
+        object_directory = repo / object_directory
     with tempfile.TemporaryDirectory() as temporary_directory:
-        temporary = Path(temporary_directory)
-        work_tree = temporary / "work-tree"
-        work_tree.mkdir()
+        temporary_objects = Path(temporary_directory) / "objects"
+        temporary_objects.mkdir()
         environment = {
-            "GIT_INDEX_FILE": str(temporary / "index"),
-            "GIT_WORK_TREE": str(work_tree),
+            "GIT_OBJECT_DIRECTORY": str(temporary_objects),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(
+                object_directory.resolve()
+            ),
+            "GIT_AUTHOR_NAME": "Didimlog",
+            "GIT_AUTHOR_EMAIL": "didimlog@example.invalid",
+            "GIT_AUTHOR_DATE": "1970-01-01T00:00:00 +0000",
+            "GIT_COMMITTER_NAME": "Didimlog",
+            "GIT_COMMITTER_EMAIL": "didimlog@example.invalid",
+            "GIT_COMMITTER_DATE": "1970-01-01T00:00:00 +0000",
         }
-        _git(
+        synthetic_theirs = _git(
             repo,
-            "read-tree",
-            "--reset",
-            ours_sha,
-            environment=environment,
-        )
-        _git(
-            repo,
-            "merge-recursive",
+            "commit-tree",
+            f"{theirs_sha}^{{tree}}",
+            "-p",
             base_sha,
-            "--",
-            ours_sha,
-            theirs_sha,
+            "-m",
+            "Didimlog temporary cancellation merge",
             environment=environment,
         )
-        return _git(repo, "write-tree", environment=environment)
+        return _git(
+            repo,
+            "merge-tree",
+            "--write-tree",
+            ours_sha,
+            synthetic_theirs,
+            environment=environment,
+        )
 
 
 def _validate_cancel_tree(
