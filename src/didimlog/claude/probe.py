@@ -10,6 +10,7 @@ import stat
 
 from didimlog.conditional_file import read_optional_regular_file
 from didimlog.indexing import (
+    PERSONAL_INDEX_BUSY,
     PERSONAL_INDEX_CURRENT,
     PROJECT_INDEX_CURRENT,
     _discover_git_root,
@@ -171,6 +172,14 @@ def _index_problem(token: str, *, personal: bool) -> Problem | None:
     current = PERSONAL_INDEX_CURRENT if personal else PROJECT_INDEX_CURRENT
     if token == current:
         return None
+    if token == PERSONAL_INDEX_BUSY:
+        # 목록도 원본도 손댈 것이 없다. didim index를 안내하면
+        # 고칠 것이 없는 사용자에게 헛일을 시키게 된다.
+        return _problem(
+            token,
+            "다른 Didimlog 실행이 개인 지식을 사용 중이라 지금은 상태를 확인하지 못했습니다.",
+            "잠시 뒤 didim index --check",
+        )
     if personal:
         impact = "개인 지식 목록이 전체 원본과 일치하지 않아 조회 결과를 신뢰할 수 없습니다."
     else:

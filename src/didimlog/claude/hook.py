@@ -24,10 +24,17 @@ def _repair_command(problems) -> str:
     ]
     if not setup_actions:
         return "didim index"
+    profile_actions = []
     for action in setup_actions:
-        if action != "didim setup":
-            return action
-    return "didim setup"
+        if action != "didim setup" and action not in profile_actions:
+            profile_actions.append(action)
+    if not profile_actions:
+        return "didim setup"
+    # 프로필별 명령이 여럿이면 하나만 보여 주는 것은 거짓이다.
+    # 그 하나를 실행해도 나머지는 그대로 남는다.
+    if len(profile_actions) > 1:
+        return "didim doctor"
+    return profile_actions[0]
 
 
 def _message(problems) -> str:

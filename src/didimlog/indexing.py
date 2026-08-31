@@ -21,6 +21,9 @@ _GIT_TIMEOUT_SECONDS = 5
 PERSONAL_INDEX_CURRENT = "PERSONAL_INDEX_CURRENT"
 PROJECT_INDEX_CURRENT = "PROJECT_INDEX_CURRENT"
 PROJECT_NOT_CONFIGURED = "PROJECT_NOT_CONFIGURED"
+# 원본은 멀쩡한데 잠금만 못 얻은 경우다. 원본 오류와 섞으면
+# 고칠 것이 없는 사용자에게 원본을 고치라고 안내하게 된다.
+PERSONAL_INDEX_BUSY = "PERSONAL_INDEX_BUSY"
 _PROJECT_NOT_CONFIGURED_TEXT = (
     "프로젝트 근거: 설정되지 않음 — didim setup을 실행하세요."
 )
@@ -147,7 +150,9 @@ def _personal_check(root: Path) -> str:
         with path_lock(root, shared=True):
             return _personal_check_locked(root)
     except OSError:
-        return "PERSONAL_INDEX_INVALID_SOURCE"
+        # 다른 실행이 잠금을 쥐고 있을 뿐 원본은 손대지 않았다.
+        # 잠시 뒤 다시 확인하면 되고, 고칠 파일은 없다.
+        return PERSONAL_INDEX_BUSY
 
 
 def _project_check(root: Path) -> str:

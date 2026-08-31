@@ -250,6 +250,10 @@ With multiple Claude profiles, Didimlog connects to the one `CLAUDE_CONFIG_DIR` 
 CLAUDE_CONFIG_DIR=~/.claude didim setup
 ```
 
+If several files link to different profiles, no single command fixes them all. `doctor` says how many causes it found and lists a command for each.
+
+`PERSONAL_INDEX_BUSY` means another Didimlog run held the personal knowledge lock, so the state could not be read. Nothing is broken and there is no file to repair; run `didim index --check` again shortly.
+
 If you also need error explanations in automation logs, place the global option before the command.
 
 ```sh

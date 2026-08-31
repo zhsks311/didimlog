@@ -280,6 +280,63 @@ SECRET-SENTINEL-BODY
         self.assertIn("수정: CLAUDE_CONFIG_DIR=~/.claude-main didim setup", message)
         self.assertNotIn(str(self.home), message)
 
+    def test_hook_defers_to_doctor_when_profiles_disagree(self):
+        """One profile command would leave the other blocked, so name neither."""
+
+        problems = (
+            Problem(
+                token="CLAUDE_IMPORT_LINKED",
+                impact="첫 번째 연결을 수정해야 합니다.",
+                action="CLAUDE_CONFIG_DIR=~/.claude-main didim setup",
+                blocks_repair=True,
+            ),
+            Problem(
+                token="CLAUDE_SETTINGS_LINKED",
+                impact="두 번째 연결을 수정해야 합니다.",
+                action="CLAUDE_CONFIG_DIR=~/.claude-work didim setup",
+                blocks_repair=True,
+            ),
+        )
+        source = io.StringIO("{}")
+        output = io.StringIO()
+        with mock.patch(
+            "didimlog.claude.hook.inspect",
+            return_value=problems,
+        ):
+            self.assertEqual(session_start(source, output), 0)
+
+        message = json.loads(output.getvalue())["systemMessage"]
+        self.assertIn("수정: didim doctor", message)
+        self.assertNotIn("CLAUDE_CONFIG_DIR=", message.rsplit("\n", 1)[-1])
+
+    def test_hook_keeps_one_command_when_a_profile_repeats(self):
+        """The same profile in several problems is still a single runnable fix."""
+
+        problems = (
+            Problem(
+                token="CLAUDE_IMPORT_LINKED",
+                impact="첫 번째 연결을 수정해야 합니다.",
+                action="CLAUDE_CONFIG_DIR=~/.claude-main didim setup",
+                blocks_repair=True,
+            ),
+            Problem(
+                token="CLAUDE_SETTINGS_LINKED",
+                impact="같은 프로필의 다른 파일입니다.",
+                action="CLAUDE_CONFIG_DIR=~/.claude-main didim setup",
+                blocks_repair=True,
+            ),
+        )
+        source = io.StringIO("{}")
+        output = io.StringIO()
+        with mock.patch(
+            "didimlog.claude.hook.inspect",
+            return_value=problems,
+        ):
+            self.assertEqual(session_start(source, output), 0)
+
+        message = json.loads(output.getvalue())["systemMessage"]
+        self.assertIn("수정: CLAUDE_CONFIG_DIR=~/.claude-main didim setup", message)
+
     def test_unexpected_probe_exception_is_fail_open(self):
         source = io.StringIO("not-json-but-consumed")
         output = io.StringIO()

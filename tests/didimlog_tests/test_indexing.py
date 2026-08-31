@@ -329,6 +329,36 @@ class IndexServiceTests(unittest.TestCase):
         self.assertFalse((self.home / "knowledge" / "index").exists())
         self.assertFalse((project / "knowledge" / "index" / "INDEX.md").exists())
 
+    def test_check_separates_a_busy_lock_from_a_broken_source(self):
+        """A lock we could not take leaves the sources intact, so say so."""
+
+        project = self._git_project()
+        self._write_lesson()
+        with mock.patch(
+            "didimlog.indexing.path_lock",
+            side_effect=OSError("lock held by another run"),
+        ):
+            result = run_index(check=True, home=self.home, cwd=project)
+
+        self.assertEqual(result.personal_token, "PERSONAL_INDEX_BUSY")
+        self.assertNotEqual(
+            result.personal_token,
+            "PERSONAL_INDEX_INVALID_SOURCE",
+        )
+
+    def test_check_still_reports_invalid_source_for_unreadable_content(self):
+        """Only the lock path changed; a real source fault keeps its token."""
+
+        project = self._git_project()
+        self._write_lesson("not valid lesson metadata\n")
+
+        result = run_index(check=True, home=self.home, cwd=project)
+
+        self.assertEqual(
+            result.personal_token,
+            "PERSONAL_INDEX_INVALID_SOURCE",
+        )
+
     def test_check_reports_both_current_surfaces(self):
         project = self._git_project()
         self._write_lesson()

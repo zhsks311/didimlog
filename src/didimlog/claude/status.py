@@ -26,6 +26,7 @@ _PERSONAL_LABELS = {
     "PERSONAL_INDEX_STALE": "갱신 필요",
     "PERSONAL_INDEX_EXTRA": "알 수 없는 index 파일 있음",
     "PERSONAL_INDEX_INVALID_SOURCE": "원본 오류",
+    "PERSONAL_INDEX_BUSY": "사용 중이라 확인 못 함",
 }
 _PROJECT_LABELS = {
     "PROJECT_INDEX_CURRENT": "최신",
@@ -137,7 +138,8 @@ def status_text(*, home=None, cwd=None, config=None) -> str:
         or problem.token == "PERSONAL_RULES_INVALID"
         for problem in problems
     )
-    claude_label = "문제 있음" if wiring_problem else "정상"
+    # 어떤 프로필이 왜 막혔는지는 doctor만 안다. status는 그 경로를 알려 준다.
+    claude_label = "문제 있음 (didim doctor)" if wiring_problem else "정상"
     return "\n".join(
         (
             "Didimlog {}".format(didimlog_version()),
@@ -222,6 +224,11 @@ def doctor_text(*, home=None, cwd=None, config=None) -> tuple[int, str]:
     ]
 
     lines = ["DOCTOR_PROBLEMS", "먼저 할 일"]
+    if len(blocking) > 1:
+        # 원인이 여럿이면 어느 것도 나머지를 대신 고치지 못한다.
+        # 순서를 지어내는 대신 전부 필요하다는 사실을 밝힌다.
+        lines.append("아래 {}가지를 모두 고쳐야 합니다.".format(len(blocking)))
+        lines.append("")
     for problem in blocking:
         lines.extend(_problem_lines(problem))
         symptoms = symptoms_by_cause[problem.token]

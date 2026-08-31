@@ -207,7 +207,7 @@ class StatusDoctorTests(unittest.TestCase):
         text = status_text(home=self.home, cwd=self.project, config=missing)
 
         self.assertIn("Claude 프로필: 확인 실패\n", text)
-        self.assertIn("Claude 연결: 문제 있음\n", text)
+        self.assertIn("Claude 연결: 문제 있음 (didim doctor)\n", text)
         self.assertNotIn(str(self.home), text)
 
     def test_status_sanitizes_control_characters_in_a_profile_name(self):
@@ -236,6 +236,21 @@ class StatusDoctorTests(unittest.TestCase):
         text = self._status()
 
         self.assertIn("Claude 연결: 문제 있음", text)
+
+    def test_status_points_a_broken_connection_at_doctor(self):
+        """status cannot name the blocked profile, so it must hand off to doctor."""
+
+        (self.config / "CLAUDE.md").write_bytes(b"# disconnected\n")
+
+        text = self._status()
+
+        self.assertIn("Claude 연결: 문제 있음 (didim doctor)", text)
+
+    def test_status_leaves_a_healthy_connection_without_a_command(self):
+        text = self._status()
+
+        self.assertIn("Claude 연결: 정상\n", text)
+        self.assertNotIn("정상 (didim doctor)", text)
 
     def test_healthy_doctor_has_stable_token_and_zero_exit(self):
         code, text = self._doctor()
@@ -387,6 +402,24 @@ class StatusDoctorTests(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertNotIn("위를 고치면 함께 해결되는 증상", text)
         self.assertEqual(text.count("무엇: "), text.count("수정: "))
+
+    def test_doctor_does_not_ask_to_rebuild_an_index_it_could_not_read(self):
+        """A busy lock leaves nothing to repair, so didim index is the wrong advice."""
+
+        with mock.patch(
+            "didimlog.indexing.path_lock",
+            side_effect=OSError("lock held by another run"),
+        ):
+            code, text = doctor_text(
+                home=self.home,
+                cwd=self.project,
+                config=self.config,
+            )
+
+        self.assertEqual(code, 3)
+        self.assertIn("무엇: PERSONAL_INDEX_BUSY", text)
+        self.assertIn("수정: 잠시 뒤 didim index --check", text)
+        self.assertNotIn("PERSONAL_INDEX_INVALID_SOURCE", text)
 
     def test_doctor_reports_an_unconfigured_git_project_without_failing(self):
         """A Git project with no evidence store is worth saying, but is not a failure."""
