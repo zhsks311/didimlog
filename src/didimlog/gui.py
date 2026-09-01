@@ -418,6 +418,8 @@ def _handler(application: GuiApplication):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            if self.close_connection:
+                self.send_header("Connection", "close")
             self.send_header("Cache-Control", "no-store")
             if allow is not None:
                 self.send_header("Allow", allow)
@@ -561,6 +563,7 @@ def _handler(application: GuiApplication):
             self._dispatch(head_only=True)
 
         def do_POST(self) -> None:
+            self.close_connection = True
             if self._allowed_origin() is None:
                 self._error(
                     GuiRequestError(

@@ -81,7 +81,7 @@ class GuiBehaviorTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=5)
 
-    def request(self, method, path, *, headers=None, authorized=True):
+    def request(self, method, path, *, body=None, headers=None, authorized=True):
         selected_headers = dict(headers or {})
         if authorized and "Authorization" not in selected_headers:
             selected_headers["Authorization"] = "Bearer " + self.server._capability
@@ -91,7 +91,7 @@ class GuiBehaviorTests(unittest.TestCase):
             timeout=5,
         )
         try:
-            connection.request(method, path, headers=selected_headers)
+            connection.request(method, path, body=body, headers=selected_headers)
             response = connection.getresponse()
             body = response.read()
             content_type = response.getheader("Content-Type", "")
@@ -233,9 +233,14 @@ class GuiBehaviorTests(unittest.TestCase):
                     "GUI_CAPABILITY_REQUIRED",
                 )
 
-        status, headers, payload = self.request("DELETE", "/api/v1/library")
+        status, headers, payload = self.request(
+            "DELETE",
+            "/api/v1/library",
+            body=b"unread request body",
+        )
         self.assertEqual(status, 405)
         self.assertEqual(dict(headers)["Allow"], "GET, HEAD")
+        self.assertEqual(dict(headers)["Connection"], "close")
         self.assertEqual(payload["error"]["token"], "GUI_READ_ONLY")
 
     def test_each_server_uses_a_new_32_byte_urlsafe_capability(self):

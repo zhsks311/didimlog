@@ -3,14 +3,20 @@ const capabilityStorageKey = "didimlog.gui.capability";
 const bootstrapCapability = /^#cap=([A-Za-z0-9_-]+)$/.exec(window.location.hash);
 let capability = null;
 if (bootstrapCapability) {
+  capability = bootstrapCapability[1];
   try {
-    window.sessionStorage.setItem(capabilityStorageKey, bootstrapCapability[1]);
-    capability = bootstrapCapability[1];
+    window.sessionStorage.setItem(capabilityStorageKey, capability);
+  } catch {
+    // The in-memory capability still permits this tab to load.
   } finally {
     window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
   }
 } else {
-  capability = window.sessionStorage.getItem(capabilityStorageKey);
+  try {
+    capability = window.sessionStorage.getItem(capabilityStorageKey);
+  } catch {
+    capability = null;
+  }
 }
 
 
