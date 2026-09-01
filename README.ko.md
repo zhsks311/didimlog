@@ -2,7 +2,7 @@
 
 [English](README.md) | 한국어
 
-Didimlog는 Claude Code와 함께 일하며 확인한 **교훈, 관찰, 실험, 근거 자료**를 로컬 파일로 남기고, 다음 작업에서 필요한 내용만 다시 찾게 하는 CLI입니다.
+Didimlog는 Claude Code와 함께 일하며 확인한 **교훈, 관찰, 실험, 근거 자료**를 로컬 파일로 남기고, 기존 책과 교훈을 loopback 웹 화면에서 읽거나 다음 작업에 필요한 내용만 다시 찾게 하는 local-first CLI입니다.
 
 다음과 같은 경우에 적합합니다.
 
@@ -117,6 +117,45 @@ lessons/<프로젝트 이름>/didimlog-quick-start-<실행 시각>.md
 - 상태가 예상과 다르면 [문제 진단하기](#문제-진단하기)
 
 ## 자주 하는 작업
+
+### 로컬 GUI에서 책과 교훈 읽기
+
+어느 디렉터리에서든 읽기 전용 local web app을 실행할 수 있습니다.
+
+```sh
+didim gui --open
+```
+
+`didim gui`는 IPv4 loopback(`127.0.0.1`)에만 bind하고 충돌 없는 port를
+선택합니다. launch마다 새 private browser capability를 만듭니다. `--open`을
+쓰면 stdout에는 secret이 없는 base URL만 출력하고, capability는 URL fragment로
+browser에 넘긴 뒤 same-origin `sessionStorage`로 옮기고 주소창에서 즉시
+지웁니다. 특정 loopback port가 필요하면
+`didim gui --port 8765 --open`을 사용합니다.
+
+`--open`을 쓰지 않으면 수동으로 열 수 있도록 sensitive 표시가 붙은 private
+handoff URL을 terminal에 한 번 출력합니다. 그 줄을 공유·기록·붙여넣지 마세요.
+자동 browser 열기가 실패하면 Didimlog는 private URL을 다시 출력하지 않고
+`--open` 없이 재실행하라는 token-free 안내만 출력합니다.
+
+첫 화면은 책장입니다. 검증한 canonical book을 scope별로 묶어 보여 주고,
+Didimlog의 기존 안전한 Markdown renderer로 메모리에서 책을 엽니다. 교훈
+화면은 metadata exact filter와 읽기 전용 원문 상세를 제공합니다. health
+panel은 개인 index, 현재 프로젝트 index, Claude 연결을 따로 표시합니다.
+개인 index가 stale, missing, extra, invalid source 상태이면 current라고
+표시하지 않습니다.
+Milestone A는 book, lesson, index, setup, Claude 설정을 쓰지 않습니다. remote
+bind, hosted service, account, telemetry, cloud sync, book authoring, 새 lesson
+form도 없습니다. 개인 자료가 없는 static shell asset은 익명으로 제공하지만,
+모든 private API read와 write 시도는 loopback Host·Origin 검사 뒤 launch별
+Bearer capability를 요구합니다. browser에는 absolute filesystem path 대신
+logical path와 opaque resource ID만 전달하며 임의 file path를 제출할 수
+없습니다.
+
+GUI book render는 기존 source 4 MiB 제한을 유지하고 image당 16 MiB, raw image
+합계 64 MiB, UTF-8 body HTML 96 MiB, serialized book response 128 MiB로
+제한합니다. 너무 큰 render는 세부 내용이 가려진 `BOOK_RENDER_TOO_LARGE`로
+실패하며 이후 요청은 계속 처리합니다.
 
 ### 프로젝트 지식을 팀과 공유하기
 
@@ -259,9 +298,9 @@ Didimlog는 성공한 대화형 명령 뒤 PyPI에서 더 최신 stable 버전�
 Didimlog X.Y.Z 업데이트 가능 — uv tool upgrade didimlog
 ```
 
-도움말, `--version`, `didim hook session-start`, `didim setup --dry-run`, 실패한
-명령, 비대화형 출력에서는 자동 확인하지 않습니다. 네트워크·응답·cache
-오류가 나도 원래 명령은 그대로 끝납니다.
+도움말, `--version`, `didim hook session-start`, `didim gui`,
+`didim setup --dry-run`, 실패한 명령, 비대화형 출력에서는 자동 확인하지
+않습니다. 네트워크·응답·cache 오류가 나도 원래 명령은 그대로 끝납니다.
 
 요청은 `https://pypi.org/pypi/didimlog/json`으로 제한하며 지식 본문, 로컬
 경로, 프로젝트명, credential, 사용자 식별자를 포함하지 않습니다. 마지막
@@ -287,6 +326,7 @@ export DIDIM_NO_UPDATE_CHECK=1
 | `didim add observation` | 프로젝트 관찰 기록 저장 | JSON stdin, 공통 record 옵션 |
 | `didim add experiment` | 프로젝트 실험 기록 저장 | JSON stdin, 공통 record 옵션 |
 | `didim add evidence` | 프로젝트 근거 자료와 원본 결합 | JSON stdin, 공통 record 옵션 |
+| `didim gui` | loopback 전용 읽기 전용 책장·교훈 reader 실행 | `--open`, `--port` |
 | `didim index` | 개인·프로젝트 index 재생성 | `--check` |
 | `didim status` | 현재 상태 요약 | `--config-dir` |
 | `didim doctor` | 문제와 수정 방법 진단 | `--config-dir` |
@@ -393,6 +433,7 @@ Didimlog는 다음 안전 규칙을 적용합니다.
 - 설정 도중 실패하면 Didimlog가 이번 실행에서 만든 내용 중 그대로 남아 있는 것만 되돌립니다. 동시에 저장된 사용자 변경은 건드리지 않습니다.
 - 기록 파일 생성 뒤 index 갱신만 실패하면 원문은 보존하고 복구 명령을 안내합니다.
 - Git object 근거 자료는 명령 시작 시 확인한 저장소의 object database에서만 검증합니다. 현재 shell의 Git 환경 변수나 외부 alternates에서 다른 object를 찾지 않습니다.
+- local GUI는 `127.0.0.1`에만 bind하고 HTTP host/origin을 먼저 검사한 뒤 launch별 capability를 constant-time으로 비교하며, book·lesson 조회에 opaque ID만 받고 finite render/response 제한을 적용하고 인증된 write method를 제공하지 않습니다.
 
 ## Claude Code 연결
 
