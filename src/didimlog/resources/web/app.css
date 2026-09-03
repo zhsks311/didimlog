@@ -68,10 +68,17 @@ main { width: min(100%, 1440px); margin: 0 auto; padding: 4rem 3rem 6rem; }
 .loading { color: var(--ink-muted); padding: 5rem 0; text-align: center; }
 .eyebrow { margin: 0 0 .55rem; color: var(--accent); font-size: .63rem; font-weight: 700; }
 .page-heading { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2rem; align-items: end; padding-bottom: 1.5rem; border-bottom: 1px solid var(--border); }
-h1, h2, h3 { font-family: var(--display); font-weight: 500; }
-h1 { margin: 0; font-size: clamp(2.65rem, 6vw, 4.6rem); line-height: .98; letter-spacing: -.035em; }
-h2 { margin: 0; font-size: clamp(1.65rem, 3vw, 2.45rem); line-height: 1.1; }
-h3 { margin: 0; font-size: 1.25rem; }
+h1, h2, h3 {
+  overflow-wrap: break-word;
+  word-break: keep-all;
+  font-family: var(--display);
+  font-weight: 500;
+  letter-spacing: normal;
+  text-wrap: balance;
+}
+h1 { margin: 0; font-size: clamp(2.65rem, 6vw, 4.6rem); line-height: 1.08; }
+h2 { margin: 0; font-size: clamp(1.65rem, 3vw, 2.45rem); line-height: 1.18; }
+h3 { margin: 0; font-size: 1.25rem; line-height: 1.2; }
 .lede { max-width: 44rem; margin: .95rem 0 0; color: var(--ink-muted); font-size: 1rem; }
 .index-notice { max-width: 24rem; border-left: 3px solid var(--success); padding: .25rem 0 .25rem 1rem; }
 .index-notice.warning { border-left-color: var(--warning); }
@@ -110,16 +117,16 @@ h3 { margin: 0; font-size: 1.25rem; }
 .source-rail dt { margin-top: 1rem; color: var(--ink-faint); font: 700 .61rem/1.4 var(--mono); text-transform: uppercase; }
 .source-rail dd { margin: .3rem 0; overflow-wrap: anywhere; }
 .book-body { min-width: 0; padding: 2.3rem clamp(1.3rem, 4vw, 3.6rem) 4rem; background: var(--raised); border: 1px solid var(--border); }
-.book-body h1 { font-size: 2.4rem; line-height: 1.08; }
-.book-body h2 { margin-top: 3.4rem; padding-top: 1.2rem; border-top: 1px solid var(--border); font-size: 1.8rem; }
-.book-body h3 { margin-top: 2.2rem; }
-.book-body p, .book-body li { max-width: 44rem; }
-.book-body img { max-width: 100%; height: auto; }
-.book-body pre { max-width: 100%; overflow: auto; padding: 1rem; background: var(--muted); border: 1px solid var(--border); }
-.book-body code { font-family: var(--mono); font-size: .85em; }
-.book-body table { width: 100%; border-collapse: collapse; font-size: .86rem; }
-.book-body th, .book-body td { padding: .55rem; border: 1px solid var(--border); text-align: left; }
-.book-body blockquote { margin-left: 0; padding-left: 1.2rem; border-left: 3px solid var(--accent); color: var(--ink-muted); }
+.document-body h1 { font-size: 2.4rem; line-height: 1.16; }
+.document-body h2 { margin-top: 3.4rem; padding-top: 1.2rem; border-top: 1px solid var(--border); font-size: 1.8rem; }
+.document-body h3 { margin-top: 2.2rem; }
+.document-body p, .document-body li { max-width: 44rem; overflow-wrap: anywhere; }
+.document-body img { max-width: 100%; height: auto; }
+.document-body pre { max-width: 100%; overflow: auto; padding: 1rem; background: var(--muted); border: 1px solid var(--border); }
+.document-body code { font-family: var(--mono); font-size: .85em; }
+.document-body table { width: 100%; border-collapse: collapse; font-size: .86rem; }
+.document-body th, .document-body td { padding: .55rem; border: 1px solid var(--border); text-align: left; }
+.document-body blockquote { margin-left: 0; padding-left: 1.2rem; border-left: 3px solid var(--accent); color: var(--ink-muted); }
 
 .lesson-heading { margin-bottom: 2rem; }
 .filters { display: grid; grid-template-columns: repeat(6, minmax(120px, 1fr)); gap: 1px; background: var(--border); border: 1px solid var(--border); }
@@ -137,7 +144,9 @@ h3 { margin: 0; font-size: 1.25rem; }
 .lesson-detail { padding: 2.5rem clamp(1.4rem, 5vw, 4.5rem); }
 .lesson-detail .summary { max-width: 44rem; color: var(--ink-muted); font-size: 1rem; }
 .lesson-metadata { display: flex; flex-wrap: wrap; gap: .55rem 1.2rem; padding: 1.15rem 0; border-block: 1px solid var(--border); color: var(--ink-muted); font-size: .72rem; }
-.markdown-source { margin: 2rem 0; white-space: pre-wrap; overflow-wrap: anywhere; font: .88rem/1.75 var(--mono); }
+.lesson-path { margin: 1.25rem 0 0; padding-top: 0; }
+.lesson-markdown { margin: 2rem 0; }
+.markdown-image { color: var(--ink-muted); font-style: italic; }
 .readonly-note { border-left: 3px solid var(--accent); padding-left: 1rem; color: var(--ink-muted); font-size: .77rem; }
 
 .health-panel {

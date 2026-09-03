@@ -36,11 +36,29 @@ booked: [safe-reader]
 ---
 ## 상황
 
-브라우저에서 원문을 읽는다.
+브라우저에서 **원문을 읽는다**.
+
+- Markdown heading
+- list item
+- `inline_code`
 
 ## 교훈
 
-<script>이 문자열은 실행되지 않고 Markdown 원문으로만 반환된다.</script>
+<script>이 문자열은 실행되지 않고 문서 텍스트로만 표시된다.</script>
+"""
+
+UNBOOKED_LESSON = """---
+topic: follow-up
+title: 아직 책에 반영되지 않은 교훈
+summary: topic-level 미반영 상태를 확인한다
+tags: [gui, safe]
+date: 2026-08-27
+review_by: 2026-10-01
+booked: []
+---
+# 후속 확인
+
+*검토할 내용*을 읽는다.
 """
 
 
@@ -60,6 +78,10 @@ class GuiBehaviorTests(unittest.TestCase):
         (self.knowledge / "book/demo/reader.md").write_text(BOOK, encoding="utf-8")
         (self.knowledge / "lessons/demo/safe-reader.md").write_text(
             LESSON,
+            encoding="utf-8",
+        )
+        (self.knowledge / "lessons/demo/follow-up.md").write_text(
+            UNBOOKED_LESSON,
             encoding="utf-8",
         )
         personal_index.write_all(
@@ -546,6 +568,84 @@ class GuiBehaviorTests(unittest.TestCase):
         self.assertEqual(book["logical_path"], "book/demo/reader.md")
         self.assertEqual(lesson["logical_path"], "lessons/demo/safe-reader.md")
         self.assertIn("<script>", lesson["markdown"])
+
+    def test_lesson_reader_renders_safe_markdown_and_preserves_filter_values(self):
+        lessons = {
+            lesson["slug"]: lesson
+            for lesson in self.library()["scopes"][0]["lessons"]
+        }
+
+        _, _, booked = self.request(
+            "GET",
+            "/api/v1/lessons/" + lessons["safe-reader"]["id"],
+        )
+        _, _, unbooked = self.request(
+            "GET",
+            "/api/v1/lessons/" + lessons["follow-up"]["id"],
+        )
+
+        self.assertIn("<h2>상황</h2>", booked["body_html"])
+        self.assertIn("<ul>", booked["body_html"])
+        self.assertIn("<strong>원문을 읽는다</strong>", booked["body_html"])
+        self.assertIn("<code>inline_code</code>", booked["body_html"])
+        self.assertNotIn("<script>", booked["body_html"])
+        self.assertIn("&lt;script&gt;", booked["body_html"])
+        self.assertIn("<script>", booked["markdown"])
+        self.assertEqual(booked["booked_state"], "booked")
+        self.assertEqual(booked["review_by"], "2026-09-28")
+        self.assertEqual(unbooked["booked_state"], "unbooked")
+        self.assertEqual(unbooked["review_by"], "2026-10-01")
+        self.assertEqual(
+            (booked["source_of_truth"], booked["view"], booked["write_performed"]),
+            ("canonical_markdown", "regenerable_in_memory_html", False),
+        )
+
+    def test_lesson_reader_rejects_unsafe_link_with_redacted_contract_error(self):
+        source = self.knowledge / "lessons/demo/safe-reader.md"
+        source.write_text(
+            LESSON + "\n[실행](javascript:alert(1))\n",
+            encoding="utf-8",
+        )
+        lesson = next(
+            item
+            for item in self.library()["scopes"][0]["lessons"]
+            if item["slug"] == "safe-reader"
+        )
+
+        status, _, payload = self.request(
+            "GET",
+            "/api/v1/lessons/" + lesson["id"],
+        )
+
+        self.assertEqual(status, 422)
+        self.assertEqual(payload["error"]["token"], "LESSON_RENDER_REJECTED")
+        self.assertNotIn("javascript:", json.dumps(payload))
+        self.assertNotIn(str(self.root), json.dumps(payload))
+
+    def test_lesson_markdown_image_is_non_fetching_alternative_text(self):
+        source = self.knowledge / "lessons/demo/safe-reader.md"
+        source.write_text(
+            LESSON + "\n![개인 diagram](https://example.com/private.png)\n",
+            encoding="utf-8",
+        )
+        lesson = next(
+            item
+            for item in self.library()["scopes"][0]["lessons"]
+            if item["slug"] == "safe-reader"
+        )
+
+        status, _, payload = self.request(
+            "GET",
+            "/api/v1/lessons/" + lesson["id"],
+        )
+
+        self.assertEqual(status, 200)
+        self.assertIn(
+            '<span class="markdown-image">이미지 · 개인 diagram</span>',
+            payload["body_html"],
+        )
+        self.assertNotIn("<img", payload["body_html"])
+        self.assertNotIn("https://example.com/private.png", payload["body_html"])
 
     def test_stale_index_is_explicit_while_validated_source_is_current(self):
         changed = BOOK.replace("안전한 로컬 책", "바뀐 원문 책")

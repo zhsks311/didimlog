@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### 수정
+
+- local GUI 교훈 상세가 canonical Markdown의 제목·목록·강조·code를 안전한 읽기 화면으로 표시합니다. book과 교훈 제목은 한국어·영어를 섞어도 자연스러운 간격과 줄바꿈을 사용하며, 내부 `booked`/`unbooked`와 `review_by`는 정확한 filter 값을 유지한 채 ‘책 반영 상태’와 ‘검토 기준일’의 뜻을 설명합니다.
+
 ## [0.1.0] - 2026-09-03
 
 ### 추가
