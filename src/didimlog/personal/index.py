@@ -69,6 +69,21 @@ class KnowledgeSourceError(KnowledgeIndexError):
             "KNOWLEDGE_INDEX_INVALID {}: {}".format(logical_path, reason)
         )
 
+class KnowledgeCollectionTooLarge(KnowledgeIndexError):
+    """The caller's finite source-item budget was exceeded."""
+
+def _value_text_bytes(value: object) -> int:
+    if isinstance(value, str):
+        return len(value.encode("utf-8"))
+    if isinstance(value, dict):
+        return sum(
+            _value_text_bytes(key) + _value_text_bytes(child)
+            for key, child in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return sum(_value_text_bytes(child) for child in value)
+    return 0
+
 
 
 
@@ -132,7 +147,11 @@ def _validate_knowledge_root(path: Path) -> None:
         )
 
 
-def _project_directories(root: Path) -> dict[str, ProjectDirectory]:
+def _project_directories(
+    root: Path,
+    *,
+    entry_budget: list[int] | None = None,
+) -> dict[str, ProjectDirectory]:
     try:
         root_info = root.lstat()
     except FileNotFoundError:
@@ -149,7 +168,18 @@ def _project_directories(root: Path) -> dict[str, ProjectDirectory]:
         )
 
     try:
-        entries = list(root.iterdir())
+        if entry_budget is None:
+            entries = list(root.iterdir())
+        else:
+            entries = []
+            with os.scandir(root) as discovered:
+                for entry in discovered:
+                    if entry_budget[0] <= 0:
+                        raise KnowledgeCollectionTooLarge(
+                            "source entry limit exceeded"
+                        )
+                    entry_budget[0] -= 1
+                    entries.append(root / entry.name)
     except OSError as exc:
         raise KnowledgeSourceError(
             root.name,
@@ -256,6 +286,8 @@ def _lesson_item(
     relative: Path,
     *,
     read_relative: Path | None = None,
+    include_content: bool = False,
+    include_body: bool = True,
 ) -> dict[str, object]:
     logical_path = _logical_source_path(project, relative)
     try:
@@ -275,20 +307,37 @@ def _lesson_item(
         ) from exc
     if parsed is None:
         raise KnowledgeSourceError(logical_path, "invalid lesson metadata")
-    fields, _, _ = parsed
+    fields, lines, closing = parsed
     tags = parse_inline_list(fields.get("tags", "[]"), canonical=True)
     if tags is None:
         raise KnowledgeSourceError(logical_path, "invalid tags")
     find_when = sorted(set([fields["topic"], *tags]), key=_byte_key)
     if not find_when:
         raise KnowledgeSourceError(logical_path, "find_when is empty")
-    return {
+    item: dict[str, object] = {
         "kind": "lesson",
         "title": fields["title"],
         "find_when": find_when,
         "path": logical_path,
         "review_by": fields.get("review_by"),
     }
+    if include_content:
+        booked = parse_inline_list(fields.get("booked", "[]"))
+        if booked is None:
+            raise KnowledgeSourceError(logical_path, "invalid booked topics")
+        item.update(
+            {
+                "slug": relative.stem,
+                "topic": fields["topic"],
+                "summary": fields["summary"],
+                "tags": tags,
+                "date": fields["date"],
+                "booked": booked,
+            }
+        )
+        if include_body:
+            item["body"] = "\n".join(lines[closing + 1 :])
+    return item
 
 
 def _document_item(
@@ -354,13 +403,31 @@ def _markdown_files(
     *,
     recursive: bool,
     root_descriptor: int,
+    entry_budget: list[int] | None = None,
+    item_byte_budget: list[int] | None = None,
     item_reader=None,
+    maximum_items: int | None = None,
 ) -> list[object]:
-    files = []
+    files: list[tuple[Path, object]] = []
 
     def scan(directory_descriptor: int, parent_relative: Path) -> None:
         try:
-            names = sorted(os.listdir(directory_descriptor), key=os.fsencode)
+            if entry_budget is None:
+                names = sorted(
+                    os.listdir(directory_descriptor),
+                    key=os.fsencode,
+                )
+            else:
+                names = []
+                with os.scandir(directory_descriptor) as discovered:
+                    for entry in discovered:
+                        if entry_budget[0] <= 0:
+                            raise KnowledgeCollectionTooLarge(
+                                "source entry limit exceeded"
+                            )
+                        entry_budget[0] -= 1
+                        names.append(entry.name)
+                names.sort(key=os.fsencode)
         except OSError as exc:
             raise KnowledgeSourceError(
                 _logical_source_path(project, parent_relative),
@@ -423,6 +490,13 @@ def _markdown_files(
             else:
                 action = "file"
 
+            if (
+                maximum_items is not None
+                and len(files) + len(selected) >= maximum_items
+            ):
+                raise KnowledgeCollectionTooLarge(
+                    "source item limit exceeded"
+                )
             logical_path = _logical_source_path(project, relative)
             selected.append(
                 (
@@ -445,18 +519,21 @@ def _markdown_files(
                     "source directory must be a real directory",
                 )
             if item_reader is None:
-                files.append((relative, relative))
+                value = relative
             else:
-                files.append(
-                    (
-                        relative,
-                        item_reader(
-                            directory_descriptor,
-                            relative,
-                            Path(relative.name),
-                        ),
-                    )
+                value = item_reader(
+                    directory_descriptor,
+                    relative,
+                    Path(relative.name),
                 )
+                if item_byte_budget is not None:
+                    item_bytes = _value_text_bytes(value)
+                    if item_bytes > item_byte_budget[0]:
+                        raise KnowledgeCollectionTooLarge(
+                            "source metadata limit exceeded"
+                        )
+                    item_byte_budget[0] -= item_bytes
+            files.append((relative, value))
 
     scan(root_descriptor, Path())
     return [
@@ -481,6 +558,12 @@ def _require_projects_unchanged(
 
 def _collect_with_projects(
     data_root=None,
+    *,
+    include_content: bool = False,
+    include_lesson_body: bool = True,
+    maximum_entries: int | None = None,
+    maximum_item_bytes: int | None = None,
+    maximum_items: int | None = None,
 ) -> tuple[
     dict[str, list[dict[str, object]]],
     tuple[ProjectDirectory, ...],
@@ -492,8 +575,17 @@ def _collect_with_projects(
         "docs": root / "docs",
         "book": root / "book",
     }
+    entry_budget = (
+        None if maximum_entries is None else [maximum_entries]
+    )
+    item_byte_budget = (
+        None if maximum_item_bytes is None else [maximum_item_bytes]
+    )
     directories = {
-        kind: _project_directories(source_root)
+        kind: _project_directories(
+            source_root,
+            entry_budget=entry_budget,
+        )
         for kind, source_root in roots.items()
     }
     snapshots = tuple(
@@ -507,27 +599,49 @@ def _collect_with_projects(
         key=_byte_key,
     )
     collected = {}
+    item_count = 0
+
+    def item_limit() -> dict[str, object]:
+        options: dict[str, object] = {}
+        if maximum_items is not None:
+            options["maximum_items"] = maximum_items - item_count
+        if entry_budget is not None:
+            options["entry_budget"] = entry_budget
+        if item_byte_budget is not None:
+            options["item_byte_budget"] = item_byte_budget
+        return options
+
+    def extend_items(
+        target: list[dict[str, object]],
+        found: list[dict[str, object]],
+    ) -> None:
+        nonlocal item_count
+        target.extend(found)
+        item_count += len(found)
+
     for project_name in projects:
         items = []
         lesson_project = directories["lesson"].get(project_name)
         if lesson_project is not None:
             descriptor = _open_project_directory(lesson_project)
             try:
-                items.extend(
-                    _markdown_files(
-                        lesson_project,
-                        recursive=False,
-                        root_descriptor=descriptor,
-                        item_reader=lambda current_descriptor, relative, leaf: (
-                            _lesson_item(
-                                lesson_project,
-                                current_descriptor,
-                                relative,
-                                read_relative=leaf,
-                            )
-                        ),
-                    )
+                found = _markdown_files(
+                    lesson_project,
+                    recursive=False,
+                    root_descriptor=descriptor,
+                    item_reader=lambda current_descriptor, relative, leaf: (
+                        _lesson_item(
+                            lesson_project,
+                            current_descriptor,
+                            relative,
+                            read_relative=leaf,
+                            include_content=include_content,
+                            include_body=include_lesson_body,
+                        )
+                    ),
+                    **item_limit(),
                 )
+                extend_items(items, found)
                 _require_projects_unchanged((lesson_project,))
             finally:
                 os.close(descriptor)
@@ -536,22 +650,22 @@ def _collect_with_projects(
         if docs_project is not None:
             descriptor = _open_project_directory(docs_project)
             try:
-                items.extend(
-                    _markdown_files(
-                        docs_project,
-                        recursive=True,
-                        root_descriptor=descriptor,
-                        item_reader=lambda current_descriptor, relative, leaf: (
-                            _document_item(
-                                docs_project,
-                                current_descriptor,
-                                relative,
-                                "docs",
-                                read_relative=leaf,
-                            )
-                        ),
-                    )
+                found = _markdown_files(
+                    docs_project,
+                    recursive=True,
+                    root_descriptor=descriptor,
+                    item_reader=lambda current_descriptor, relative, leaf: (
+                        _document_item(
+                            docs_project,
+                            current_descriptor,
+                            relative,
+                            "docs",
+                            read_relative=leaf,
+                        )
+                    ),
+                    **item_limit(),
                 )
+                extend_items(items, found)
                 _require_projects_unchanged((docs_project,))
             finally:
                 os.close(descriptor)
@@ -560,22 +674,22 @@ def _collect_with_projects(
         if book_project is not None:
             descriptor = _open_project_directory(book_project)
             try:
-                items.extend(
-                    _markdown_files(
-                        book_project,
-                        recursive=False,
-                        root_descriptor=descriptor,
-                        item_reader=lambda current_descriptor, relative, leaf: (
-                            _document_item(
-                                book_project,
-                                current_descriptor,
-                                relative,
-                                "book",
-                                read_relative=leaf,
-                            )
-                        ),
-                    )
+                found = _markdown_files(
+                    book_project,
+                    recursive=False,
+                    root_descriptor=descriptor,
+                    item_reader=lambda current_descriptor, relative, leaf: (
+                        _document_item(
+                            book_project,
+                            current_descriptor,
+                            relative,
+                            "book",
+                            read_relative=leaf,
+                        )
+                    ),
+                    **item_limit(),
                 )
+                extend_items(items, found)
                 _require_projects_unchanged((book_project,))
             finally:
                 os.close(descriptor)
@@ -584,10 +698,45 @@ def _collect_with_projects(
     return collected, snapshots
 
 
-def collect(data_root=None) -> dict[str, list[dict[str, object]]]:
-    """선택한 Markdown을 검사하고 프로젝트별 인덱스 항목을 반환한다."""
-    collected, _ = _collect_with_projects(data_root)
+def collect(
+    data_root=None,
+    *,
+    include_content: bool = False,
+) -> dict[str, list[dict[str, object]]]:
+    """Return validated source rows, optionally including lesson view content."""
+    collected, _ = _collect_with_projects(
+        data_root,
+        include_content=include_content,
+    )
     return collected
+
+
+def collect_snapshot(
+    data_root=None,
+    *,
+    include_content: bool = False,
+    include_lesson_body: bool = True,
+    maximum_entries: int | None = None,
+    maximum_item_bytes: int | None = None,
+    maximum_items: int | None = None,
+) -> tuple[dict[str, list[dict[str, object]]], IndexCheckState]:
+    """Collect one source snapshot and inspect its exact derived index under one lock."""
+    root = Path(data_root) if data_root is not None else lessons_dir().parent
+    with path_lock(root, shared=True):
+        collected, _ = _collect_with_projects(
+            root,
+            include_content=include_content,
+            include_lesson_body=include_lesson_body,
+            maximum_entries=maximum_entries,
+            maximum_item_bytes=maximum_item_bytes,
+            maximum_items=maximum_items,
+        )
+        outputs = {
+            project: render_project(project, items)
+            for project, items in collected.items()
+        }
+        state = inspect_index(outputs, root / "index")
+        return collected, state
 
 
 def render_project(project: str, items: Iterable[Mapping[str, object]]) -> str:

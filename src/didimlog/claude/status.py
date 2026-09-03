@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import os
 import unicodedata
 from pathlib import Path
@@ -16,7 +18,7 @@ from didimlog.indexing import (
 from didimlog.project.git_exclude import discover_project_for_setup
 from didimlog.personal.paths import data_home
 
-from .probe import Problem, inspect
+from .probe import Problem, _index_problem, inspect
 
 
 _PERSONAL_LABELS = {
@@ -33,6 +35,16 @@ _PROJECT_LABELS = {
     "PROJECT_INDEX_EXTRA": "알 수 없는 index 파일 있음",
     "PROJECT_INDEX_INVALID_SOURCE": "원본 오류",
 }
+
+
+@dataclass(frozen=True)
+class StatusSnapshot:
+    version: str
+    personal_token: str
+    project_name: str | None
+    project_token: str
+    claude_token: str
+    problems: tuple[Problem, ...]
 
 
 def _safe_label(value: str) -> str:
@@ -68,6 +80,8 @@ def _diagnostic_problems(
     cwd,
     config,
     project_root: Path | None,
+    personal_token: str,
+    project_token: str,
 ) -> tuple[Problem, ...]:
     try:
         return inspect(
@@ -75,54 +89,118 @@ def _diagnostic_problems(
             cwd=cwd,
             config=config,
             _project_root=project_root,
+            _personal_token=personal_token,
+            _project_token=project_token,
         )
     except (OSError, ValueError):
-        return (
+        problems = [
             Problem(
                 token="CLAUDE_CONFIG_INVALID",
                 impact="Claude 설정을 안전하게 읽을 수 없어 연결 상태를 확인하지 못합니다.",
                 action="didim setup",
-            ),
-        )
+            )
+        ]
+        for token, personal in (
+            (personal_token, True),
+            (project_token, False),
+        ):
+            if not token.startswith(
+                "PERSONAL_INDEX_" if personal else "PROJECT_INDEX_"
+            ):
+                continue
+            problem = _index_problem(token, personal=personal)
+            if problem is not None:
+                problems.append(problem)
+        return tuple(problems)
 
 
-def status_text(*, home=None, cwd=None, config=None) -> str:
-    """Summarize current state without exposing absolute home paths."""
+def status_snapshot(
+    *,
+    home=None,
+    cwd=None,
+    config=None,
+    _personal_token: str | None = None,
+) -> StatusSnapshot:
+    """Return typed, privacy-safe read-only health state for other surfaces."""
     selected_home = Path.home() if home is None else Path(home)
     selected_home = Path(os.path.abspath(selected_home))
-    personal_token = _personal_check(data_home(selected_home))
-    personal_label = _PERSONAL_LABELS.get(personal_token, "확인 필요")
-
+    personal_token = (
+        _personal_check(data_home(selected_home))
+        if _personal_token is None
+        else _personal_token
+    )
     project_root, project_problem = _discover_project(cwd)
+
     if project_problem is not None:
-        project_name = "확인 실패"
-        project_label = "확인 실패"
+        project_name = None
+        project_token = "PROJECT_STATUS_UNKNOWN"
     elif project_root is None:
-        project_name = "없음"
-        project_label = "설정되지 않음"
+        project_name = None
+        project_token = "PROJECT_NOT_CONFIGURED"
     else:
         project_name = _safe_label(project_root.name)
-        if _prepared_project(project_root):
-            project_token = _project_check(project_root)
-            project_label = _PROJECT_LABELS.get(project_token, "확인 필요")
-        else:
-            project_label = "설정되지 않음"
+        project_token = (
+            _project_check(project_root)
+            if _prepared_project(project_root)
+            else "PROJECT_NOT_CONFIGURED"
+        )
 
-    problems = _diagnostic_problems(
-        home=selected_home,
-        cwd=cwd,
-        config=config,
-        project_root=project_root,
+    problems = list(
+        _diagnostic_problems(
+            home=selected_home,
+            cwd=cwd,
+            config=config,
+            project_root=project_root,
+            personal_token=personal_token,
+            project_token=project_token,
+        )
     )
+    if project_problem is not None:
+        problems.append(project_problem)
     wiring_problem = any(
         problem.token.startswith("CLAUDE_")
         or problem.token == "PERSONAL_RULES_INVALID"
         for problem in problems
     )
-    claude_label = "문제 있음" if wiring_problem else "정상"
+    return StatusSnapshot(
+        version=didimlog_version(),
+        personal_token=personal_token,
+        project_name=project_name,
+        project_token=project_token,
+        claude_token="CLAUDE_PROBLEMS" if wiring_problem else "CLAUDE_OK",
+        problems=tuple(problems),
+    )
+
+
+def status_text(*, home=None, cwd=None, config=None) -> str:
+    """Summarize current state without exposing absolute home paths."""
+    snapshot = status_snapshot(home=home, cwd=cwd, config=config)
+    personal_label = _PERSONAL_LABELS.get(
+        snapshot.personal_token,
+        "확인 필요",
+    )
+    project_name = (
+        "확인 실패"
+        if snapshot.project_token == "PROJECT_STATUS_UNKNOWN"
+        else snapshot.project_name or "없음"
+    )
+    if snapshot.project_token == "PROJECT_NOT_CONFIGURED":
+        project_label = "설정되지 않음"
+    elif snapshot.project_token == "PROJECT_STATUS_UNKNOWN":
+        project_label = "확인 실패"
+    else:
+        project_label = _PROJECT_LABELS.get(
+            snapshot.project_token,
+            "확인 필요",
+        )
+    claude_label = (
+        "문제 있음"
+        if snapshot.claude_token == "CLAUDE_PROBLEMS"
+        else "정상"
+    )
     return "\n".join(
         (
-            "Didimlog {}".format(didimlog_version()),
+            "Didimlog {}".format(snapshot.version),
             "개인 지식: {}".format(personal_label),
             "현재 프로젝트: {}".format(project_name),
             "프로젝트 근거: {}".format(project_label),
@@ -134,19 +212,7 @@ def status_text(*, home=None, cwd=None, config=None) -> str:
 
 def doctor_text(*, home=None, cwd=None, config=None) -> tuple[int, str]:
     """Return stable diagnosis text and a nonzero policy exit for any problem."""
-    selected_home = Path.home() if home is None else Path(home)
-    selected_home = Path(os.path.abspath(selected_home))
-    project_root, project_problem = _discover_project(cwd)
-    problems = list(
-        _diagnostic_problems(
-            home=selected_home,
-            cwd=cwd,
-            config=config,
-            project_root=project_root,
-        )
-    )
-    if project_problem is not None:
-        problems.append(project_problem)
+    problems = status_snapshot(home=home, cwd=cwd, config=config).problems
     if not problems:
         return 0, "DOCTOR_OK\n문제 없음\n"
 

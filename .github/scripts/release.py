@@ -7,10 +7,12 @@ import argparse
 from dataclasses import asdict, dataclass
 from datetime import date
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import tomllib
 
 
@@ -126,13 +128,23 @@ class ReleaseEvidence:
     head_is_preparation: bool
 
 
-def _git(repo: Path, *arguments: str, strip: bool = True) -> str:
+def _git(
+    repo: Path,
+    *arguments: str,
+    strip: bool = True,
+    environment: dict[str, str] | None = None,
+) -> str:
     try:
         result = subprocess.run(
             ["git", "-C", str(repo), *arguments],
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT_SECONDS,
+            env=(
+                {**os.environ, **environment}
+                if environment is not None
+                else None
+            ),
         )
     except subprocess.TimeoutExpired as error:
         raise ReleaseError(f"git_timeout:{arguments[0]}") from error
@@ -402,6 +414,52 @@ def _expected_release_kind(head_ref: str) -> str | None:
     return None
 
 
+def _three_way_merge_tree(
+    repo: Path,
+    base_sha: str,
+    ours_sha: str,
+    theirs_sha: str,
+) -> str:
+    object_directory = Path(
+        _git(repo, "rev-parse", "--git-path", "objects")
+    )
+    if not object_directory.is_absolute():
+        object_directory = repo / object_directory
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        temporary_objects = Path(temporary_directory) / "objects"
+        temporary_objects.mkdir()
+        environment = {
+            "GIT_OBJECT_DIRECTORY": str(temporary_objects),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(
+                object_directory.resolve()
+            ),
+            "GIT_AUTHOR_NAME": "Didimlog",
+            "GIT_AUTHOR_EMAIL": "didimlog@example.invalid",
+            "GIT_AUTHOR_DATE": "1970-01-01T00:00:00 +0000",
+            "GIT_COMMITTER_NAME": "Didimlog",
+            "GIT_COMMITTER_EMAIL": "didimlog@example.invalid",
+            "GIT_COMMITTER_DATE": "1970-01-01T00:00:00 +0000",
+        }
+        synthetic_theirs = _git(
+            repo,
+            "commit-tree",
+            f"{theirs_sha}^{{tree}}",
+            "-p",
+            base_sha,
+            "-m",
+            "Didimlog temporary cancellation merge",
+            environment=environment,
+        )
+        return _git(
+            repo,
+            "merge-tree",
+            "--write-tree",
+            ours_sha,
+            synthetic_theirs,
+            environment=environment,
+        )
+
+
 def _validate_cancel_tree(
     repo: Path,
     cancel: CancelMarker,
@@ -423,12 +481,8 @@ def _validate_cancel_tree(
         preparation.commit_sha,
     )[0]
     try:
-        expected_tree = _git(
+        expected_tree = _three_way_merge_tree(
             repo,
-            "merge-tree",
-            "--write-tree",
-            "--no-messages",
-            "--merge-base",
             preparation.commit_sha,
             cancel_parents[0],
             preparation_parent,

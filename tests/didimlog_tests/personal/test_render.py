@@ -10,7 +10,12 @@ from importlib import resources
 from pathlib import Path
 
 from didimlog.personal import render as render_module
-from didimlog.personal.render import render_book
+from didimlog.personal.render import (
+    BookRenderLimits,
+    BookRenderTooLarge,
+    render_book,
+    render_book_view,
+)
 
 
 PNG = base64.b64decode(
@@ -491,6 +496,226 @@ graph LR
                     self.render()
 
                 self.assertFalse(self.output.exists())
+
+    def test_attr_list_cannot_create_event_or_style_attributes(self):
+        self.write_source(
+            """# Safe heading {#chosen onclick="alert(1)" style="color:red"}
+
+Term
+: Definition
+
+| Value |
+| ---: |
+| 1 |
+
+Footnote reference.[^1]
+
+[^1]: Footnote body.
+"""
+        )
+
+        view = render_book_view(
+            project=PROJECT,
+            source_name=self.source.name,
+            data_root=self.data_root,
+        )
+        document = self.render().read_text(encoding="utf-8")
+        standalone_body = document.split("<body><main>", 1)[1].split(
+            '\n<p class="source">',
+            1,
+        )[0]
+
+        for rendered in (view.body_html, standalone_body):
+            self.assertNotRegex(
+                rendered,
+                r"<[^>]*\son[a-z0-9_-]*\s*=",
+            )
+            self.assertNotRegex(
+                rendered,
+                r'<[^>]*\sstyle="color:red"',
+            )
+            self.assertNotRegex(
+                rendered,
+                r'<[^>]*\sid="chosen"',
+            )
+            self.assertIn("<dl>", rendered)
+            self.assertIn('class="footnote"', rendered)
+            self.assertIn('style="text-align: right;"', rendered)
+
+        self.assertNotRegex(standalone_body, r"<h1[^>]*\sid=")
+        self.assertTrue(view.headings)
+        self.assertNotEqual(view.headings[0].anchor, "chosen")
+        self.assertIn(
+            'id="{}"'.format(view.headings[0].anchor),
+            view.body_html,
+        )
+
+    def test_gui_heading_ids_and_heading_fragments_are_namespaced(self):
+        self.write_source(
+            """# content
+
+[첫 제목](#content)
+
+## content
+
+[중복 제목](#content_1)
+
+## health-panel
+
+Footnote reference.[^1]
+
+[^1]: Footnote body.
+
+[상대 링크](chapter.md#content)
+[외부 링크](https://example.com/#content)
+"""
+        )
+
+        view = render_book_view(
+            project=PROJECT,
+            source_name=self.source.name,
+            data_root=self.data_root,
+            namespace_headings=True,
+        )
+
+        anchors = [heading.anchor for heading in view.headings]
+        self.assertEqual(
+            anchors,
+            [
+                "didim-book-heading-content",
+                "didim-book-heading-content_1",
+                "didim-book-heading-health-panel",
+            ],
+        )
+        for anchor in anchors:
+            self.assertIn('id="{}"'.format(anchor), view.body_html)
+        self.assertIn(
+            'href="#didim-book-heading-content"',
+            view.body_html,
+        )
+        self.assertIn(
+            'href="#didim-book-heading-content_1"',
+            view.body_html,
+        )
+        self.assertIn('href="#fn:1"', view.body_html)
+        self.assertIn('href="#fnref:1"', view.body_html)
+        self.assertIn('href="chapter.md#content"', view.body_html)
+        self.assertIn(
+            'href="https://example.com/#content"',
+            view.body_html,
+        )
+
+    def test_gui_source_and_body_limits_accept_exact_bytes_and_reject_one_over(self):
+        self.write_source("# bounded\n\n본문\n")
+        source_bytes = self.source.stat().st_size
+        unbounded = render_book_view(
+            project=PROJECT,
+            source_name=self.source.name,
+            data_root=self.data_root,
+            namespace_headings=True,
+        )
+        body_bytes = len(unbounded.body_html.encode("utf-8"))
+        exact = BookRenderLimits(
+            source_bytes=source_bytes,
+            image_bytes=1,
+            aggregate_image_bytes=1,
+            body_html_bytes=body_bytes,
+        )
+
+        rendered = render_book_view(
+            project=PROJECT,
+            source_name=self.source.name,
+            data_root=self.data_root,
+            limits=exact,
+            namespace_headings=True,
+        )
+        self.assertEqual(rendered.body_html, unbounded.body_html)
+
+        with self.assertRaises(BookRenderTooLarge):
+            render_book_view(
+                project=PROJECT,
+                source_name=self.source.name,
+                data_root=self.data_root,
+                limits=BookRenderLimits(
+                    source_bytes=source_bytes - 1,
+                    image_bytes=1,
+                    aggregate_image_bytes=1,
+                    body_html_bytes=body_bytes,
+                ),
+                namespace_headings=True,
+            )
+        with self.assertRaises(BookRenderTooLarge):
+            render_book_view(
+                project=PROJECT,
+                source_name=self.source.name,
+                data_root=self.data_root,
+                limits=BookRenderLimits(
+                    source_bytes=source_bytes,
+                    image_bytes=1,
+                    aggregate_image_bytes=1,
+                    body_html_bytes=body_bytes - 1,
+                ),
+                namespace_headings=True,
+            )
+
+    def test_gui_image_limits_apply_before_base64_and_to_raw_aggregate(self):
+        first = b"first-image"
+        second = b"second-image"
+        (self.assets / "first.png").write_bytes(first)
+        (self.assets / "second.png").write_bytes(second)
+        self.write_source(
+            "# images\n\n![첫째](assets/first.png)\n\n"
+            "![둘째](assets/second.png)\n"
+        )
+        source_bytes = self.source.stat().st_size
+        exact = BookRenderLimits(
+            source_bytes=source_bytes,
+            image_bytes=max(len(first), len(second)),
+            aggregate_image_bytes=len(first) + len(second),
+            body_html_bytes=1024 * 1024,
+        )
+
+        rendered = render_book_view(
+            project=PROJECT,
+            source_name=self.source.name,
+            data_root=self.data_root,
+            limits=exact,
+            namespace_headings=True,
+        )
+        self.assertEqual(rendered.body_html.count(";base64,"), 2)
+
+        with self.assertRaises(BookRenderTooLarge), mock.patch(
+            "didimlog.personal.render.base64.b64encode",
+            wraps=base64.b64encode,
+        ) as encode:
+            render_book_view(
+                project=PROJECT,
+                source_name=self.source.name,
+                data_root=self.data_root,
+                limits=BookRenderLimits(
+                    source_bytes=source_bytes,
+                    image_bytes=len(first) - 1,
+                    aggregate_image_bytes=len(first) + len(second),
+                    body_html_bytes=1024 * 1024,
+                ),
+                namespace_headings=True,
+            )
+        encode.assert_not_called()
+
+        with self.assertRaises(BookRenderTooLarge):
+            render_book_view(
+                project=PROJECT,
+                source_name=self.source.name,
+                data_root=self.data_root,
+                limits=BookRenderLimits(
+                    source_bytes=source_bytes,
+                    image_bytes=max(len(first), len(second)),
+                    aggregate_image_bytes=len(first) + len(second) - 1,
+                    body_html_bytes=1024 * 1024,
+                ),
+                namespace_headings=True,
+            )
+
 
     def test_unsafe_markdown_link_schemes_are_rejected(self):
         for destination in (

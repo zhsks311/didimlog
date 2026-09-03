@@ -29,6 +29,7 @@ from didimlog.errors import (
     EXIT_USAGE,
     emit_error,
 )
+from didimlog.gui import serve_gui
 from didimlog.indexing import (
     PERSONAL_INDEX_CURRENT,
     PROJECT_INDEX_CURRENT,
@@ -46,6 +47,8 @@ from didimlog.personal.lesson_writing import (
 )
 from didimlog.project.capture import CaptureRequest, capture
 from didimlog.project.git_exclude import discover_project_for_setup
+from didimlog.update import automatic_update_notice
+
 
 
 _EXPLAIN_ERRORS = "--explain-errors"
@@ -58,6 +61,7 @@ didim add lesson
 didim add observation
 didim add experiment
 didim add evidence
+didim gui
 didim index
 didim status
 didim doctor
@@ -99,6 +103,16 @@ def _add_record_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--scope", default="project", help="project 또는 task:<name>")
     parser.add_argument("--tags", default="", help="쉼표로 구분한 태그")
     parser.add_argument("--sources", default="", help="쉼표로 구분한 record ID")
+
+
+def _port(value: str) -> int:
+    try:
+        port = int(value, 10)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("port must be an integer") from error
+    if not 0 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 0 and 65535")
+    return port
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -177,6 +191,21 @@ def build_parser() -> argparse.ArgumentParser:
         )
         _add_record_options(record)
         record.set_defaults(_handler=_add_record, _help_parser=record)
+
+    gui = commands.add_parser("gui", help="읽기 전용 local web GUI 실행")
+    gui.add_argument(
+        "--port",
+        type=_port,
+        default=0,
+        help="loopback port (기본값: 충돌 없는 임의 port)",
+    )
+    gui.add_argument(
+        "--open",
+        dest="open_browser",
+        action="store_true",
+        help="server 시작 뒤 기본 browser 열기",
+    )
+    gui.set_defaults(_handler=_gui, _help_parser=gui)
 
     index = commands.add_parser("index", help="검색 목록 생성 또는 확인")
     index.add_argument("--check", action="store_true", help="파일을 바꾸지 않고 확인")
@@ -435,6 +464,11 @@ def _add_record(args) -> int:
     return 0
 
 
+def _gui(args) -> int:
+    return serve_gui(port=args.port, open_browser=args.open_browser)
+
+
+
 def _index(args) -> int:
     result = run_index(check=args.check)
     print(result.personal)
@@ -490,8 +524,19 @@ def _as_didim_error(error: Exception) -> DidimError:
     )
 
 
+def _automatic_update_eligible(parsed, *, real_invocation: bool) -> bool:
+    if not real_invocation or not _stderr_is_tty():
+        return False
+    if parsed.command in ("gui", "hook"):
+        return False
+    if parsed.command == "setup" and parsed.dry_run:
+        return False
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
-    arguments = list(sys.argv[1:] if argv is None else argv)
+    real_invocation = argv is None
+    arguments = list(sys.argv[1:] if real_invocation else argv)
     parser = build_parser()
     explain = _explain_requested(arguments)
     try:
@@ -506,13 +551,22 @@ def main(argv: list[str] | None = None) -> int:
         parsed._help_parser.print_help()
         return 0
     try:
-        return handler(parsed)
+        result = handler(parsed)
     except (DidimError, LessonError, OSError, UnicodeError, ValueError) as error:
         return emit_error(
             _as_didim_error(error),
             explain=explain,
             tty=_stderr_is_tty(),
         )
+    if result == 0 and _automatic_update_eligible(
+        parsed,
+        real_invocation=real_invocation,
+    ):
+        try:
+            automatic_update_notice(didimlog_version(), stderr=sys.stderr)
+        except Exception:
+            pass
+    return result
 
 
 if __name__ == "__main__":
