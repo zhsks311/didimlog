@@ -4,18 +4,18 @@
 
 ## [Unreleased]
 
-### 수정
-
-- 자동 업데이트 확인이 느린 응답에서 socket read마다 timeout을 다시 시작하지 않고 전체 응답 읽기 시간을 제한해 원래 CLI 명령의 완료를 지연하지 않도록 고쳤습니다.
-- 책장 source entry와 항목을 10,000개, metadata를 8 MiB, serialized response를 16 MiB로 allocation 전에 제한하고 목록 metadata에 교훈 본문을 보관하지 않아 큰 지식 트리와 동시 요청에서도 메모리 사용이 유한하도록 고쳤습니다.
-- health token과 관련 문제를 한 번의 개인·프로젝트 index snapshot에서 만들고 HTTP 기본 port 80의 canonical loopback Host·Origin을 허용해 화면이 서로 모순되거나 자기 launch를 거부하지 않도록 고쳤습니다.
-
 ## [0.1.0] - 2026-09-03
 
 ### 추가
 
 - 성공한 대화형 `didim` 명령 뒤 최대 하루에 한 번 PyPI의 새 stable 버전을 확인해 stderr로 알립니다. 원래 명령의 stdout과 종료 코드는 유지하며, `DIDIM_NO_UPDATE_CHECK=1`로 요청과 cache 저장을 모두 끌 수 있습니다.
 - `didim gui`로 `127.0.0.1`에만 bind하는 읽기 전용 local web app을 실행할 수 있습니다. 기존 parser·index·안전한 book renderer를 재사용해 책장, book reader, 교훈 metadata filter·원문 상세, surface별 health를 제공하며 browse 중 원문·index·설정을 쓰지 않습니다. launch마다 새 browser capability를 URL fragment로 안전하게 handoff하고 private API에 Bearer 인증을 요구하며, book source·image·rendered HTML·serialized response에 finite 제한을 적용합니다. reader heading ID와 fragment를 app route와 분리하고 겹친 async 요청에서는 최신 탐색·선택·refresh만 화면 상태를 바꿉니다.
+
+### 수정
+
+- 자동 업데이트 확인이 느린 응답에서 socket read마다 timeout을 다시 시작하지 않고 전체 응답 읽기 시간을 제한해 원래 CLI 명령의 완료를 지연하지 않도록 고쳤습니다.
+- 책장 source entry와 항목을 10,000개, metadata를 8 MiB, serialized response를 16 MiB로 allocation 전에 제한하고 목록 metadata에 교훈 본문을 보관하지 않아 큰 지식 트리와 동시 요청에서도 메모리 사용이 유한하도록 고쳤습니다.
+- health token과 관련 문제를 한 번의 개인·프로젝트 index snapshot에서 만들고 HTTP 기본 port 80의 canonical loopback Host·Origin을 허용해 화면이 서로 모순되거나 자기 launch를 거부하지 않도록 고쳤습니다.
 
 ## [0.0.5] - 2026-08-19
 
