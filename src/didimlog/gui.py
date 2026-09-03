@@ -47,6 +47,7 @@ _GUI_BOOK_RENDER_LIMITS = BookRenderLimits(
 )
 _GUI_BOOK_RESPONSE_MAX_BYTES = 128 * 1024 * 1024
 _GUI_LIBRARY_ITEM_MAX = 10_000
+_GUI_LIBRARY_METADATA_MAX_BYTES = 8 * 1024 * 1024
 _GUI_LIBRARY_RESPONSE_MAX_BYTES = 16 * 1024 * 1024
 
 _SECURITY_HEADERS = {
@@ -122,6 +123,27 @@ def _health_payload(snapshot: StatusSnapshot) -> dict[str, object]:
     }
 
 
+def _json_bytes(
+    payload: dict[str, object],
+    *,
+    maximum_bytes: int | None,
+) -> bytes:
+    encoder = json.JSONEncoder(
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if maximum_bytes is None:
+        return encoder.encode(payload).encode("utf-8")
+
+    body = bytearray()
+    for text in encoder.iterencode(payload):
+        chunk = text.encode("utf-8")
+        if len(body) + len(chunk) > maximum_bytes:
+            raise OverflowError("serialized JSON exceeds limit")
+        body.extend(chunk)
+    return bytes(body)
+
+
 class GuiApplication:
     """Typed read-only application boundary used by the HTTP adapter."""
 
@@ -166,6 +188,8 @@ class GuiApplication:
                 root,
                 include_content=True,
                 include_lesson_body=False,
+                maximum_entries=_GUI_LIBRARY_ITEM_MAX,
+                maximum_item_bytes=_GUI_LIBRARY_METADATA_MAX_BYTES,
                 maximum_items=_GUI_LIBRARY_ITEM_MAX,
             )
         except personal_index.KnowledgeCollectionTooLarge as error:
@@ -463,17 +487,17 @@ def _handler(application: GuiApplication):
             maximum_bytes: int | None = None,
             maximum_error: GuiRequestError | None = None,
         ) -> None:
-            body = json.dumps(
-                payload,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-            if maximum_bytes is not None and len(body) > maximum_bytes:
+            try:
+                body = _json_bytes(
+                    payload,
+                    maximum_bytes=maximum_bytes,
+                )
+            except OverflowError as error:
                 raise maximum_error or GuiRequestError(
                     "BOOK_RENDER_TOO_LARGE",
                     HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
                     "책 reader 결과가 local GUI의 안전한 크기 제한을 넘었습니다.",
-                )
+                ) from error
             self._send(
                 status,
                 body,

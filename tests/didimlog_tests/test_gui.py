@@ -446,12 +446,15 @@ class GuiBehaviorTests(unittest.TestCase):
         collect_snapshot.assert_called_once_with(
             self.knowledge,
             include_content=True,
+            maximum_entries=gui_module._GUI_LIBRARY_ITEM_MAX,
+            maximum_item_bytes=gui_module._GUI_LIBRARY_METADATA_MAX_BYTES,
             include_lesson_body=False,
             maximum_items=gui_module._GUI_LIBRARY_ITEM_MAX,
         )
 
     def test_library_bounds_items_and_serialized_response_then_recovers(self):
         for constant in (
+            "_GUI_LIBRARY_METADATA_MAX_BYTES",
             "_GUI_LIBRARY_ITEM_MAX",
             "_GUI_LIBRARY_RESPONSE_MAX_BYTES",
         ):

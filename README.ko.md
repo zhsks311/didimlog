@@ -154,11 +154,11 @@ logical path와 opaque resource ID만 전달하며 임의 file path를 제출할
 
 GUI book render는 기존 source 4 MiB 제한을 유지하고 image당 16 MiB, raw image
 합계 64 MiB, UTF-8 body HTML 96 MiB, serialized book response 128 MiB로
-제한합니다. 책장은 검증된 source 항목을 최대 10,000개까지 받고 metadata를
-만드는 동안 교훈 본문을 보관하지 않으며 serialized response를 16 MiB로
-제한합니다. 제한을 넘긴 book과 library는 세부 내용이 가려진
-`BOOK_RENDER_TOO_LARGE`와 `GUI_LIBRARY_TOO_LARGE`로 실패하며 이후 요청은
-계속 처리합니다.
+제한합니다. 책장 탐색은 source entry와 항목을 최대 10,000개까지 받고 교훈
+본문을 제외한 metadata를 8 MiB까지만 보관하며 serialized response를
+incremental하게 16 MiB로 제한합니다. 제한을 넘긴 book과 library는 세부
+내용이 가려진 `BOOK_RENDER_TOO_LARGE`와 `GUI_LIBRARY_TOO_LARGE`로 실패하며
+이후 요청은 계속 처리합니다.
 
 ### 프로젝트 지식을 팀과 공유하기
 
