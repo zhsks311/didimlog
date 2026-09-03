@@ -131,6 +131,42 @@ class AutomaticUpdateNoticeTests(unittest.TestCase):
         self.assertLess(len(payload), update.RESPONSE_MAX_BYTES)
         self.assertIn("Didimlog 0.0.6 업데이트 가능", output)
 
+    def test_slow_incremental_response_stops_at_one_total_read_deadline(self):
+        clock = [0.0]
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        network_socket = mock.Mock()
+        response.fp.raw._sock = network_socket
+
+        def read_one(_size):
+            remaining = network_socket.settimeout.call_args.args[0]
+            read_delay = 0.4
+            clock[0] += min(remaining, read_delay)
+            if remaining < read_delay:
+                raise TimeoutError("read deadline reached")
+            return b"x"
+
+        response.read1.side_effect = read_one
+        opener = mock.Mock(return_value=response)
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(update.time, "monotonic", side_effect=lambda: clock[0]),
+        ):
+            home = Path(temporary).resolve() / "home"
+            home.mkdir()
+            output, _ = self.run_notice(home, opener=opener)
+
+            self.assertEqual(output, "")
+            self.assertFalse((home / ".cache" / "didimlog" / "update.json").exists())
+
+        self.assertEqual(response.read1.call_count, 3)
+        self.assertEqual(network_socket.settimeout.call_count, 3)
+        self.assertAlmostEqual(
+            network_socket.settimeout.call_args.args[0],
+            0.2,
+        )
+
     def test_absolute_xdg_cache_home_selects_the_cache_location(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

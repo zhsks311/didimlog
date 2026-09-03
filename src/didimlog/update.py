@@ -28,6 +28,7 @@ PYPI_URL = "https://pypi.org/pypi/didimlog/json"
 REQUEST_TIMEOUT = 1.0
 RESPONSE_MAX_BYTES = 1024 * 1024
 CHECK_INTERVAL_SECONDS = 24 * 60 * 60
+_RESPONSE_READ_CHUNK_BYTES = 64 * 1024
 _CACHE_MAX_BYTES = 512
 _DISABLE_ENVIRONMENT = "DIDIM_NO_UPDATE_CHECK"
 _STABLE_VERSION = re.compile(
@@ -146,11 +147,51 @@ def _decode_cache(data: bytes | None) -> _Cache | None:
     return _Cache(checked_at=checked_at, latest=latest)
 
 
+def _set_response_read_timeout(response: object, timeout: float) -> None:
+    stream = getattr(response, "fp", None)
+    raw_stream = getattr(stream, "raw", None)
+    network_socket = getattr(raw_stream, "_sock", None)
+    set_timeout = getattr(network_socket, "settimeout", None)
+    if callable(set_timeout):
+        set_timeout(timeout)
+
+
+def _read_response(response: object) -> bytes:
+    deadline = time.monotonic() + REQUEST_TIMEOUT
+    read_available = getattr(response, "read1", None)
+    if not callable(read_available):
+        data = response.read(RESPONSE_MAX_BYTES + 1)
+        if time.monotonic() >= deadline:
+            raise TimeoutError("PyPI response deadline exceeded")
+        return data
+
+    chunks: list[bytes] = []
+    size = 0
+    while size <= RESPONSE_MAX_BYTES:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("PyPI response deadline exceeded")
+        _set_response_read_timeout(response, remaining)
+        chunk = read_available(
+            min(
+                _RESPONSE_READ_CHUNK_BYTES,
+                RESPONSE_MAX_BYTES + 1 - size,
+            )
+        )
+        if not isinstance(chunk, bytes):
+            raise ValueError("PyPI response is invalid")
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    return b"".join(chunks)
+
+
 def _fetch_latest(
     opener: Callable[..., object],
 ) -> str:
     with opener(PYPI_URL, timeout=REQUEST_TIMEOUT) as response:
-        data = response.read(RESPONSE_MAX_BYTES + 1)
+        data = _read_response(response)
     if not isinstance(data, bytes) or len(data) > RESPONSE_MAX_BYTES:
         raise ValueError("PyPI response is invalid")
     value = json.loads(data.decode("utf-8"))
