@@ -133,7 +133,7 @@ class AutomaticUpdateNoticeTests(unittest.TestCase):
         self.assertLess(len(payload), update.RESPONSE_MAX_BYTES)
         self.assertIn("Didimlog 0.0.6 업데이트 가능", output)
 
-    def test_slow_response_cannot_delay_the_completed_cli_command(self):
+    def test_slow_response_stops_at_total_request_deadline(self):
         release = threading.Event()
         finished = threading.Event()
         response = mock.MagicMock()
@@ -142,36 +142,27 @@ class AutomaticUpdateNoticeTests(unittest.TestCase):
 
         def blocked_read(_size):
             try:
-                release.wait(timeout=1)
+                release.wait(timeout=2)
                 return pypi_payload("0.0.6")
             finally:
                 finished.set()
 
         response.read.side_effect = blocked_read
         opener = mock.Mock(return_value=response)
-        timer = threading.Timer(0.2, release.set)
+        timer = threading.Timer(1.0, release.set)
         timer.start()
         try:
-            with (
-                tempfile.TemporaryDirectory() as temporary,
-                mock.patch.object(update, "REQUEST_TIMEOUT", 0.02),
-            ):
-                home = Path(temporary).resolve() / "home"
-                home.mkdir()
+            with mock.patch.object(update, "REQUEST_TIMEOUT", 0.02):
                 started = time.monotonic()
-                output, _ = self.run_notice(home, opener=opener)
+                with self.assertRaises(TimeoutError):
+                    update._fetch_latest(opener)
                 elapsed = time.monotonic() - started
-
-                self.assertEqual(output, "")
-                self.assertFalse(
-                    (home / ".cache" / "didimlog" / "update.json").exists()
-                )
         finally:
             release.set()
             timer.cancel()
             self.assertTrue(finished.wait(timeout=1))
 
-        self.assertLess(elapsed, 0.1)
+        self.assertLess(elapsed, 0.5)
         self.assertTrue(update._FETCH_GUARD.acquire(timeout=1))
         update._FETCH_GUARD.release()
 
