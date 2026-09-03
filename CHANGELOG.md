@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-03
+
 ### 추가
 
 - 성공한 대화형 `didim` 명령 뒤 최대 하루에 한 번 PyPI의 새 stable 버전을 확인해 stderr로 알립니다. 원래 명령의 stdout과 종료 코드는 유지하며, `DIDIM_NO_UPDATE_CHECK=1`로 요청과 cache 저장을 모두 끌 수 있습니다.
@@ -68,7 +70,8 @@
 - macOS·Linux 및 Python 3.11~3.14 지원 계약.
 
 
-[Unreleased]: https://github.com/zhsks311/didimlog/compare/v0.0.5...HEAD
+[Unreleased]: https://github.com/zhsks311/didimlog/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/zhsks311/didimlog/releases/tag/v0.1.0
 [0.0.5]: https://github.com/zhsks311/didimlog/releases/tag/v0.0.5
 [0.0.4]: https://github.com/zhsks311/didimlog/releases/tag/v0.0.4
 [0.0.3]: https://github.com/zhsks311/didimlog/releases/tag/v0.0.3
