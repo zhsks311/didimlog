@@ -11,7 +11,12 @@ from didimlog import version as didimlog_version
 
 from didimlog.claude.probe import _launcher_from_settings
 from didimlog.claude.setup import apply_setup, plan_setup
-from didimlog.claude.status import _safe_label, doctor_text, status_text
+from didimlog.claude.status import (
+    _safe_label,
+    doctor_text,
+    status_snapshot,
+    status_text,
+)
 
 
 class StatusDoctorTests(unittest.TestCase):
@@ -190,6 +195,44 @@ class StatusDoctorTests(unittest.TestCase):
             "Claude 연결: 정상\n",
         )
         self.assertNotIn(str(self.home), text)
+
+    def test_snapshot_builds_tokens_and_index_problems_from_one_probe(self):
+        with (
+            mock.patch(
+                "didimlog.claude.status._personal_check",
+                return_value="PERSONAL_INDEX_STALE",
+            ) as personal_check,
+            mock.patch(
+                "didimlog.claude.status._project_check",
+                return_value="PROJECT_INDEX_STALE",
+            ) as project_check,
+            mock.patch(
+                "didimlog.claude.probe._personal_check",
+                side_effect=AssertionError("personal index was probed twice"),
+            ),
+            mock.patch(
+                "didimlog.claude.probe._project_check",
+                side_effect=AssertionError("project index was probed twice"),
+            ),
+        ):
+            snapshot = status_snapshot(
+                home=self.home,
+                cwd=self.project,
+                config=self.config,
+            )
+
+        self.assertEqual(snapshot.personal_token, "PERSONAL_INDEX_STALE")
+        self.assertEqual(snapshot.project_token, "PROJECT_INDEX_STALE")
+        self.assertEqual(
+            {
+                problem.token
+                for problem in snapshot.problems
+                if problem.token.endswith("_INDEX_STALE")
+            },
+            {"PERSONAL_INDEX_STALE", "PROJECT_INDEX_STALE"},
+        )
+        personal_check.assert_called_once()
+        project_check.assert_called_once()
 
     def test_status_distinguishes_personal_stale_and_unconfigured_project(self):
         personal_index = self.home / "knowledge" / "index"

@@ -27,6 +27,7 @@ from .connect import (
 from .paths import config_dir, config_target
 
 _PROJECT_ROOT_UNSET = object()
+_INDEX_TOKEN_UNSET = object()
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,8 @@ def inspect(
     cwd=None,
     config=None,
     _project_root=_PROJECT_ROOT_UNSET,
+    _personal_token=_INDEX_TOKEN_UNSET,
+    _project_token=_INDEX_TOKEN_UNSET,
 ) -> tuple[Problem, ...]:
     """Inspect wiring and derived indexes without reading source bodies into output."""
     selected_home = Path.home() if home is None else Path(home)
@@ -184,7 +187,11 @@ def inspect(
         )
 
     personal_problem = _index_problem(
-        _personal_check(data_home(selected_home)),
+        (
+            _personal_check(data_home(selected_home))
+            if _personal_token is _INDEX_TOKEN_UNSET
+            else _personal_token
+        ),
         personal=True,
     )
     if personal_problem is not None:
@@ -195,12 +202,22 @@ def inspect(
         if _project_root is _PROJECT_ROOT_UNSET
         else _project_root
     )
-    if project_root is not None and _prepared_project(project_root):
-        project_problem = _index_problem(
-            _project_check(project_root),
-            personal=False,
-        )
-        if project_problem is not None:
-            problems.append(project_problem)
+    if project_root is not None:
+        project_token = None
+        if _project_token is _INDEX_TOKEN_UNSET:
+            if _prepared_project(project_root):
+                project_token = _project_check(project_root)
+        elif (
+            isinstance(_project_token, str)
+            and _project_token.startswith("PROJECT_INDEX_")
+        ):
+            project_token = _project_token
+        if project_token is not None:
+            project_problem = _index_problem(
+                project_token,
+                personal=False,
+            )
+            if project_problem is not None:
+                problems.append(project_problem)
 
     return tuple(problems)

@@ -6,9 +6,11 @@ from dataclasses import dataclass
 import json
 import math
 import os
+import queue
 from pathlib import Path
 import re
 import stat
+import threading
 import time
 from typing import Callable, Mapping, TextIO
 from urllib.request import urlopen
@@ -28,12 +30,12 @@ PYPI_URL = "https://pypi.org/pypi/didimlog/json"
 REQUEST_TIMEOUT = 1.0
 RESPONSE_MAX_BYTES = 1024 * 1024
 CHECK_INTERVAL_SECONDS = 24 * 60 * 60
-_RESPONSE_READ_CHUNK_BYTES = 64 * 1024
 _CACHE_MAX_BYTES = 512
 _DISABLE_ENVIRONMENT = "DIDIM_NO_UPDATE_CHECK"
 _STABLE_VERSION = re.compile(
     r"^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$"
 )
+_FETCH_GUARD = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -147,51 +149,43 @@ def _decode_cache(data: bytes | None) -> _Cache | None:
     return _Cache(checked_at=checked_at, latest=latest)
 
 
-def _set_response_read_timeout(response: object, timeout: float) -> None:
-    stream = getattr(response, "fp", None)
-    raw_stream = getattr(stream, "raw", None)
-    network_socket = getattr(raw_stream, "_sock", None)
-    set_timeout = getattr(network_socket, "settimeout", None)
-    if callable(set_timeout):
-        set_timeout(timeout)
-
-
-def _read_response(response: object) -> bytes:
-    deadline = time.monotonic() + REQUEST_TIMEOUT
-    read_available = getattr(response, "read1", None)
-    if not callable(read_available):
-        data = response.read(RESPONSE_MAX_BYTES + 1)
-        if time.monotonic() >= deadline:
-            raise TimeoutError("PyPI response deadline exceeded")
-        return data
-
-    chunks: list[bytes] = []
-    size = 0
-    while size <= RESPONSE_MAX_BYTES:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError("PyPI response deadline exceeded")
-        _set_response_read_timeout(response, remaining)
-        chunk = read_available(
-            min(
-                _RESPONSE_READ_CHUNK_BYTES,
-                RESPONSE_MAX_BYTES + 1 - size,
-            )
-        )
-        if not isinstance(chunk, bytes):
-            raise ValueError("PyPI response is invalid")
-        if not chunk:
-            break
-        chunks.append(chunk)
-        size += len(chunk)
-    return b"".join(chunks)
-
-
 def _fetch_latest(
     opener: Callable[..., object],
 ) -> str:
-    with opener(PYPI_URL, timeout=REQUEST_TIMEOUT) as response:
-        data = _read_response(response)
+    if not _FETCH_GUARD.acquire(blocking=False):
+        raise TimeoutError("PyPI request is already in progress")
+
+    results: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+    def fetch() -> None:
+        try:
+            with opener(PYPI_URL, timeout=REQUEST_TIMEOUT) as response:
+                data = response.read(RESPONSE_MAX_BYTES + 1)
+            results.put((True, data))
+        except Exception as error:
+            results.put((False, error))
+        finally:
+            _FETCH_GUARD.release()
+
+    worker = threading.Thread(
+        target=fetch,
+        name="didimlog-update-check",
+        daemon=True,
+    )
+    try:
+        worker.start()
+    except BaseException:
+        _FETCH_GUARD.release()
+        raise
+    try:
+        succeeded, result = results.get(timeout=REQUEST_TIMEOUT)
+    except queue.Empty as error:
+        raise TimeoutError("PyPI request deadline exceeded") from error
+    if not succeeded:
+        if isinstance(result, BaseException):
+            raise result
+        raise RuntimeError("PyPI request failed without an exception")
+    data = result
     if not isinstance(data, bytes) or len(data) > RESPONSE_MAX_BYTES:
         raise ValueError("PyPI response is invalid")
     value = json.loads(data.decode("utf-8"))

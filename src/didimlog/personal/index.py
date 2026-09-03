@@ -69,6 +69,9 @@ class KnowledgeSourceError(KnowledgeIndexError):
             "KNOWLEDGE_INDEX_INVALID {}: {}".format(logical_path, reason)
         )
 
+class KnowledgeCollectionTooLarge(KnowledgeIndexError):
+    """The caller's finite source-item budget was exceeded."""
+
 
 
 
@@ -257,6 +260,7 @@ def _lesson_item(
     *,
     read_relative: Path | None = None,
     include_content: bool = False,
+    include_body: bool = True,
 ) -> dict[str, object]:
     logical_path = _logical_source_path(project, relative)
     try:
@@ -302,9 +306,10 @@ def _lesson_item(
                 "tags": tags,
                 "date": fields["date"],
                 "booked": booked,
-                "body": "\n".join(lines[closing + 1 :]),
             }
         )
+        if include_body:
+            item["body"] = "\n".join(lines[closing + 1 :])
     return item
 
 
@@ -372,6 +377,7 @@ def _markdown_files(
     recursive: bool,
     root_descriptor: int,
     item_reader=None,
+    maximum_items: int | None = None,
 ) -> list[object]:
     files = []
 
@@ -451,6 +457,8 @@ def _markdown_files(
             )
 
         for _, relative, logical_path, action in sorted(selected):
+            if maximum_items is not None and len(files) >= maximum_items:
+                raise KnowledgeCollectionTooLarge("source item limit exceeded")
             if action == "invalid-file":
                 raise KnowledgeSourceError(
                     logical_path,
@@ -500,6 +508,8 @@ def _collect_with_projects(
     data_root=None,
     *,
     include_content: bool = False,
+    include_lesson_body: bool = True,
+    maximum_items: int | None = None,
 ) -> tuple[
     dict[str, list[dict[str, object]]],
     tuple[ProjectDirectory, ...],
@@ -526,28 +536,47 @@ def _collect_with_projects(
         key=_byte_key,
     )
     collected = {}
+    item_count = 0
+
+    def remaining_items() -> int | None:
+        if maximum_items is None:
+            return None
+        return maximum_items - item_count
+
+    def item_limit() -> dict[str, int]:
+        remaining = remaining_items()
+        return {} if remaining is None else {"maximum_items": remaining}
+
+    def extend_items(
+        target: list[dict[str, object]],
+        found: list[dict[str, object]],
+    ) -> None:
+        nonlocal item_count
+        target.extend(found)
+        item_count += len(found)
     for project_name in projects:
         items = []
         lesson_project = directories["lesson"].get(project_name)
         if lesson_project is not None:
             descriptor = _open_project_directory(lesson_project)
             try:
-                items.extend(
-                    _markdown_files(
-                        lesson_project,
-                        recursive=False,
-                        root_descriptor=descriptor,
-                        item_reader=lambda current_descriptor, relative, leaf: (
-                            _lesson_item(
-                                lesson_project,
-                                current_descriptor,
-                                relative,
-                                read_relative=leaf,
-                                include_content=include_content,
-                            )
-                        ),
-                    )
+                found = _markdown_files(
+                    lesson_project,
+                    recursive=False,
+                    root_descriptor=descriptor,
+                    item_reader=lambda current_descriptor, relative, leaf: (
+                        _lesson_item(
+                            lesson_project,
+                            current_descriptor,
+                            relative,
+                            read_relative=leaf,
+                            include_content=include_content,
+                            include_body=include_lesson_body,
+                        )
+                    ),
+                    **item_limit(),
                 )
+                extend_items(items, found)
                 _require_projects_unchanged((lesson_project,))
             finally:
                 os.close(descriptor)
@@ -556,22 +585,22 @@ def _collect_with_projects(
         if docs_project is not None:
             descriptor = _open_project_directory(docs_project)
             try:
-                items.extend(
-                    _markdown_files(
-                        docs_project,
-                        recursive=True,
-                        root_descriptor=descriptor,
-                        item_reader=lambda current_descriptor, relative, leaf: (
-                            _document_item(
-                                docs_project,
-                                current_descriptor,
-                                relative,
-                                "docs",
-                                read_relative=leaf,
-                            )
-                        ),
-                    )
+                found = _markdown_files(
+                    docs_project,
+                    recursive=True,
+                    root_descriptor=descriptor,
+                    item_reader=lambda current_descriptor, relative, leaf: (
+                        _document_item(
+                            docs_project,
+                            current_descriptor,
+                            relative,
+                            "docs",
+                            read_relative=leaf,
+                        )
+                    ),
+                    **item_limit(),
                 )
+                extend_items(items, found)
                 _require_projects_unchanged((docs_project,))
             finally:
                 os.close(descriptor)
@@ -580,22 +609,22 @@ def _collect_with_projects(
         if book_project is not None:
             descriptor = _open_project_directory(book_project)
             try:
-                items.extend(
-                    _markdown_files(
-                        book_project,
-                        recursive=False,
-                        root_descriptor=descriptor,
-                        item_reader=lambda current_descriptor, relative, leaf: (
-                            _document_item(
-                                book_project,
-                                current_descriptor,
-                                relative,
-                                "book",
-                                read_relative=leaf,
-                            )
-                        ),
-                    )
+                found = _markdown_files(
+                    book_project,
+                    recursive=False,
+                    root_descriptor=descriptor,
+                    item_reader=lambda current_descriptor, relative, leaf: (
+                        _document_item(
+                            book_project,
+                            current_descriptor,
+                            relative,
+                            "book",
+                            read_relative=leaf,
+                        )
+                    ),
+                    **item_limit(),
                 )
+                extend_items(items, found)
                 _require_projects_unchanged((book_project,))
             finally:
                 os.close(descriptor)
@@ -621,6 +650,8 @@ def collect_snapshot(
     data_root=None,
     *,
     include_content: bool = False,
+    include_lesson_body: bool = True,
+    maximum_items: int | None = None,
 ) -> tuple[dict[str, list[dict[str, object]]], IndexCheckState]:
     """Collect one source snapshot and inspect its exact derived index under one lock."""
     root = Path(data_root) if data_root is not None else lessons_dir().parent
@@ -628,6 +659,8 @@ def collect_snapshot(
         collected, _ = _collect_with_projects(
             root,
             include_content=include_content,
+            include_lesson_body=include_lesson_body,
+            maximum_items=maximum_items,
         )
         outputs = {
             project: render_project(project, items)

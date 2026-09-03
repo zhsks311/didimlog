@@ -46,6 +46,8 @@ _GUI_BOOK_RENDER_LIMITS = BookRenderLimits(
     body_html_bytes=96 * 1024 * 1024,
 )
 _GUI_BOOK_RESPONSE_MAX_BYTES = 128 * 1024 * 1024
+_GUI_LIBRARY_ITEM_MAX = 10_000
+_GUI_LIBRARY_RESPONSE_MAX_BYTES = 16 * 1024 * 1024
 
 _SECURITY_HEADERS = {
     "Content-Security-Policy": (
@@ -132,10 +134,20 @@ class GuiApplication:
     def personal_root(self) -> Path:
         return data_home(self.home)
 
-    def health(self) -> dict[str, object]:
-        return _health_payload(
-            status_snapshot(home=self.home, cwd=self.cwd, config=self.config)
+    def _status_snapshot(
+        self,
+        *,
+        personal_token: str | None = None,
+    ) -> StatusSnapshot:
+        return status_snapshot(
+            home=self.home,
+            cwd=self.cwd,
+            config=self.config,
+            _personal_token=personal_token,
         )
+
+    def health(self) -> dict[str, object]:
+        return _health_payload(self._status_snapshot())
 
     def _collected(self) -> dict[str, list[dict[str, object]]]:
         root = self.personal_root
@@ -149,16 +161,26 @@ class GuiApplication:
         root = self.personal_root
         if not root.exists():
             return {}, "PERSONAL_INDEX_MISSING"
-        collected, index_state = personal_index.collect_snapshot(
-            root,
-            include_content=True,
-        )
+        try:
+            collected, index_state = personal_index.collect_snapshot(
+                root,
+                include_content=True,
+                include_lesson_body=False,
+                maximum_items=_GUI_LIBRARY_ITEM_MAX,
+            )
+        except personal_index.KnowledgeCollectionTooLarge as error:
+            raise GuiRequestError(
+                "GUI_LIBRARY_TOO_LARGE",
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                "책장 결과가 local GUI의 안전한 크기 제한을 넘었습니다.",
+            ) from error
         return collected, _PERSONAL_INDEX_TOKENS[index_state]
 
     def library(self) -> dict[str, object]:
-        health = self.health()
         collected, personal_token = self._library_snapshot()
-        health["personal_index"] = _personal_index_payload(personal_token)
+        health = _health_payload(
+            self._status_snapshot(personal_token=personal_token)
+        )
         scopes = []
         current_project = health["project"]["name"]
         for scope, items in sorted(
@@ -360,6 +382,8 @@ def _handler(application: GuiApplication):
                 "127.0.0.1:{}".format(port),
                 "localhost:{}".format(port),
             }
+            if port == 80:
+                allowed.update({LOOPBACK_HOST, "localhost"})
             if host not in allowed:
                 return None
             try:
@@ -437,6 +461,7 @@ def _handler(application: GuiApplication):
             head_only: bool = False,
             allow: str | None = None,
             maximum_bytes: int | None = None,
+            maximum_error: GuiRequestError | None = None,
         ) -> None:
             body = json.dumps(
                 payload,
@@ -444,7 +469,7 @@ def _handler(application: GuiApplication):
                 separators=(",", ":"),
             ).encode("utf-8")
             if maximum_bytes is not None and len(body) > maximum_bytes:
-                raise GuiRequestError(
+                raise maximum_error or GuiRequestError(
                     "BOOK_RENDER_TOO_LARGE",
                     HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
                     "책 reader 결과가 local GUI의 안전한 크기 제한을 넘었습니다.",
@@ -492,7 +517,17 @@ def _handler(application: GuiApplication):
                     self._json(HTTPStatus.OK, application.health(), head_only=head_only)
                     return
                 if path == "/api/v1/library":
-                    self._json(HTTPStatus.OK, application.library(), head_only=head_only)
+                    self._json(
+                        HTTPStatus.OK,
+                        application.library(),
+                        head_only=head_only,
+                        maximum_bytes=_GUI_LIBRARY_RESPONSE_MAX_BYTES,
+                        maximum_error=GuiRequestError(
+                            "GUI_LIBRARY_TOO_LARGE",
+                            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                            "책장 결과가 local GUI의 안전한 크기 제한을 넘었습니다.",
+                        ),
+                    )
                     return
                 if path.startswith("/api/v1/books/"):
                     identifier = path.removeprefix("/api/v1/books/")

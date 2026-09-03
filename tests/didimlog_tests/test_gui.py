@@ -81,13 +81,22 @@ class GuiBehaviorTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=5)
 
-    def request(self, method, path, *, body=None, headers=None, authorized=True):
+    def request(
+        self,
+        method,
+        path,
+        *,
+        body=None,
+        headers=None,
+        authorized=True,
+        connection_port=None,
+    ):
         selected_headers = dict(headers or {})
         if authorized and "Authorization" not in selected_headers:
             selected_headers["Authorization"] = "Bearer " + self.server._capability
         connection = http.client.HTTPConnection(
             LOOPBACK_HOST,
-            self.server.server_port,
+            self.server.server_port if connection_port is None else connection_port,
             timeout=5,
         )
         try:
@@ -152,6 +161,34 @@ class GuiBehaviorTests(unittest.TestCase):
             "GET",
             "/api/v1/health",
             headers={"Host": "attacker.example"},
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"]["token"], "GUI_LOCAL_REQUEST_REQUIRED")
+
+    def test_port_80_accepts_browser_canonical_loopback_host_and_origin(self):
+        actual_port = self.server.server_port
+        try:
+            self.server.server_port = 80
+            for host in (LOOPBACK_HOST, "localhost"):
+                with self.subTest(host=host):
+                    status, _, payload = self.request(
+                        "GET",
+                        "/api/v1/health",
+                        headers={
+                            "Host": host,
+                            "Origin": "http://" + host,
+                        },
+                        connection_port=actual_port,
+                    )
+                    self.assertEqual(status, 200)
+                    self.assertTrue(payload["read_only"])
+        finally:
+            self.server.server_port = actual_port
+
+        status, _, payload = self.request(
+            "GET",
+            "/api/v1/health",
+            headers={"Host": LOOPBACK_HOST},
         )
         self.assertEqual(status, 403)
         self.assertEqual(payload["error"]["token"], "GUI_LOCAL_REQUEST_REQUIRED")
@@ -402,10 +439,37 @@ class GuiBehaviorTests(unittest.TestCase):
         self.assertFalse(
             library["health"]["personal_index"]["current"],
         )
+        self.assertIn(
+            "PERSONAL_INDEX_STALE",
+            {issue["token"] for issue in library["health"]["issues"]},
+        )
         collect_snapshot.assert_called_once_with(
             self.knowledge,
             include_content=True,
+            include_lesson_body=False,
+            maximum_items=gui_module._GUI_LIBRARY_ITEM_MAX,
         )
+
+    def test_library_bounds_items_and_serialized_response_then_recovers(self):
+        for constant in (
+            "_GUI_LIBRARY_ITEM_MAX",
+            "_GUI_LIBRARY_RESPONSE_MAX_BYTES",
+        ):
+            with self.subTest(constant=constant), mock.patch(
+                "didimlog.gui." + constant,
+                1,
+            ):
+                status, _, payload = self.request("GET", "/api/v1/library")
+                self.assertEqual(status, 413)
+                self.assertEqual(
+                    payload["error"]["token"],
+                    "GUI_LIBRARY_TOO_LARGE",
+                )
+                self.assertNotIn(str(self.root), json.dumps(payload))
+
+        recovery_status, _, recovery = self.request("GET", "/api/v1/library")
+        self.assertEqual(recovery_status, 200)
+        self.assertEqual(len(recovery["scopes"]), 1)
 
     def test_mermaid_asset_uses_verified_loader_and_fails_closed(self):
         with mock.patch(

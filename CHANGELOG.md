@@ -7,6 +7,8 @@
 ### 수정
 
 - 자동 업데이트 확인이 느린 응답에서 socket read마다 timeout을 다시 시작하지 않고 전체 응답 읽기 시간을 제한해 원래 CLI 명령의 완료를 지연하지 않도록 고쳤습니다.
+- 책장 source 항목을 10,000개, serialized response를 16 MiB로 제한하고 목록 metadata에 교훈 본문을 보관하지 않아 큰 지식 트리와 동시 요청에서도 메모리 사용이 유한하도록 고쳤습니다.
+- health token과 관련 문제를 한 번의 개인·프로젝트 index snapshot에서 만들고 HTTP 기본 port 80의 canonical loopback Host·Origin을 허용해 화면이 서로 모순되거나 자기 launch를 거부하지 않도록 고쳤습니다.
 
 ## [0.1.0] - 2026-09-03
 

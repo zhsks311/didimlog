@@ -4,6 +4,8 @@ import json
 import stat
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -131,41 +133,47 @@ class AutomaticUpdateNoticeTests(unittest.TestCase):
         self.assertLess(len(payload), update.RESPONSE_MAX_BYTES)
         self.assertIn("Didimlog 0.0.6 업데이트 가능", output)
 
-    def test_slow_incremental_response_stops_at_one_total_read_deadline(self):
-        clock = [0.0]
+    def test_slow_response_cannot_delay_the_completed_cli_command(self):
+        release = threading.Event()
+        finished = threading.Event()
         response = mock.MagicMock()
         response.__enter__.return_value = response
         response.__exit__.return_value = False
-        network_socket = mock.Mock()
-        response.fp.raw._sock = network_socket
 
-        def read_one(_size):
-            remaining = network_socket.settimeout.call_args.args[0]
-            read_delay = 0.4
-            clock[0] += min(remaining, read_delay)
-            if remaining < read_delay:
-                raise TimeoutError("read deadline reached")
-            return b"x"
+        def blocked_read(_size):
+            try:
+                release.wait(timeout=1)
+                return pypi_payload("0.0.6")
+            finally:
+                finished.set()
 
-        response.read1.side_effect = read_one
+        response.read.side_effect = blocked_read
         opener = mock.Mock(return_value=response)
-        with (
-            tempfile.TemporaryDirectory() as temporary,
-            mock.patch.object(update.time, "monotonic", side_effect=lambda: clock[0]),
-        ):
-            home = Path(temporary).resolve() / "home"
-            home.mkdir()
-            output, _ = self.run_notice(home, opener=opener)
+        timer = threading.Timer(0.2, release.set)
+        timer.start()
+        try:
+            with (
+                tempfile.TemporaryDirectory() as temporary,
+                mock.patch.object(update, "REQUEST_TIMEOUT", 0.02),
+            ):
+                home = Path(temporary).resolve() / "home"
+                home.mkdir()
+                started = time.monotonic()
+                output, _ = self.run_notice(home, opener=opener)
+                elapsed = time.monotonic() - started
 
-            self.assertEqual(output, "")
-            self.assertFalse((home / ".cache" / "didimlog" / "update.json").exists())
+                self.assertEqual(output, "")
+                self.assertFalse(
+                    (home / ".cache" / "didimlog" / "update.json").exists()
+                )
+        finally:
+            release.set()
+            timer.cancel()
+            self.assertTrue(finished.wait(timeout=1))
 
-        self.assertEqual(response.read1.call_count, 3)
-        self.assertEqual(network_socket.settimeout.call_count, 3)
-        self.assertAlmostEqual(
-            network_socket.settimeout.call_args.args[0],
-            0.2,
-        )
+        self.assertLess(elapsed, 0.1)
+        self.assertTrue(update._FETCH_GUARD.acquire(timeout=1))
+        update._FETCH_GUARD.release()
 
     def test_absolute_xdg_cache_home_selects_the_cache_location(self):
         with tempfile.TemporaryDirectory() as temporary:
