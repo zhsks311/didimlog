@@ -18,7 +18,7 @@ from didimlog.indexing import (
 from didimlog.project.git_exclude import discover_project_for_setup
 from didimlog.personal.paths import data_home
 
-from .probe import Problem, inspect
+from .probe import Problem, _index_problem, inspect
 
 
 _PERSONAL_LABELS = {
@@ -80,6 +80,8 @@ def _diagnostic_problems(
     cwd,
     config,
     project_root: Path | None,
+    personal_token: str,
+    project_token: str,
 ) -> tuple[Problem, ...]:
     try:
         return inspect(
@@ -87,22 +89,46 @@ def _diagnostic_problems(
             cwd=cwd,
             config=config,
             _project_root=project_root,
+            _personal_token=personal_token,
+            _project_token=project_token,
         )
     except (OSError, ValueError):
-        return (
+        problems = [
             Problem(
                 token="CLAUDE_CONFIG_INVALID",
                 impact="Claude 설정을 안전하게 읽을 수 없어 연결 상태를 확인하지 못합니다.",
                 action="didim setup",
-            ),
-        )
+            )
+        ]
+        for token, personal in (
+            (personal_token, True),
+            (project_token, False),
+        ):
+            if not token.startswith(
+                "PERSONAL_INDEX_" if personal else "PROJECT_INDEX_"
+            ):
+                continue
+            problem = _index_problem(token, personal=personal)
+            if problem is not None:
+                problems.append(problem)
+        return tuple(problems)
 
 
-def status_snapshot(*, home=None, cwd=None, config=None) -> StatusSnapshot:
+def status_snapshot(
+    *,
+    home=None,
+    cwd=None,
+    config=None,
+    _personal_token: str | None = None,
+) -> StatusSnapshot:
     """Return typed, privacy-safe read-only health state for other surfaces."""
     selected_home = Path.home() if home is None else Path(home)
     selected_home = Path(os.path.abspath(selected_home))
-    personal_token = _personal_check(data_home(selected_home))
+    personal_token = (
+        _personal_check(data_home(selected_home))
+        if _personal_token is None
+        else _personal_token
+    )
     project_root, project_problem = _discover_project(cwd)
 
     if project_problem is not None:
@@ -125,6 +151,8 @@ def status_snapshot(*, home=None, cwd=None, config=None) -> StatusSnapshot:
             cwd=cwd,
             config=config,
             project_root=project_root,
+            personal_token=personal_token,
+            project_token=project_token,
         )
     )
     if project_problem is not None:

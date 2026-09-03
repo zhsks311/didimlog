@@ -6,9 +6,11 @@ from dataclasses import dataclass
 import json
 import math
 import os
+import queue
 from pathlib import Path
 import re
 import stat
+import threading
 import time
 from typing import Callable, Mapping, TextIO
 from urllib.request import urlopen
@@ -33,6 +35,7 @@ _DISABLE_ENVIRONMENT = "DIDIM_NO_UPDATE_CHECK"
 _STABLE_VERSION = re.compile(
     r"^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$"
 )
+_FETCH_GUARD = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -149,8 +152,40 @@ def _decode_cache(data: bytes | None) -> _Cache | None:
 def _fetch_latest(
     opener: Callable[..., object],
 ) -> str:
-    with opener(PYPI_URL, timeout=REQUEST_TIMEOUT) as response:
-        data = response.read(RESPONSE_MAX_BYTES + 1)
+    if not _FETCH_GUARD.acquire(blocking=False):
+        raise TimeoutError("PyPI request is already in progress")
+
+    results: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+    def fetch() -> None:
+        try:
+            with opener(PYPI_URL, timeout=REQUEST_TIMEOUT) as response:
+                data = response.read(RESPONSE_MAX_BYTES + 1)
+            results.put((True, data))
+        except Exception as error:
+            results.put((False, error))
+        finally:
+            _FETCH_GUARD.release()
+
+    worker = threading.Thread(
+        target=fetch,
+        name="didimlog-update-check",
+        daemon=True,
+    )
+    try:
+        worker.start()
+    except BaseException:
+        _FETCH_GUARD.release()
+        raise
+    try:
+        succeeded, result = results.get(timeout=REQUEST_TIMEOUT)
+    except queue.Empty as error:
+        raise TimeoutError("PyPI request deadline exceeded") from error
+    if not succeeded:
+        if isinstance(result, BaseException):
+            raise result
+        raise RuntimeError("PyPI request failed without an exception")
+    data = result
     if not isinstance(data, bytes) or len(data) > RESPONSE_MAX_BYTES:
         raise ValueError("PyPI response is invalid")
     value = json.loads(data.decode("utf-8"))

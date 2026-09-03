@@ -4,6 +4,8 @@ import json
 import stat
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -130,6 +132,39 @@ class AutomaticUpdateNoticeTests(unittest.TestCase):
         self.assertGreater(len(payload), 64 * 1024)
         self.assertLess(len(payload), update.RESPONSE_MAX_BYTES)
         self.assertIn("Didimlog 0.0.6 업데이트 가능", output)
+
+    def test_slow_response_stops_at_total_request_deadline(self):
+        release = threading.Event()
+        finished = threading.Event()
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+
+        def blocked_read(_size):
+            try:
+                release.wait(timeout=2)
+                return pypi_payload("0.0.6")
+            finally:
+                finished.set()
+
+        response.read.side_effect = blocked_read
+        opener = mock.Mock(return_value=response)
+        timer = threading.Timer(1.0, release.set)
+        timer.start()
+        try:
+            with mock.patch.object(update, "REQUEST_TIMEOUT", 0.02):
+                started = time.monotonic()
+                with self.assertRaises(TimeoutError):
+                    update._fetch_latest(opener)
+                elapsed = time.monotonic() - started
+        finally:
+            release.set()
+            timer.cancel()
+            self.assertTrue(finished.wait(timeout=1))
+
+        self.assertLess(elapsed, 0.5)
+        self.assertTrue(update._FETCH_GUARD.acquire(timeout=1))
+        update._FETCH_GUARD.release()
 
     def test_absolute_xdg_cache_home_selects_the_cache_location(self):
         with tempfile.TemporaryDirectory() as temporary:

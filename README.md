@@ -156,8 +156,11 @@ absolute filesystem paths, and it cannot submit arbitrary file paths.
 
 GUI book rendering retains the existing 4 MiB source limit and also limits
 each image to 16 MiB, aggregate raw images to 64 MiB, rendered UTF-8 body HTML
-to 96 MiB, and the serialized book response to 128 MiB. Oversized rendering
-fails with the redacted `BOOK_RENDER_TOO_LARGE` response and does not stop
+to 96 MiB, and the serialized book response to 128 MiB. Bookshelf discovery
+accepts at most 10,000 source entries and items, retains at most 8 MiB of
+metadata without lesson bodies, and incrementally limits its serialized
+response to 16 MiB. Oversized books and libraries fail with redacted
+`BOOK_RENDER_TOO_LARGE` and `GUI_LIBRARY_TOO_LARGE` responses without stopping
 later requests.
 
 ### Share Project Knowledge with the Team
