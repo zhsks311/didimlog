@@ -47,6 +47,15 @@ _RAW_HTML = re.compile(HTML_RE, re.DOTALL | re.UNICODE)
 _EXTERNAL_URI = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 _ALLOWED_LINK_SCHEMES = frozenset(("http", "https", "mailto"))
 _MERMAID_SHA256 = "70137e77bb273bb2ef972b86e8b0400cca8be53cb25bfc45911a186dc98665de"
+_SAFE_MARKDOWN_EXTENSIONS = (
+    "abbr",
+    "def_list",
+    "fenced_code",
+    "footnotes",
+    "sane_lists",
+    "tables",
+)
+_ALT_ATTRIBUTE = re.compile(r'\balt="([^"]*)"', re.IGNORECASE)
 _GUI_HEADING_PREFIX = "didim-book-heading-"
 _HEADING_ID = re.compile(
     r'(<h[1-6]\b[^>]*\bid=")([^"]*)(")',
@@ -281,6 +290,35 @@ def _reject_unsafe_rendered_html(rendered: str) -> None:
     parser.close()
 
 
+def _render_lesson_image_as_text(match: re.Match[str]) -> str:
+    attributes = match.group(1) + match.group(3)
+    alt_match = _ALT_ATTRIBUTE.search(attributes)
+    alt = "" if alt_match is None else html.unescape(alt_match.group(1)).strip()
+    label = "이미지" if not alt else "이미지 · " + alt
+    return '<span class="markdown-image">{}</span>'.format(html.escape(label))
+
+
+def render_markdown_body(
+    source: str,
+    *,
+    maximum_bytes: int | None = None,
+) -> str:
+    """Render lesson Markdown safely without treating source HTML as markup."""
+    converter = markdown.Markdown(
+        extensions=list(_SAFE_MARKDOWN_EXTENSIONS),
+        output_format="html5",
+    )
+    rendered = converter.convert(html.escape(source, quote=False))
+    rendered = _IMAGE.sub(_render_lesson_image_as_text, rendered)
+    _reject_unsafe_rendered_html(rendered)
+    if (
+        maximum_bytes is not None
+        and len(rendered.encode("utf-8")) > maximum_bytes
+    ):
+        raise BookRenderTooLarge
+    return rendered
+
+
 def load_verified_mermaid() -> bytes:
     """Return the pinned vendored Mermaid runtime only after SHA-256 verification."""
     try:
@@ -423,16 +461,9 @@ def _render_book_view_at(
     body_source = "\n".join(lines[closing + 1 :])
 
     _reject_raw_html(body_source)
-    # ``extra`` includes attr_list, which would let source text add arbitrary
-    # HTML attributes. Keep its documented safe features explicit.
-    extensions = [
-        "abbr",
-        "def_list",
-        "fenced_code",
-        "footnotes",
-        "sane_lists",
-        "tables",
-    ]
+    # Keep the documented safe features explicit. ``extra`` would also enable
+    # attr_list, allowing source text to add arbitrary HTML attributes.
+    extensions = list(_SAFE_MARKDOWN_EXTENSIONS)
     if include_toc:
         extensions.append("toc")
     converter = markdown.Markdown(

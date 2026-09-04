@@ -140,11 +140,21 @@ instruction to relaunch without `--open`; it never prints the failed private
 URL as a fallback.
 
 The first screen is the Bookshelf. It groups validated canonical books by
-scope, opens each book through Didimlog's safe in-memory Markdown renderer,
-and provides a read-only lesson list/detail view with exact metadata filters.
-The health panel reports the personal index, current project index, and Claude
-connection separately. If the personal index is stale, missing, extra, or has
-an invalid source, the GUI never labels it current.
+scope and opens each book through Didimlog's safe in-memory Markdown renderer.
+Lesson detail uses the same safe Markdown feature set for headings, lists,
+emphasis, and code while retaining the canonical source as the source of
+truth. Raw HTML is displayed as document text, and lesson images are shown as
+non-fetching alternative text.
+
+The lesson filters compare the stored metadata exactly. “Topic included in a
+book” and “Topic not yet included in a book” explain the internal
+`booked`/`unbooked` states: they mean that the lesson topic was or was not
+reflected in a book, not that a particular book passage came from that lesson.
+“Review reference date” is the date recorded in `review_by` for deciding when
+to revisit the lesson; the GUI neither generates the date nor infers an
+overdue state. The health panel reports the personal index, current project
+index, and Claude connection separately. If the personal index is stale,
+missing, extra, or has an invalid source, the GUI never labels it current.
 
 Milestone A performs no book, lesson, index, setup, or Claude configuration
 writes. It has no remote binding, hosted service, account, telemetry, cloud
@@ -156,12 +166,13 @@ absolute filesystem paths, and it cannot submit arbitrary file paths.
 
 GUI book rendering retains the existing 4 MiB source limit and also limits
 each image to 16 MiB, aggregate raw images to 64 MiB, rendered UTF-8 body HTML
-to 96 MiB, and the serialized book response to 128 MiB. Bookshelf discovery
-accepts at most 10,000 source entries and items, retains at most 8 MiB of
-metadata without lesson bodies, and incrementally limits its serialized
-response to 16 MiB. Oversized books and libraries fail with redacted
-`BOOK_RENDER_TOO_LARGE` and `GUI_LIBRARY_TOO_LARGE` responses without stopping
-later requests.
+to 96 MiB, and the serialized book response to 128 MiB. Rendered lesson body
+HTML is limited to 24 MiB. Bookshelf discovery accepts at most 10,000 source
+entries and items, retains at most 8 MiB of metadata without lesson bodies,
+and incrementally limits its serialized response to 16 MiB. Oversized books,
+lesson renderings, and libraries fail with redacted `BOOK_RENDER_TOO_LARGE`,
+`LESSON_RENDER_TOO_LARGE`, and `GUI_LIBRARY_TOO_LARGE` responses without
+stopping later requests.
 
 ### Share Project Knowledge with the Team
 

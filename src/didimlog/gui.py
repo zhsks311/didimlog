@@ -28,6 +28,7 @@ from didimlog.personal.render import (
     BookRenderTooLarge,
     load_verified_mermaid,
     render_book_view,
+    render_markdown_body,
 )
 
 
@@ -46,6 +47,7 @@ _GUI_BOOK_RENDER_LIMITS = BookRenderLimits(
     body_html_bytes=96 * 1024 * 1024,
 )
 _GUI_BOOK_RESPONSE_MAX_BYTES = 128 * 1024 * 1024
+_GUI_LESSON_BODY_HTML_MAX_BYTES = 24 * 1024 * 1024
 _GUI_LIBRARY_ITEM_MAX = 10_000
 _GUI_LIBRARY_METADATA_MAX_BYTES = 8 * 1024 * 1024
 _GUI_LIBRARY_RESPONSE_MAX_BYTES = 16 * 1024 * 1024
@@ -359,6 +361,23 @@ class GuiApplication:
         scope, item = self._find_item(identifier, "lesson")
         topic = str(item["topic"])
         booked_topics = list(item["booked"])
+        try:
+            body_html = render_markdown_body(
+                str(item["body"]),
+                maximum_bytes=_GUI_LESSON_BODY_HTML_MAX_BYTES,
+            )
+        except BookRenderTooLarge as error:
+            raise GuiRequestError(
+                "LESSON_RENDER_TOO_LARGE",
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                "교훈 reader 결과가 local GUI의 안전한 크기 제한을 넘었습니다.",
+            ) from error
+        except ValueError as error:
+            raise GuiRequestError(
+                "LESSON_RENDER_REJECTED",
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "교훈 원문이 안전한 reader 계약을 통과하지 못했습니다.",
+            ) from error
         return {
             "id": identifier,
             "slug": str(item["slug"]),
@@ -373,7 +392,9 @@ class GuiApplication:
             "logical_path": str(item["path"]),
             "scope": scope,
             "markdown": str(item["body"]),
+            "body_html": body_html,
             "source_of_truth": "canonical_markdown",
+            "view": "regenerable_in_memory_html",
             "write_performed": False,
         }
 

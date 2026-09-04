@@ -302,6 +302,33 @@ function renderBookshelf() {
   show("bookshelf");
 }
 
+function configureRenderedLinks(article) {
+  for (const link of article.querySelectorAll("a[href]")) {
+    const href = link.getAttribute("href");
+    if (/^(https?:|mailto:)/i.test(href)) {
+      link.setAttribute("target", "_blank");
+      link.setAttribute("rel", "noopener noreferrer");
+    } else if (href.startsWith("#")) {
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        let anchor;
+        try {
+          anchor = decodeURIComponent(href.slice(1));
+        } catch (_) {
+          return;
+        }
+        const target = [...article.querySelectorAll("[id]")]
+          .find((node) => node.id === anchor);
+        if (!target) return;
+        if (!target.hasAttribute("tabindex")) target.setAttribute("tabindex", "-1");
+        target.focus({ preventScroll: true });
+        target.scrollIntoView({ block: "start" });
+      });
+    }
+  }
+}
+
+
 async function renderReader(identifier, generation, hash) {
   if (!routeIsCurrent(generation, hash)) return;
   setNavigation(null);
@@ -342,32 +369,10 @@ async function renderReader(identifier, generation, hash) {
   }
   if (!book.headings.length) toc.append(element("span", { text: "본문 제목 없음" }));
 
-  const article = element("article", { className: "book-body" });
+  const article = element("article", { className: "book-body document-body" });
   // body_html is produced only by the existing server-side safe book renderer.
   article.innerHTML = book.body_html;
-  for (const link of article.querySelectorAll("a[href]")) {
-    const href = link.getAttribute("href");
-    if (/^(https?:|mailto:)/i.test(href)) {
-      link.setAttribute("target", "_blank");
-      link.setAttribute("rel", "noopener noreferrer");
-    } else if (href.startsWith("#")) {
-      link.addEventListener("click", (event) => {
-        event.preventDefault();
-        let anchor;
-        try {
-          anchor = decodeURIComponent(href.slice(1));
-        } catch (_) {
-          return;
-        }
-        const target = [...article.querySelectorAll("[id]")]
-          .find((node) => node.id === anchor);
-        if (!target) return;
-        if (!target.hasAttribute("tabindex")) target.setAttribute("tabindex", "-1");
-        target.focus({ preventScroll: true });
-        target.scrollIntoView({ block: "start" });
-      });
-    }
-  }
+  configureRenderedLinks(article);
 
   const rail = element("aside", { className: "source-rail" }, [
     element("h2", { text: "SOURCE" }),
@@ -410,14 +415,20 @@ function option(value, label = value) {
   return element("option", { text: label, attrs: { value } });
 }
 
+function bookedStateLabel(value) {
+  if (value === "booked") return "주제가 책에 반영됨";
+  if (value === "unbooked") return "주제가 책에 아직 반영되지 않음";
+  return value;
+}
+
 function unique(values) {
   return [...new Set(values.filter(Boolean))].sort((a, b) => a.localeCompare(b, "ko"));
 }
 
-function filterControl(label, id, values, allLabel) {
+function filterControl(label, id, values, allLabel, labelForValue = (value) => value) {
   const select = element("select", { attrs: { id } });
   select.append(option("", allLabel));
-  for (const value of values) select.append(option(value));
+  for (const value of values) select.append(option(value, labelForValue(value)));
   return element("label", { className: "filter" }, [
     element("span", { text: label }),
     select,
@@ -460,7 +471,7 @@ function renderLessonList() {
   const list = views.lessons.querySelector("#lesson-list");
   clear(list);
   const lessons = filteredLessons();
-  list.append(element("div", { className: "lesson-result-count", text: `${lessons.length}개 교훈 · metadata exact filter` }));
+  list.append(element("div", { className: "lesson-result-count", text: `${lessons.length}개 교훈 · metadata 정확히 일치` }));
   for (const lesson of lessons) {
     const row = element("button", {
       className: "lesson-row",
@@ -472,7 +483,7 @@ function renderLessonList() {
     }, [
       element("strong", { text: lesson.title }),
       element("p", { text: lesson.summary }),
-      element("span", { className: "lesson-meta", text: `${lesson.scope} · ${lesson.topic} · ${lesson.date} · ${lesson.booked_state}` }),
+      element("span", { className: "lesson-meta", text: `${lesson.scope} · ${lesson.topic} · ${lesson.date} · ${bookedStateLabel(lesson.booked_state)}` }),
     ]);
     row.addEventListener("click", () => selectLesson(lesson.id));
     list.append(row);
@@ -496,20 +507,24 @@ async function selectLesson(
     const lesson = await api(`/api/v1/lessons/${encodeURIComponent(identifier)}`);
     if (!lessonIsCurrent(generation, identifier, routeGeneration, hash)) return;
     clear(detail);
+    const markdownBody = element("div", { className: "lesson-markdown document-body" });
+    // body_html is produced only by the shared server-side safe Markdown renderer.
+    markdownBody.innerHTML = lesson.body_html;
+    configureRenderedLinks(markdownBody);
     detail.append(
       element("p", { className: "eyebrow", text: `${lesson.scope} · LESSON` }),
       element("h2", { text: lesson.title }),
       element("p", { className: "summary", text: lesson.summary }),
       element("div", { className: "lesson-metadata" }, [
-        element("span", { text: `topic · ${lesson.topic}` }),
-        element("span", { text: `date · ${lesson.date}` }),
-        element("span", { text: `tags · ${lesson.tags.join(", ") || "없음"}` }),
-        element("span", { text: `booked · ${lesson.booked_state}` }),
-        lesson.review_by ? element("span", { text: `review_by · ${lesson.review_by}` }) : null,
+        element("span", { text: `주제 · ${lesson.topic}` }),
+        element("span", { text: `작성일 · ${lesson.date}` }),
+        element("span", { text: `태그 · ${lesson.tags.join(", ") || "없음"}` }),
+        element("span", { text: `책 반영 · ${bookedStateLabel(lesson.booked_state)}` }),
+        lesson.review_by ? element("span", { text: `검토 기준일 · ${lesson.review_by}` }) : null,
       ]),
-      element("p", { className: "logical-path", text: lesson.logical_path }),
-      element("pre", { className: "markdown-source", text: lesson.markdown }),
-      element("p", { className: "readonly-note", text: "canonical Markdown 원문을 읽기 전용으로 표시합니다. booked는 이 lesson의 topic-level 표식이며 특정 책 문장의 provenance가 아닙니다." }),
+      element("p", { className: "logical-path lesson-path", text: lesson.logical_path }),
+      markdownBody,
+      element("p", { className: "readonly-note", text: "canonical Markdown을 안전한 읽기 화면으로만 변환합니다. ‘주제가 책에 반영됨’은 topic-level 상태이며, 특정 책 문장의 출처라는 뜻이 아닙니다. 검토 기준일은 이 교훈을 언제 다시 살펴볼지 판단하려고 review_by에 기록해 둔 날짜입니다." }),
     );
   } catch (error) {
     if (!lessonIsCurrent(generation, identifier, routeGeneration, hash)) return;
@@ -528,15 +543,15 @@ async function renderLessons(generation, hash) {
     filterControl("SCOPE", "filter-scope", unique(lessons.map((item) => item.scope)), "모든 scope"),
     filterControl("TOPIC", "filter-topic", unique(lessons.map((item) => item.topic)), "모든 topic"),
     filterControl("TAG", "filter-tag", unique(lessons.flatMap((item) => item.tags)), "모든 tag"),
-    filterControl("BOOKED", "filter-booked", ["booked", "unbooked"], "모든 상태"),
-    dateControl("DATE", "filter-date"),
-    dateControl("REVIEW DATE", "filter-review"),
+    filterControl("책 반영", "filter-booked", ["booked", "unbooked"], "모든 책 반영 상태", bookedStateLabel),
+    dateControl("작성일", "filter-date"),
+    dateControl("검토 기준일", "filter-review"),
   ]);
   root.append(
     element("div", { className: "lesson-heading" }, [
       element("p", { className: "eyebrow", text: "CANONICAL LESSONS" }),
       element("h1", { text: "교훈" }),
-      element("p", { className: "lede", text: "scope, topic, tag, 날짜, 검토일, topic-level booked 상태로 정확히 좁혀 원문을 읽습니다." }),
+      element("p", { className: "lede", text: "scope, topic, tag, 작성일, 검토 기준일, 책 반영 상태가 정확히 일치하는 교훈으로 좁혀 읽습니다." }),
     ]),
     filters,
     element("div", { className: "lesson-layout" }, [

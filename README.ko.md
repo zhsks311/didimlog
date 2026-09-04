@@ -139,11 +139,21 @@ handoff URL을 terminal에 한 번 출력합니다. 그 줄을 공유·기록·�
 `--open` 없이 재실행하라는 token-free 안내만 출력합니다.
 
 첫 화면은 책장입니다. 검증한 canonical book을 scope별로 묶어 보여 주고,
-Didimlog의 기존 안전한 Markdown renderer로 메모리에서 책을 엽니다. 교훈
-화면은 metadata exact filter와 읽기 전용 원문 상세를 제공합니다. health
-panel은 개인 index, 현재 프로젝트 index, Claude 연결을 따로 표시합니다.
-개인 index가 stale, missing, extra, invalid source 상태이면 current라고
-표시하지 않습니다.
+Didimlog의 안전한 Markdown renderer로 메모리에서 책을 엽니다. 교훈 상세도
+같은 안전한 Markdown 기능을 사용해 제목, 목록, 강조, code를 읽기 편한
+문서로 표시하면서 canonical 원문을 source of truth로 유지합니다. raw HTML은
+문서 텍스트로 표시하고, 교훈의 이미지는 network를 요청하지 않는 대체
+텍스트로 표시합니다.
+
+교훈 filter는 저장된 metadata 값을 그대로 정확히 비교합니다. 화면의
+‘주제가 책에 반영됨’과 ‘주제가 책에 아직 반영되지 않음’은 내부
+`booked`/`unbooked` 상태를 설명합니다. lesson topic이 book에 반영됐는지를
+뜻할 뿐, 특정 book 문장이 그 lesson에서 왔다는 provenance는 아닙니다.
+‘검토 기준일’은 교훈을 언제 다시 살펴볼지 판단하려고 `review_by`에 기록해
+둔 날짜입니다. GUI가 이 날짜를 만들거나 overdue 상태를 추론하지 않습니다.
+health panel은 개인 index, 현재 프로젝트 index, Claude 연결을 따로
+표시합니다. 개인 index가 stale, missing, extra, invalid source 상태이면
+current라고 표시하지 않습니다.
 Milestone A는 book, lesson, index, setup, Claude 설정을 쓰지 않습니다. remote
 bind, hosted service, account, telemetry, cloud sync, book authoring, 새 lesson
 form도 없습니다. 개인 자료가 없는 static shell asset은 익명으로 제공하지만,
@@ -154,11 +164,12 @@ logical path와 opaque resource ID만 전달하며 임의 file path를 제출할
 
 GUI book render는 기존 source 4 MiB 제한을 유지하고 image당 16 MiB, raw image
 합계 64 MiB, UTF-8 body HTML 96 MiB, serialized book response 128 MiB로
-제한합니다. 책장 탐색은 source entry와 항목을 최대 10,000개까지 받고 교훈
-본문을 제외한 metadata를 8 MiB까지만 보관하며 serialized response를
-incremental하게 16 MiB로 제한합니다. 제한을 넘긴 book과 library는 세부
-내용이 가려진 `BOOK_RENDER_TOO_LARGE`와 `GUI_LIBRARY_TOO_LARGE`로 실패하며
-이후 요청은 계속 처리합니다.
+제한합니다. 교훈의 rendered body HTML은 24 MiB로 제한합니다. 책장 탐색은
+source entry와 항목을 최대 10,000개까지 받고 교훈 본문을 제외한 metadata를
+8 MiB까지만 보관하며 serialized response를 incremental하게 16 MiB로
+제한합니다. 제한을 넘긴 book, 교훈 render, library는 세부 내용이 가려진
+`BOOK_RENDER_TOO_LARGE`, `LESSON_RENDER_TOO_LARGE`,
+`GUI_LIBRARY_TOO_LARGE`로 실패하며 이후 요청은 계속 처리합니다.
 
 ### 프로젝트 지식을 팀과 공유하기
 
