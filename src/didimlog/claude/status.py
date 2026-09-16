@@ -23,6 +23,7 @@ from didimlog.connections import (
     load_state,
 )
 
+from .connect import managed_connection_present
 from .probe import Problem, _index_problem, inspect
 
 
@@ -248,6 +249,15 @@ def status_snapshot(
                 )
             elif claude_roots:
                 claude_token = "CLAUDE_DISABLED"
+            elif managed_connection_present(None, home=selected_home) is None:
+                problems.append(
+                    Problem(
+                        token="CLAUDE_CONFIG_INVALID",
+                        impact="Claude 설정을 안전하게 읽을 수 없어 연결 상태를 확인하지 못합니다.",
+                        action="didim setup",
+                    )
+                )
+                claude_token = "CLAUDE_STATUS_UNKNOWN"
             else:
                 claude_token = "CLAUDE_UNSELECTED"
 

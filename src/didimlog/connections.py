@@ -417,24 +417,36 @@ def _codex_hook(
     }
 
 
-def _managed_codex_hook(value) -> bool:
+def _codex_startup_tail(value) -> list[str] | None:
     if not isinstance(value, dict) or value.get("type") != "command":
-        return False
+        return None
     command = value.get("command")
-    if not isinstance(command, str) or "\n" in command or "\r" in command:
-        return False
+    if not isinstance(command, str):
+        return None
     try:
         arguments = shlex.split(command)
     except ValueError:
+        return None
+    for index in range(len(arguments) - 2):
+        if (
+            Path(arguments[index]).name == "didim"
+            and arguments[index + 1 : index + 3] == ["hook", "startup-check"]
+        ):
+            return arguments[index + 1 :]
+    return None
+
+
+def _codex_startup_hook(value) -> bool:
+    return _codex_startup_tail(value) is not None
+
+
+def _managed_codex_hook(value) -> bool:
+    command = value.get("command") if isinstance(value, dict) else None
+    if not isinstance(command, str) or "\n" in command or "\r" in command:
         return False
-    try:
-        index = arguments.index("hook")
-    except ValueError:
-        return False
-    tail = arguments[index:]
+    tail = _codex_startup_tail(value)
     return (
-        index > 0
-        and Path(arguments[index - 1]).name == "didim"
+        tail is not None
         and len(tail) == 8
         and tail[:5]
         == ["hook", "startup-check", "--client", "codex", "--root"]
@@ -1287,7 +1299,7 @@ def _codex_hook_residual(raw: bytes) -> bool:
             not isinstance(command, dict) for command in commands
         ):
             return True
-        if any(_managed_codex_hook(command) for command in commands):
+        if any(_codex_startup_hook(command) for command in commands):
             return True
     return False
 

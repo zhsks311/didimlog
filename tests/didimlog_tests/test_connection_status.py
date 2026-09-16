@@ -94,6 +94,36 @@ class SelectedConnectionStatusTests(unittest.TestCase):
         self.assertEqual(snapshot.claude_token, "CLAUDE_PROBLEMS")
         self.assertNotEqual(snapshot.claude_token, "CLAUDE_UNSELECTED")
 
+    def test_first_omp_selection_survives_unreadable_legacy_claude_child(self):
+        config = self.home / ".claude"
+        config.mkdir()
+        user_source = self.root / "user-claude.md"
+        user_bytes = b"# User-owned Claude instructions\n"
+        user_source.write_bytes(user_bytes)
+        (config / "CLAUDE.md").symlink_to(user_source)
+
+        def refuse_symlink_read(path, _maximum):
+            self.assertNotEqual(path, config / "CLAUDE.md")
+            return None
+
+        with mock.patch(
+            "didimlog.claude.connect.read_optional_regular_file",
+            side_effect=refuse_symlink_read,
+        ):
+            plan = self._plan(True)
+        self._apply(plan, "omp-connect-with-unreadable-claude")
+
+        self.assertTrue((config / "CLAUDE.md").is_symlink())
+        self.assertEqual(user_source.read_bytes(), user_bytes)
+        state, _ = load_state(self.home)
+        self.assertNotIn("claude", state.clients)
+        snapshot = self._snapshot()
+        self.assertEqual(snapshot.claude_token, "CLAUDE_STATUS_UNKNOWN")
+        self.assertIn(
+            "CLAUDE_CONFIG_INVALID",
+            {problem.token for problem in snapshot.problems},
+        )
+
     def test_explicit_claude_config_remains_the_diagnostic_target(self):
         recorded = self.home / ".claude-recorded"
         explicit = self.home / ".claude-explicit"

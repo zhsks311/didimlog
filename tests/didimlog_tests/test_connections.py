@@ -184,6 +184,32 @@ class ConnectionTests(unittest.TestCase):
             2,
         )
 
+    def test_modified_codex_startup_hook_is_preserved_and_reported_residual(self):
+        codex = self._root("modified-codex")
+        self._apply(self._plan("codex", codex, connect=True), "connect-codex")
+        path = codex / "hooks.json"
+        value = json.loads(path.read_text(encoding="utf-8"))
+        commands = value["hooks"]["SessionStart"][0]["hooks"]
+        commands[0]["command"] += " --cwd /tmp\n:"
+        user_hook = {"type": "command", "command": "printf user-hook"}
+        commands.append(user_hook)
+        path.write_text(json.dumps(value), encoding="utf-8")
+
+        self._apply(
+            self._plan("codex", codex, connect=False),
+            "disconnect-modified-codex",
+        )
+
+        preserved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            preserved["hooks"]["SessionStart"][0]["hooks"],
+            commands,
+        )
+        state, _ = load_state(self.home)
+        statuses, problems = inspect_connections(state, home=self.home)
+        self.assertIn("CODEX_RESIDUAL_DISCOVERY", {status.token for status in statuses})
+        self.assertIn("CODEX_RESIDUAL_DISCOVERY", {problem[0] for problem in problems})
+
     def test_apply_rejects_swapped_personal_root_without_writing_outside(self):
         omp = self._root("swapped-root")
         plan = self._plan("omp", omp, connect=True)

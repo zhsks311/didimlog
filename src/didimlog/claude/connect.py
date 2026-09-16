@@ -403,8 +403,8 @@ def managed_connection_present(
     *,
     environ: Mapping[str, str] | None = None,
     home: Path | None = None,
-) -> bool:
-    """Return whether the selected profile contains Didimlog-managed wiring."""
+) -> bool | None:
+    """Return True for managed wiring, False for absence, or None when unreadable."""
     try:
         selected, selected_home = _selected_config(
             explicit,
@@ -412,50 +412,67 @@ def managed_connection_present(
             home=home,
         )
     except ValueError:
-        return False
+        environment = os.environ if environ is None else environ
+        try:
+            selected_home = Path.home() if home is None else Path(home)
+            configured = environment.get("CLAUDE_CONFIG_DIR")
+            candidate = Path(configured) if configured else selected_home / ".claude"
+            candidate.expanduser().lstat()
+        except FileNotFoundError:
+            return False
+        except (OSError, RuntimeError, TypeError):
+            return None
+        return None
+
+    unknown = False
     try:
         resource_directory_exists = _resource_directory_exists(selected)
     except (OSError, ValueError):
-        return True
+        resource_directory_exists = False
+        unknown = True
     if resource_directory_exists:
         for name, _packaged in _packaged_resources():
-            path = _target(selected, "didimlog/" + name, selected_home)
             try:
+                path = _target(selected, "didimlog/" + name, selected_home)
                 path.lstat()
             except FileNotFoundError:
                 continue
-            except OSError:
-                return True
+            except (OSError, ValueError):
+                unknown = True
+                continue
             return True
 
-    claude_path = _target(selected, "CLAUDE.md", selected_home)
     try:
+        claude_path = _target(selected, "CLAUDE.md", selected_home)
         claude_original = read_optional_regular_file(
             claude_path,
             _MANAGED_FILE_MAXIMUM_BYTES,
         )
     except (OSError, ValueError):
         claude_original = None
+        unknown = True
     if claude_original is not None and (
         config_module._START_PREFIX in claude_original
         or config_module._END_PREFIX in claude_original
     ):
         return True
 
-    settings_path = _target(selected, "settings.json", selected_home)
     try:
+        settings_path = _target(selected, "settings.json", selected_home)
         settings_original = read_optional_regular_file(
             settings_path,
             _MANAGED_FILE_MAXIMUM_BYTES,
         )
     except (OSError, ValueError):
-        return False
-    if settings_original is None:
-        return False
-    try:
-        return _remove_managed_hooks(settings_original) != settings_original
-    except ValueError:
-        return False
+        settings_original = None
+        unknown = True
+    if settings_original is not None:
+        try:
+            if _remove_managed_hooks(settings_original) != settings_original:
+                return True
+        except ValueError:
+            unknown = True
+    return None if unknown else False
 
 
 def _delete_unchanged(change: _FileChange) -> None:
