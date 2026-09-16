@@ -38,6 +38,12 @@ from didimlog.project.scaffold import (
 from .connect import ClaudeChangePlan, apply_connect, plan_connect
 from .probe import inspect
 from .transaction import InstallJournal
+from didimlog.connections import (
+    ConnectionPlan,
+    apply_connections,
+    plan_connections,
+    postcheck_connections,
+)
 
 
 @dataclass(frozen=True)
@@ -55,11 +61,14 @@ class SetupPlan:
     project_changes: tuple[str, ...]
     project_notices: tuple[str, ...]
     claude_changes: tuple[str, ...]
+    connection_changes: tuple[tuple[str, tuple[str, ...]], ...]
+    connection_notices: tuple[str, ...]
     _personal: _PersonalSetupPlan = field(repr=False, compare=False)
     _project: ScaffoldPlan | None = field(repr=False, compare=False)
     _project_exclude: GitExcludePlan | None = field(repr=False, compare=False)
     _project_root: Path | None = field(repr=False, compare=False)
     _claude: ClaudeChangePlan | None = field(repr=False, compare=False)
+    _connections: ConnectionPlan | None = field(repr=False, compare=False)
 
 
 def _find_launcher() -> str | None:
@@ -164,6 +173,9 @@ def plan_setup(
     include_project: bool,
     skip_claude: bool,
     project_knowledge: str = "local",
+    clients: tuple[str, ...] | None = None,
+    omp_agent_dir=None,
+    codex_home=None,
 ) -> SetupPlan:
     """Preflight every requested surface and return one deterministic summary."""
     personal_plan, personal_changes = _plan_personal(home)
@@ -197,19 +209,47 @@ def plan_setup(
     else:
         project_changes = ()
 
+    requested_clients = (
+        (() if skip_claude else ("claude",))
+        if clients is None
+        else tuple(dict.fromkeys(clients))
+    )
     claude_plan: ClaudeChangePlan | None = None
-    if skip_claude:
-        claude_changes = ()
-    else:
-        launcher = _find_launcher()
-        if launcher is None:
+    launcher: Path | None = None
+    if requested_clients:
+        found = _find_launcher()
+        if found is None:
             raise ValueError("didim launcher is unavailable")
+        launcher = Path(found)
+    if "claude" in requested_clients:
         claude_plan = plan_connect(
             config,
-            launcher=Path(launcher),
+            launcher=launcher,
             home=personal_plan.home,
         )
         claude_changes = claude_plan.changes
+    else:
+        claude_changes = ()
+
+    connection_plan: ConnectionPlan | None = None
+    if requested_clients:
+        roots = {
+            "claude": None if claude_plan is None else claude_plan.config_dir,
+            "omp": omp_agent_dir,
+            "codex": codex_home,
+        }
+        connection_plan = plan_connections(
+            tuple((client, roots[client]) for client in requested_clients),
+            launcher=launcher,
+            home=personal_plan.home,
+            connect=True,
+            require_storage=False,
+        )
+        connection_changes = (("선택한 도구 연결", connection_plan.changes),)
+        connection_notices = connection_plan.notices
+    else:
+        connection_changes = ()
+        connection_notices = ()
 
     return SetupPlan(
         version=didimlog_version(),
@@ -217,11 +257,14 @@ def plan_setup(
         project_changes=project_changes,
         project_notices=project_notices,
         claude_changes=claude_changes,
+        connection_changes=connection_changes,
+        connection_notices=connection_notices,
         _personal=personal_plan,
         _project=project_plan,
         _project_exclude=project_exclude,
         _project_root=project_root,
         _claude=claude_plan,
+        _connections=connection_plan,
     )
 
 
@@ -319,6 +362,8 @@ def _postcheck(plan: SetupPlan) -> tuple[str, ...]:
                 project_current = False
             if not project_current:
                 raise DidimError("SETUP_POSTCHECK_FAILED", exit_code=EXIT_POLICY)
+    if plan._connections is not None:
+        postcheck_connections(plan._connections)
 
 
     if plan._project_exclude is None:
@@ -377,7 +422,13 @@ def apply_setup(plan: SetupPlan, *, approved: bool) -> tuple[str, ...]:
     if plan._project_exclude is not None:
         apply_git_exclude(plan._project_exclude)
 
-    if plan._claude is None or not plan._claude.changes:
+    if (
+        (plan._claude is None or not plan._claude.changes)
+        and (
+            plan._connections is None
+            or not plan._connections.changes
+        )
+    ):
         return _postcheck(plan)
 
     with tempfile.TemporaryDirectory(
@@ -389,8 +440,27 @@ def apply_setup(plan: SetupPlan, *, approved: bool) -> tuple[str, ...]:
             reset=True,
         )
         try:
-            apply_connect(plan._claude, journal)
+            if plan._claude is not None and plan._claude.changes:
+                apply_connect(
+                    plan._claude,
+                    journal,
+                    rollback_on_error=False,
+                )
+            if plan._connections is not None:
+                apply_connections(
+                    plan._connections,
+                    journal,
+                    rollback_on_error=False,
+                )
             return _postcheck(plan)
-        except BaseException:
-            journal.rollback()
+        except BaseException as error:
+            failed = journal.rollback()
+            if failed:
+                raise DidimError(
+                    "CONNECTION_ROLLBACK_INCOMPLETE",
+                    exit_code=EXIT_POLICY,
+                    details=tuple(
+                        "대상: " + name for name in sorted(set(failed))
+                    ),
+                ) from error
             raise

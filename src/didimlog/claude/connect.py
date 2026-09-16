@@ -231,22 +231,40 @@ def _apply_writes(plan: ClaudeChangePlan, journal: InstallJournal) -> None:
             change.original,
             backup,
         )
-        write_regular_file_if_unchanged(
-            change.path,
-            change.original,
-            change.intended,
-        )
+        try:
+            write_regular_file_if_unchanged(
+                change.path,
+                change.original,
+                change.intended,
+            )
+        except BaseException:
+            try:
+                current = read_optional_regular_file(
+                    change.path,
+                    max(len(change.intended), _MANAGED_FILE_MAXIMUM_BYTES),
+                )
+                if current == change.intended:
+                    journal.record_installed(change.name, change.intended)
+            except (OSError, ValueError):
+                pass
+            raise
         journal.record_installed(change.name, change.intended)
 
 
-def apply_connect(plan: ClaudeChangePlan, journal: InstallJournal) -> None:
+def apply_connect(
+    plan: ClaudeChangePlan,
+    journal: InstallJournal,
+    *,
+    rollback_on_error: bool = True,
+) -> None:
     """Apply an approved connect plan and rollback only unchanged owned bytes."""
     if not isinstance(plan, ClaudeChangePlan):
         raise ValueError("invalid Claude connect plan")
     try:
         _apply_writes(plan, journal)
     except BaseException:
-        journal.rollback()
+        if rollback_on_error:
+            journal.rollback()
         raise
 
 
@@ -378,6 +396,66 @@ def plan_disconnect(
             changes.append("관리 지침 제거: {}".format(path))
 
     return ClaudeChangePlan(selected, tuple(changes), tuple(file_changes))
+
+
+def managed_connection_present(
+    explicit=None,
+    *,
+    environ: Mapping[str, str] | None = None,
+    home: Path | None = None,
+) -> bool:
+    """Return whether the selected profile contains Didimlog-managed wiring."""
+    try:
+        selected, selected_home = _selected_config(
+            explicit,
+            environ=environ,
+            home=home,
+        )
+    except ValueError:
+        return False
+    try:
+        resource_directory_exists = _resource_directory_exists(selected)
+    except (OSError, ValueError):
+        return True
+    if resource_directory_exists:
+        for name, _packaged in _packaged_resources():
+            path = _target(selected, "didimlog/" + name, selected_home)
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return True
+            return True
+
+    claude_path = _target(selected, "CLAUDE.md", selected_home)
+    try:
+        claude_original = read_optional_regular_file(
+            claude_path,
+            _MANAGED_FILE_MAXIMUM_BYTES,
+        )
+    except (OSError, ValueError):
+        claude_original = None
+    if claude_original is not None and (
+        config_module._START_PREFIX in claude_original
+        or config_module._END_PREFIX in claude_original
+    ):
+        return True
+
+    settings_path = _target(selected, "settings.json", selected_home)
+    try:
+        settings_original = read_optional_regular_file(
+            settings_path,
+            _MANAGED_FILE_MAXIMUM_BYTES,
+        )
+    except (OSError, ValueError):
+        return False
+    if settings_original is None:
+        return False
+    try:
+        return _remove_managed_hooks(settings_original) != settings_original
+    except ValueError:
+        return False
 
 
 def _delete_unchanged(change: _FileChange) -> None:

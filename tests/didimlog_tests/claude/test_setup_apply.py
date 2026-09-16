@@ -7,6 +7,9 @@ from pathlib import Path
 from unittest import mock
 
 from didimlog.claude import setup as setup_module
+from didimlog.claude.connect import apply_disconnect, plan_disconnect
+from didimlog.claude.transaction import InstallJournal
+from didimlog.connections import apply_connections, load_state, plan_connections
 from didimlog.claude.setup import apply_setup, plan_setup
 from didimlog.errors import DidimError
 from didimlog.indexing import run_index
@@ -424,6 +427,49 @@ class SetupApplyTests(unittest.TestCase):
 
         self.assertEqual(self._snapshot(self.root), before)
 
+    def test_default_setup_reconnects_existing_disconnected_claude_selection(self):
+        self._apply(self._plan())
+        disconnect_files = plan_disconnect(
+            self.config,
+            environ={},
+            home=self.home,
+        )
+        disconnect_selection = plan_connections(
+            (("claude", disconnect_files.config_dir),),
+            launcher=self.launcher,
+            home=self.home,
+            environ={},
+            connect=False,
+            require_storage=True,
+        )
+        journal = InstallJournal(
+            self.root / "disconnect-claude.json",
+            reset=True,
+        )
+        apply_connections(disconnect_selection, journal)
+        apply_disconnect(disconnect_files, journal)
+        state, _ = load_state(self.home)
+        self.assertEqual(
+            state.clients["claude"][str(self.config.resolve())].intent,
+            "disconnected",
+        )
+        self.assertNotIn(
+            "didim",
+            (self.config / "settings.json").read_text(encoding="utf-8"),
+        )
+
+        reconnect = self._plan()
+        self.assertIsNotNone(reconnect._connections)
+        self._apply(reconnect)
+
+        state, _ = load_state(self.home)
+        self.assertEqual(
+            state.clients["claude"][str(self.config.resolve())].intent,
+            "connected",
+        )
+        self.assertTrue((self.config / "CLAUDE.md").is_file())
+        self.assertTrue((self.config / "settings.json").is_file())
+
     def test_personal_failure_starts_neither_project_nor_claude(self):
         plan = self._plan()
         with mock.patch(
@@ -540,8 +586,8 @@ class SetupApplyTests(unittest.TestCase):
         plan = self._plan()
         real_apply_connect = setup_module.apply_connect
 
-        def connect_then_track(claude_plan, journal):
-            real_apply_connect(claude_plan, journal)
+        def connect_then_track(claude_plan, journal, **kwargs):
+            real_apply_connect(claude_plan, journal, **kwargs)
             self._git(
                 self.project,
                 "add",

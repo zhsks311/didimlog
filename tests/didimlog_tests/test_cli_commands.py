@@ -477,7 +477,8 @@ class CliCommandSurfaceTests(unittest.TestCase):
         ) as connect, mock.patch("didimlog.cli.apply_connect"), mock.patch(
             "didimlog.cli.plan_disconnect", return_value=disconnect_plan
         ) as disconnect, mock.patch("didimlog.cli.apply_disconnect"), mock.patch(
-            "didimlog.cli.status_text", return_value="status\n"
+            "didimlog.cli._claude_selection_plan", return_value=None
+        ), mock.patch("didimlog.cli.status_text", return_value="status\n"
         ) as status, mock.patch(
             "didimlog.cli.doctor_text", return_value=(3, "doctor\n")
         ) as doctor:

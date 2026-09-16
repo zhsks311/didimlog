@@ -69,6 +69,19 @@ If setup completed successfully, you can verify the following status. The projec
 Claude 연결: 정상
 ```
 
+#### Optional: connect OMP or Codex CLI
+
+Choose clients explicitly during setup. Repeating `--client` adds each selected client without changing the others:
+
+```sh
+didim setup --client claude --client omp --client codex --dry-run
+didim setup --client claude --client omp --client codex --yes
+```
+
+Use `--omp-agent-dir` or `--codex-home` when the active client uses a non-default root. The same roots can be managed later with `didim connect omp|codex --dry-run` and `--yes`, or removed with `didim disconnect omp|codex --dry-run` and `--yes`. Didimlog removes only unchanged files it installed; shared or foreign discovery files may remain and are reported instead of being deleted.
+
+The integration targets OMP 18.1.16 or newer and Codex CLI 0.154.0 or newer. Didimlog does not execute either host CLI while planning or during `--dry-run`; confirm the installed versions separately. OMP and Codex run a bounded, read-only startup advisory for the selected root after connection. A quiet result means the managed connection files and the global index exist; it does not prove index freshness or a successful model session. Codex trust approval remains a manual Codex action. `didim status` reports these clients as installed but unverified until a real new host session is checked.
+
 ### 4. Save Your First Lesson
 
 Lessons accept Markdown source through standard input. The following example includes the execution time in the slug, so repeated runs do not overwrite an existing lesson.

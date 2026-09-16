@@ -69,6 +69,19 @@ didim status
 Claude 연결: 정상
 ```
 
+#### 선택 사항: OMP 또는 Codex CLI 연결
+
+설정할 때 사용할 도구를 직접 고를 수 있습니다. `--client`를 반복하면 다른 연결은 건드리지 않고 선택한 도구를 함께 추가합니다.
+
+```sh
+didim setup --client claude --client omp --client codex --dry-run
+didim setup --client claude --client omp --client codex --yes
+```
+
+실제로 쓰는 도구의 경로가 기본값과 다르면 `--omp-agent-dir` 또는 `--codex-home`을 함께 지정합니다. 이후 같은 경로를 `didim connect omp|codex --dry-run`과 `--yes`로 연결하거나, `didim disconnect omp|codex --dry-run`과 `--yes`로 해제할 수 있습니다. Didimlog는 자신이 설치했고 바뀌지 않은 파일만 지웁니다. 다른 도구와 공유하거나 Didimlog가 만들지 않은 자동 발견 파일이 남을 수 있으면 지우지 않고 안내합니다.
+
+이 연결은 OMP 18.1.16 이상과 Codex CLI 0.154.0 이상을 대상으로 합니다. Didimlog는 변경 계획을 만들거나 `--dry-run`을 실행할 때 두 도구의 명령을 실행하지 않으므로, 설치된 버전은 따로 확인해야 합니다. 연결한 뒤 OMP와 Codex는 선택한 경로에 대해 실행 시간과 입출력 크기를 제한한 읽기 전용 시작 확인을 실행합니다. 아무 안내가 없으면 관리 중인 연결 파일과 전역 index 파일이 있다는 뜻입니다. index가 최신인지 또는 실제 모델 세션이 성공했는지는 뜻하지 않습니다. Codex의 신뢰 승인은 Codex에서 사용자가 직접 해야 합니다. 실제 새 도구 세션을 확인하기 전까지 `didim status`는 설치됐지만 실행은 확인하지 않은 상태로 표시합니다.
+
 ### 4. 첫 교훈 저장
 
 교훈은 Markdown 원문을 표준 입력으로 받습니다. 아래 예시는 실행 시각을 slug에 넣으므로 반복해도 기존 교훈을 덮어쓰지 않습니다.

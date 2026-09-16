@@ -22,6 +22,7 @@ from didimlog.claude.hook import session_start
 from didimlog.claude.setup import apply_setup, plan_setup
 from didimlog.claude.status import doctor_text, status_text
 from didimlog.claude.transaction import InstallJournal
+from didimlog.connections import apply_connections, load_state, plan_connections
 from didimlog.errors import (
     DidimError,
     EXIT_POLICY,
@@ -47,6 +48,7 @@ from didimlog.personal.lesson_writing import (
 )
 from didimlog.project.capture import CaptureRequest, capture
 from didimlog.project.git_exclude import discover_project_for_setup
+from didimlog.startup import startup_check
 from didimlog.update import automatic_update_notice
 
 
@@ -56,7 +58,11 @@ _STDIN_MAX_BYTES = 64 * 1024
 _COMMANDS = """\
 didim setup
 didim connect claude
+didim connect omp
+didim connect codex
 didim disconnect claude
+didim disconnect omp
+didim disconnect codex
 didim add lesson
 didim add observation
 didim add experiment
@@ -138,6 +144,22 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--yes", action="store_true", help="변경 계획 승인")
     setup.add_argument("--skip-claude", action="store_true", help="Claude 연결 건너뛰기")
     setup.add_argument(
+        "--client",
+        action="append",
+        choices=("claude", "omp", "codex"),
+        help="추가하거나 수리할 연결 (반복 가능)",
+    )
+    setup.add_argument(
+        "--omp-agent-dir",
+        type=Path,
+        help="실제로 사용하는 OMP agent 디렉터리",
+    )
+    setup.add_argument(
+        "--codex-home",
+        type=Path,
+        help="실제로 사용하는 CODEX_HOME",
+    )
+    setup.add_argument(
         "--project-knowledge",
         choices=("local", "shared"),
         help="프로젝트 지식을 이 컴퓨터에만 둘지 Git으로 공유할지 선택",
@@ -152,6 +174,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config(connect_claude)
     connect_claude.add_argument("--yes", action="store_true", help="변경 계획 승인")
     connect_claude.set_defaults(_handler=_connect_claude, _help_parser=connect_claude)
+    connect_omp = connect_tools.add_parser("omp", help="OMP 연결")
+    connect_omp.add_argument("--omp-agent-dir", type=Path)
+    connect_omp.add_argument("--dry-run", action="store_true", help="변경 계획만 표시")
+    connect_omp.add_argument("--yes", action="store_true", help="변경 계획 승인")
+    connect_omp.set_defaults(_handler=_connect_client, _help_parser=connect_omp)
+    connect_codex = connect_tools.add_parser("codex", help="Codex CLI 연결")
+    connect_codex.add_argument("--codex-home", type=Path)
+    connect_codex.add_argument("--dry-run", action="store_true", help="변경 계획만 표시")
+    connect_codex.add_argument("--yes", action="store_true", help="변경 계획 승인")
+    connect_codex.set_defaults(_handler=_connect_client, _help_parser=connect_codex)
 
     disconnect = commands.add_parser("disconnect", help="도구 연결 해제")
     disconnect.set_defaults(_help_parser=disconnect)
@@ -167,6 +199,24 @@ def build_parser() -> argparse.ArgumentParser:
     disconnect_claude.set_defaults(
         _handler=_disconnect_claude,
         _help_parser=disconnect_claude,
+    )
+    disconnect_omp = disconnect_tools.add_parser("omp", help="OMP 연결 해제")
+    disconnect_omp.add_argument("--omp-agent-dir", type=Path)
+    disconnect_omp.add_argument("--dry-run", action="store_true", help="변경 계획만 표시")
+    disconnect_omp.add_argument("--yes", action="store_true", help="변경 계획 승인")
+    disconnect_omp.set_defaults(
+        _handler=_disconnect_client,
+        _help_parser=disconnect_omp,
+    )
+    disconnect_codex = disconnect_tools.add_parser(
+        "codex", help="Codex CLI 연결 해제"
+    )
+    disconnect_codex.add_argument("--codex-home", type=Path)
+    disconnect_codex.add_argument("--dry-run", action="store_true", help="변경 계획만 표시")
+    disconnect_codex.add_argument("--yes", action="store_true", help="변경 계획 승인")
+    disconnect_codex.set_defaults(
+        _handler=_disconnect_client,
+        _help_parser=disconnect_codex,
     )
 
     add = commands.add_parser("add", help="새 자료 저장")
@@ -224,6 +274,15 @@ def build_parser() -> argparse.ArgumentParser:
     hook_types = hook.add_subparsers(dest="hook_type", metavar="hook")
     session = hook_types.add_parser("session-start", help="세션 시작 상태 확인")
     session.set_defaults(_handler=_session_start, _help_parser=session)
+    startup = hook_types.add_parser(
+        "startup-check",
+        help=argparse.SUPPRESS,
+    )
+    startup.add_argument("--client", required=True, choices=("omp", "codex"))
+    startup.add_argument("--root", required=True, type=Path)
+    startup.add_argument("--revision", required=True)
+    startup.add_argument("--cwd")
+    startup.set_defaults(_handler=_startup_check, _help_parser=startup)
     return parser
 
 
@@ -235,11 +294,12 @@ def _safe_output_text(value: str) -> str:
 
 
 def _summary(plan) -> str:
-    groups = (
+    groups = [
         ("개인 교훈", plan.personal_changes),
         ("프로젝트 근거", plan.project_changes),
         ("Claude 연결", plan.claude_changes),
-    )
+    ]
+    groups.extend(getattr(plan, "connection_changes", ()))
     lines = ["Didimlog {} 변경 계획".format(plan.version)]
     for label, changes in groups:
         lines.extend(("", label))
@@ -248,11 +308,14 @@ def _summary(plan) -> str:
             if changes
             else ("- 변경 없음",)
         )
-    if plan.project_notices:
+    notices = tuple(plan.project_notices) + tuple(
+        getattr(plan, "connection_notices", ())
+    )
+    if notices:
         lines.extend(("", "안내"))
         lines.extend(
             "- {}".format(_safe_output_text(notice))
-            for notice in plan.project_notices
+            for notice in dict.fromkeys(notices)
         )
     return "\n".join(lines) + "\n"
 
@@ -288,6 +351,27 @@ def _print_notices(notices) -> None:
 def _setup(args) -> int:
     if args.dry_run and args.yes:
         raise DidimError("CLI_USAGE_ERROR", exit_code=EXIT_USAGE)
+    selected_clients = None if args.client is None else tuple(dict.fromkeys(args.client))
+    if (
+        selected_clients is not None
+        and args.skip_claude
+        and "claude" in selected_clients
+    ):
+        raise DidimError("CLI_USAGE_ERROR", exit_code=EXIT_USAGE)
+    if (
+        selected_clients is not None
+        and "claude" not in selected_clients
+        and args.config_dir is not None
+    ):
+        raise DidimError("CLI_USAGE_ERROR", exit_code=EXIT_USAGE)
+    if args.omp_agent_dir is not None and (
+        selected_clients is None or "omp" not in selected_clients
+    ):
+        raise DidimError("CLI_USAGE_ERROR", exit_code=EXIT_USAGE)
+    if args.codex_home is not None and (
+        selected_clients is None or "codex" not in selected_clients
+    ):
+        raise DidimError("CLI_USAGE_ERROR", exit_code=EXIT_USAGE)
     mode = _project_knowledge_mode(args)
     plan = plan_setup(
         home=None,
@@ -296,6 +380,9 @@ def _setup(args) -> int:
         include_project=True,
         skip_claude=args.skip_claude,
         project_knowledge=mode,
+        clients=selected_clients,
+        omp_agent_dir=args.omp_agent_dir,
+        codex_home=args.codex_home,
     )
     print(_summary(plan), end="")
     if args.dry_run:
@@ -318,6 +405,7 @@ def _setup(args) -> int:
             return 0
     final_notices = apply_setup(plan, approved=approved)
     planned_notices = set(plan.project_notices)
+    planned_notices.update(getattr(plan, "connection_notices", ()))
     new_notices = []
     for notice in final_notices:
         if notice in planned_notices:
@@ -340,10 +428,61 @@ def _find_launcher() -> Path:
     return Path(executable).resolve(strict=True)
 
 
-def _apply_claude(plan, apply) -> None:
+
+def _claude_selection_plan(config_dir: Path, launcher: Path, *, connect: bool):
+    home = Path.home().absolute()
+    try:
+        state, _ = load_state(home)
+    except ValueError as error:
+        raise DidimError("CONNECTION_STATE_INVALID", exit_code=EXIT_POLICY) from error
+    if state is None:
+        return None
+    return plan_connections(
+        (("claude", config_dir),),
+        launcher=launcher,
+        home=home,
+        connect=connect,
+        require_storage=True,
+    )
+
+
+def _apply_claude_with_selection(
+    claude_plan,
+    connection_plan,
+    *,
+    connect: bool,
+) -> None:
     with tempfile.TemporaryDirectory(prefix="didimlog-cli-") as directory:
         journal = InstallJournal(Path(directory) / "journal.json", reset=True)
-        apply(plan, journal)
+        if connect:
+            try:
+                apply_connect(
+                    claude_plan,
+                    journal,
+                    rollback_on_error=False,
+                )
+                if connection_plan is not None:
+                    apply_connections(
+                        connection_plan,
+                        journal,
+                        rollback_on_error=False,
+                    )
+            except BaseException as error:
+                failed = journal.rollback()
+                if failed:
+                    raise DidimError(
+                        "CONNECTION_ROLLBACK_INCOMPLETE",
+                        exit_code=EXIT_POLICY,
+                        details=tuple(
+                            "대상: " + name
+                            for name in sorted(set(failed))
+                        ),
+                    ) from error
+                raise
+        else:
+            if connection_plan is not None:
+                apply_connections(connection_plan, journal)
+            apply_disconnect(claude_plan, journal)
 
 
 def _print_changes(title: str, changes: tuple[str, ...]) -> None:
@@ -354,9 +493,9 @@ def _print_changes(title: str, changes: tuple[str, ...]) -> None:
     else:
         print("- 변경 없음")
 
-
 def _connect_claude(args) -> int:
-    plan = plan_connect(args.config_dir, launcher=_find_launcher())
+    launcher = _find_launcher()
+    plan = plan_connect(args.config_dir, launcher=launcher)
     _print_changes("Claude 연결", plan.changes)
     if args.yes:
         approved = True
@@ -374,14 +513,85 @@ def _connect_claude(args) -> int:
         if not approved:
             print("변경하지 않았습니다.")
             return 0
-    _apply_claude(plan, apply_connect)
+    connection_plan = _claude_selection_plan(
+        plan.config_dir,
+        launcher,
+        connect=True,
+    )
+    _apply_claude_with_selection(plan, connection_plan, connect=True)
+    return 0
+
+def _disconnect_claude(args) -> int:
+    launcher = _find_launcher()
+    plan = plan_disconnect(args.config_dir)
+    connection_plan = _claude_selection_plan(
+        plan.config_dir,
+        launcher,
+        connect=False,
+    )
+    _print_changes("Claude 연결 해제", plan.changes)
+    _apply_claude_with_selection(plan, connection_plan, connect=False)
     return 0
 
 
-def _disconnect_claude(args) -> int:
-    plan = plan_disconnect(args.config_dir)
-    _print_changes("Claude 연결 해제", plan.changes)
-    _apply_claude(plan, apply_disconnect)
+def _client_root(args, client: str):
+    return args.omp_agent_dir if client == "omp" else args.codex_home
+
+
+def _apply_connection_cli(plan) -> None:
+    with tempfile.TemporaryDirectory(prefix="didimlog-connection-") as directory:
+        journal = InstallJournal(Path(directory) / "journal.json", reset=True)
+        apply_connections(plan, journal)
+
+
+def _approve_client_change(args, *, client: str, action: str) -> bool:
+    if args.dry_run:
+        return False
+    if args.yes:
+        return True
+    if not sys.stdin.isatty():
+        raise DidimError(
+            "{}_{}_APPROVAL_REQUIRED".format(client.upper(), action.upper()),
+            exit_code=EXIT_USAGE,
+            help_text="변경 요약을 확인한 뒤 --yes를 사용하세요.",
+        )
+    approved = input("이 변경을 적용할까요? [y/N]: ").strip().lower() in {
+        "y",
+        "yes",
+    }
+    if not approved:
+        args._change_declined = True
+        print("변경하지 않았습니다.")
+    return approved
+
+
+def _plan_client(args, *, connect: bool):
+    client = args.connect_tool if connect else args.disconnect_tool
+    if args.dry_run and args.yes:
+        raise DidimError("CLI_USAGE_ERROR", exit_code=EXIT_USAGE)
+    return client, plan_connections(
+        ((client, _client_root(args, client)),),
+        launcher=_find_launcher(),
+        connect=connect,
+        require_storage=True,
+    )
+
+
+def _connect_client(args) -> int:
+    client, plan = _plan_client(args, connect=True)
+    _print_changes("{} 연결".format(client.upper()), plan.changes)
+    _print_notices(plan.notices)
+    if _approve_client_change(args, client=client, action="connect"):
+        _apply_connection_cli(plan)
+    return 0
+
+
+def _disconnect_client(args) -> int:
+    client, plan = _plan_client(args, connect=False)
+    _print_changes("{} 연결 해제".format(client.upper()), plan.changes)
+    _print_notices(plan.notices)
+    if _approve_client_change(args, client=client, action="disconnect"):
+        _apply_connection_cli(plan)
     return 0
 
 
@@ -496,6 +706,17 @@ def _session_start(args) -> int:
     return session_start(sys.stdin, sys.stdout)
 
 
+def _startup_check(args) -> int:
+    return startup_check(
+        client=args.client,
+        root=args.root,
+        revision=args.revision,
+        cwd=args.cwd,
+        stdin=sys.stdin,
+        stdout=sys.stdout,
+    )
+
+
 def _as_didim_error(error: Exception) -> DidimError:
     if isinstance(error, DidimError):
         return error
@@ -530,6 +751,11 @@ def _automatic_update_eligible(parsed, *, real_invocation: bool) -> bool:
     if parsed.command in ("gui", "hook"):
         return False
     if parsed.command == "setup" and parsed.dry_run:
+        return False
+    if parsed.command in ("connect", "disconnect") and (
+        getattr(parsed, "dry_run", False)
+        or getattr(parsed, "_change_declined", False)
+    ):
         return False
     return True
 
