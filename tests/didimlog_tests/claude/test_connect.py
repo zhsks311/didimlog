@@ -15,6 +15,7 @@ from didimlog.claude.connect import (
 )
 from didimlog.claude.config import render_managed_block
 from didimlog.claude.transaction import InstallJournal
+from didimlog.errors import DidimError
 
 
 RESOURCE_NAMES = (
@@ -89,8 +90,18 @@ class ConcurrentSecondClaudeWriteJournal(InstallJournal):
         self.first_target: Path | None = None
         self.second_target: Path | None = None
 
-    def record_installed(self, name: str, data: bytes) -> None:
-        super().record_installed(name, data)
+    def record_installed(
+        self,
+        name: str,
+        data: bytes,
+        *,
+        parent_descriptor: int | None = None,
+    ) -> None:
+        super().record_installed(
+            name,
+            data,
+            parent_descriptor=parent_descriptor,
+        )
         target = Path(self.data["targets"][name]["path"])
         if self.first_target is not None or target.name not in {
             "CLAUDE.md",
@@ -561,6 +572,36 @@ class DisconnectTests(unittest.TestCase):
 
 
 class ConnectRollbackTests(unittest.TestCase):
+    def test_same_byte_file_created_after_plan_is_preserved_as_foreign(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            home = root / "home"
+            config = home / ".claude"
+            config.mkdir(parents=True)
+            launcher = make_launcher(home)
+            plan = plan_connect(
+                config,
+                launcher=launcher,
+                environ={},
+                home=home,
+            )
+            settings_change = next(
+                change for change in plan._files if change.name == "settings"
+            )
+            settings_change.path.write_bytes(settings_change.intended)
+            independent = settings_change.path.read_bytes()
+
+            with self.assertRaises(ValueError):
+                apply_connect(
+                    plan,
+                    make_journal(root, "same-byte-concurrent-create"),
+                )
+
+            self.assertEqual(settings_change.path.read_bytes(), independent)
+            self.assertFalse((config / "CLAUDE.md").exists())
+            for name in RESOURCE_NAMES:
+                self.assertFalse((config / "didimlog" / name).exists())
+
     def test_second_claude_write_failure_rolls_back_owned_bytes_but_preserves_user_edits_and_data(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -598,8 +639,12 @@ class ConnectRollbackTests(unittest.TestCase):
                 settings,
             )
 
-            with self.assertRaises(ValueError):
+            with self.assertRaises(DidimError) as caught:
                 apply_connect(plan, journal)
+            self.assertEqual(
+                caught.exception.token,
+                "CONNECTION_ROLLBACK_INCOMPLETE",
+            )
 
             self.assertIsNotNone(journal.first_target)
             self.assertIsNotNone(journal.second_target)

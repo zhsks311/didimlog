@@ -459,6 +459,10 @@ def apply_setup(plan: SetupPlan, *, approved: bool) -> tuple[str, ...]:
                 raise DidimError(
                     "CONNECTION_ROLLBACK_INCOMPLETE",
                     exit_code=EXIT_POLICY,
+                    help_text=(
+                        "연결 파일을 보존했지만 변경을 완전히 되돌렸는지 확인할 수 없습니다. "
+                        "didim doctor로 상태를 확인하세요."
+                    ),
                     details=tuple(
                         "대상: " + name for name in sorted(set(failed))
                     ),

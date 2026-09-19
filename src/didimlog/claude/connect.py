@@ -12,10 +12,14 @@ import secrets
 import stat
 from collections.abc import Mapping
 
+from didimlog import conditional_file as conditional_file_module
 from didimlog.conditional_file import (
+    ConditionalWriteRecoveryError,
     read_optional_regular_file,
     write_regular_file_if_unchanged,
+    write_regular_file_at_if_unchanged,
 )
+from didimlog.errors import DidimError, EXIT_POLICY
 from didimlog.file_io import (
     UnsafePathError,
     open_directory_path,
@@ -231,24 +235,38 @@ def _apply_writes(plan: ClaudeChangePlan, journal: InstallJournal) -> None:
             change.original,
             backup,
         )
+        target = conditional_file_module._target_path(change.path)
+        parent_descriptor = conditional_file_module._open_parent(target)
+        ownership: int | None = None
         try:
-            write_regular_file_if_unchanged(
-                change.path,
+            conditional_file_module._verify_parent(target, parent_descriptor)
+            ownership = write_regular_file_at_if_unchanged(
+                parent_descriptor,
+                target.name,
                 change.original,
                 change.intended,
             )
-        except BaseException:
+            if ownership is None:
+                raise ValueError("Claude connect change was not published")
             try:
-                current = read_optional_regular_file(
-                    change.path,
-                    max(len(change.intended), _MANAGED_FILE_MAXIMUM_BYTES),
-                )
-                if current == change.intended:
-                    journal.record_installed(change.name, change.intended)
-            except (OSError, ValueError):
-                pass
-            raise
-        journal.record_installed(change.name, change.intended)
+                conditional_file_module._verify_parent(target, parent_descriptor)
+            except BaseException:
+                if ownership is not None:
+                    journal.record_installed(
+                        change.name,
+                        change.intended,
+                        parent_descriptor=parent_descriptor,
+                    )
+                raise
+            journal.record_installed(
+                change.name,
+                change.intended,
+                parent_descriptor=parent_descriptor,
+            )
+        finally:
+            if ownership is not None:
+                os.close(ownership)
+            os.close(parent_descriptor)
 
 
 def apply_connect(
@@ -262,9 +280,20 @@ def apply_connect(
         raise ValueError("invalid Claude connect plan")
     try:
         _apply_writes(plan, journal)
-    except BaseException:
-        if rollback_on_error:
-            journal.rollback()
+    except BaseException as error:
+        failed = journal.rollback() if rollback_on_error else ()
+        if failed or isinstance(error, ConditionalWriteRecoveryError):
+            raise DidimError(
+                "CONNECTION_ROLLBACK_INCOMPLETE",
+                exit_code=EXIT_POLICY,
+                help_text=(
+                    "연결 파일을 보존했지만 변경을 완전히 되돌렸는지 확인할 수 없습니다. "
+                    "didim doctor로 상태를 확인하세요."
+                ),
+                details=tuple(
+                    "대상: " + name for name in sorted(set(failed))
+                ),
+            ) from error
         raise
 
 

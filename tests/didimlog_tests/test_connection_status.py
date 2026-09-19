@@ -5,7 +5,7 @@ from unittest import mock
 
 from didimlog.claude.connect import apply_connect, plan_connect
 from didimlog.claude.probe import Problem
-from didimlog.claude.status import status_snapshot, status_text
+from didimlog.claude.status import doctor_text, status_snapshot, status_text
 from didimlog.claude.transaction import InstallJournal
 from didimlog.connections import (
     apply_connections,
@@ -205,6 +205,55 @@ class SelectedConnectionStatusTests(unittest.TestCase):
             <= set(payload)
         )
         self.assertEqual(payload["connections"]["omp"]["state"], "disabled")
+
+    def test_disconnected_omp_reports_retained_shared_skill_as_residual(self):
+        codex = self.home / ".codex"
+        codex.mkdir()
+
+        def plan(client, root, connect):
+            return plan_connections(
+                ((client, root),),
+                launcher=self.launcher,
+                home=self.home,
+                environ={},
+                connect=connect,
+                require_storage=True,
+            )
+
+        self._apply(plan("codex", codex, True), "connect-codex")
+        shared_skill = self.home / ".agents/skills/didimlog/SKILL.md"
+        retained = b"user-retained shared skill\n"
+        shared_skill.write_bytes(retained)
+        self._apply(plan("codex", codex, False), "disconnect-codex")
+        self._apply(self._plan(True), "connect-omp")
+        self._apply(self._plan(False), "disconnect-omp")
+
+        snapshot = self._snapshot()
+        omp_tokens = {
+            status.token
+            for status in snapshot.client_statuses
+            if status.client == "omp"
+        }
+        self.assertEqual(omp_tokens, {"OMP_RESIDUAL_DISCOVERY"})
+        self.assertIn(
+            "OMP_RESIDUAL_DISCOVERY",
+            {problem.token for problem in snapshot.problems},
+        )
+        self.assertEqual(shared_skill.read_bytes(), retained)
+
+        with mock.patch(
+            "didimlog.claude.status._personal_check",
+            return_value="PERSONAL_INDEX_CURRENT",
+        ), mock.patch(
+            "didimlog.claude.status._discover_project",
+            return_value=(None, None),
+        ):
+            status = status_text(home=self.home, cwd=self.root)
+            doctor_exit, doctor = doctor_text(home=self.home, cwd=self.root)
+        self.assertIn("OMP 연결: 해제했지만 자동 발견 가능", status)
+        self.assertNotIn("OMP 연결: 해제됨", status)
+        self.assertNotEqual(doctor_exit, 0)
+        self.assertIn("무엇: OMP_RESIDUAL_DISCOVERY", doctor)
 
     def test_invalid_selection_state_is_unknown_and_never_healthy(self):
         state_path = self.home / "knowledge/.didimlog/connections.json"

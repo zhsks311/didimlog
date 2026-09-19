@@ -22,6 +22,7 @@ from didimlog.claude.connect import (
 from didimlog.claude.transaction import InstallJournal
 from didimlog.claude.paths import config_dir as claude_config_dir
 from didimlog.conditional_file import (
+    ConditionalWriteRecoveryError,
     read_optional_regular_file,
     write_regular_file_at_if_unchanged,
 )
@@ -513,10 +514,20 @@ def _discovery_targets(
     home: Path,
 ) -> tuple[tuple[Path, str], ...]:
     if client == "omp":
-        return (
+        targets = (
             (root / "extensions/didimlog.js", "file"),
             *tuple(
                 (root / "skills/didimlog" / name, "file")
+                for name in _SKILL_FILES
+            ),
+        )
+        shared_root = home / ".agents"
+        if root == shared_root:
+            return targets
+        return (
+            *targets,
+            *tuple(
+                (shared_root / "skills/didimlog" / name, "file")
                 for name in _SKILL_FILES
             ),
         )
@@ -1228,16 +1239,20 @@ def apply_connections(
             os.close(record.parent_descriptor)
         deleted.clear()
         return ()
-    except BaseException:
+    except BaseException as error:
         failed = _restore_deleted(deleted)
         if rollback_on_error:
             failed.extend(journal.rollback())
-        if failed:
+        if failed or isinstance(error, ConditionalWriteRecoveryError):
             raise DidimError(
                 "CONNECTION_ROLLBACK_INCOMPLETE",
                 exit_code=EXIT_POLICY,
+                help_text=(
+                    "연결 파일을 보존했지만 변경을 완전히 되돌렸는지 확인할 수 없습니다. "
+                    "didim doctor로 상태를 확인하세요."
+                ),
                 details=tuple("대상: " + name for name in sorted(set(failed))),
-            )
+            ) from error
         raise
 
 

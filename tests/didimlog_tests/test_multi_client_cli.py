@@ -1,5 +1,7 @@
 import contextlib
 import io
+import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -149,6 +151,61 @@ class MultiClientCliTests(unittest.TestCase):
             self.assertEqual(state_path.read_bytes(), concurrent)
             self.assertFalse((config / "CLAUDE.md").exists())
             self.assertFalse((config / "settings.json").exists())
+
+    def test_claude_connect_reports_incomplete_recovery_for_preserved_edit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            config = home / ".claude"
+            launcher = root / "bin/didim"
+            config.mkdir(parents=True)
+            launcher.parent.mkdir()
+            launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            launcher.chmod(0o755)
+            settings = config / "settings.json"
+            concurrent = b'{"independent":"user bytes"}\n'
+            real_fsync = os.fsync
+            injected = False
+
+            def edit_during_settings_parent_sync(descriptor):
+                nonlocal injected
+                if (
+                    not injected
+                    and settings.exists()
+                    and stat.S_ISDIR(os.fstat(descriptor).st_mode)
+                ):
+                    injected = True
+                    settings.write_bytes(concurrent)
+                    raise OSError("synthetic parent sync failure")
+                return real_fsync(descriptor)
+
+            with mock.patch.object(
+                Path,
+                "home",
+                return_value=home,
+            ), mock.patch(
+                "didimlog.cli._find_launcher",
+                return_value=launcher,
+            ), mock.patch(
+                "didimlog.conditional_file.os.fsync",
+                side_effect=edit_during_settings_parent_sync,
+            ):
+                code, _output, error = invoke_real(
+                    [
+                        "connect",
+                        "claude",
+                        "--yes",
+                        "--config-dir",
+                        str(config),
+                    ],
+                    tty=True,
+                )
+
+            self.assertTrue(injected)
+            self.assertEqual(code, 3)
+            self.assertEqual(error.splitlines()[0], "CONNECTION_ROLLBACK_INCOMPLETE")
+            self.assertIn("didim doctor", error)
+            self.assertEqual(settings.read_bytes(), concurrent)
 
     def test_real_dry_run_and_rejection_skip_automatic_update(self):
         plan = SimpleNamespace(changes=("planned",), notices=())

@@ -401,6 +401,7 @@ def _setup(args) -> int:
             "yes",
         }
         if not approved:
+            args._change_declined = True
             print("변경하지 않았습니다.")
             return 0
     final_notices = apply_setup(plan, approved=approved)
@@ -473,6 +474,10 @@ def _apply_claude_with_selection(
                     raise DidimError(
                         "CONNECTION_ROLLBACK_INCOMPLETE",
                         exit_code=EXIT_POLICY,
+                        help_text=(
+                            "연결 파일을 보존했지만 변경을 완전히 되돌렸는지 확인할 수 없습니다. "
+                            "didim doctor로 상태를 확인하세요."
+                        ),
                         details=tuple(
                             "대상: " + name
                             for name in sorted(set(failed))
@@ -511,6 +516,7 @@ def _connect_claude(args) -> int:
             "yes",
         }
         if not approved:
+            args._change_declined = True
             print("변경하지 않았습니다.")
             return 0
     connection_plan = _claude_selection_plan(
@@ -750,9 +756,7 @@ def _automatic_update_eligible(parsed, *, real_invocation: bool) -> bool:
         return False
     if parsed.command in ("gui", "hook"):
         return False
-    if parsed.command == "setup" and parsed.dry_run:
-        return False
-    if parsed.command in ("connect", "disconnect") and (
+    if parsed.command in ("setup", "connect", "disconnect") and (
         getattr(parsed, "dry_run", False)
         or getattr(parsed, "_change_declined", False)
     ):

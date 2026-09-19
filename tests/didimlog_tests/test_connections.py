@@ -210,6 +210,41 @@ class ConnectionTests(unittest.TestCase):
         self.assertIn("CODEX_RESIDUAL_DISCOVERY", {status.token for status in statuses})
         self.assertIn("CODEX_RESIDUAL_DISCOVERY", {problem[0] for problem in problems})
 
+    def test_connect_reports_incomplete_recovery_for_preserved_edit(self):
+        omp = self._root("recovery-omp")
+        plan = self._plan("omp", omp, connect=True)
+        extension = omp / "extensions/didimlog.js"
+        concurrent = b"independent user extension\n"
+        real_fsync = os.fsync
+        injected = False
+
+        def edit_during_extension_parent_sync(descriptor):
+            nonlocal injected
+            if (
+                not injected
+                and extension.exists()
+                and os.path.samestat(os.fstat(descriptor), extension.parent.stat())
+            ):
+                injected = True
+                extension.write_bytes(concurrent)
+                raise OSError("synthetic parent sync failure")
+            return real_fsync(descriptor)
+
+        with mock.patch.object(
+            connections_module.os,
+            "fsync",
+            side_effect=edit_during_extension_parent_sync,
+        ), self.assertRaises(DidimError) as caught:
+            self._apply(plan, "incomplete-connect")
+
+        self.assertTrue(injected)
+        self.assertEqual(
+            caught.exception.token,
+            "CONNECTION_ROLLBACK_INCOMPLETE",
+        )
+        self.assertIn("didim doctor", caught.exception.help_text)
+        self.assertEqual(extension.read_bytes(), concurrent)
+
     def test_apply_rejects_swapped_personal_root_without_writing_outside(self):
         omp = self._root("swapped-root")
         plan = self._plan("omp", omp, connect=True)

@@ -1,7 +1,12 @@
 import contextlib
+import errno
 import io
 import json
+import os
+import pty
+import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -10,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from didimlog import cli, update, version as didimlog_version
+from didimlog import cli, update
 
 
 class TerminalBuffer(io.StringIO):
@@ -312,6 +317,218 @@ class AutomaticUpdateNoticeTests(unittest.TestCase):
 
 
 class AutomaticCliIntegrationTests(unittest.TestCase):
+    @staticmethod
+    def _tree_bytes(root):
+        return {
+            path.relative_to(root).as_posix(): (
+                None if path.is_dir() else path.read_bytes()
+            )
+            for path in sorted(root.rglob("*"))
+        }
+
+    def run_real_tty(self, root, argv, *, stdin=b"", home_directories=()):
+        home = root / "home"
+        workspace = root / "workspace"
+        cache = root / "cache"
+        bin_directory = root / "bin"
+        home.mkdir()
+        workspace.mkdir()
+        bin_directory.mkdir()
+        for relative_directory in home_directories:
+            (home / relative_directory).mkdir(parents=True)
+        launcher = bin_directory / "didim"
+        launcher.write_bytes(b"#!/bin/sh\nexit 0\n")
+        launcher.chmod(0o755)
+        original_home = self._tree_bytes(home)
+
+        proxy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        proxy.bind(("127.0.0.1", 0))
+        proxy.listen()
+        proxy.setblocking(False)
+        proxy_port = proxy.getsockname()[1]
+
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "HOME": str(home),
+                "XDG_CACHE_HOME": str(cache),
+                "PATH": str(bin_directory)
+                + os.pathsep
+                + environment.get("PATH", ""),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "HTTPS_PROXY": "http://127.0.0.1:{}".format(proxy_port),
+                "https_proxy": "http://127.0.0.1:{}".format(proxy_port),
+                "http_proxy": "http://127.0.0.1:{}".format(proxy_port),
+                "no_proxy": "",
+                "HTTP_PROXY": "http://127.0.0.1:{}".format(proxy_port),
+                "NO_PROXY": "",
+            }
+        )
+        environment.pop("DIDIM_NO_UPDATE_CHECK", None)
+        source_root = Path(__file__).resolve().parents[2] / "src"
+        environment["PYTHONPATH"] = str(source_root) + os.pathsep + environment.get(
+            "PYTHONPATH", ""
+        )
+
+        master, slave = pty.openpty()
+        process = None
+        output = bytearray()
+        try:
+            process = subprocess.Popen(
+                [sys.executable, "-m", "didimlog.cli", *argv],
+                cwd=workspace,
+                env=environment,
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                close_fds=True,
+            )
+            os.close(slave)
+            slave = -1
+            os.set_blocking(master, False)
+            if stdin:
+                os.write(master, stdin)
+            deadline = time.monotonic() + 15
+            while process.poll() is None:
+                try:
+                    output.extend(os.read(master, 64 * 1024))
+                except BlockingIOError:
+                    pass
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+                if time.monotonic() >= deadline:
+                    process.kill()
+                    process.wait()
+                    self.fail("real TTY CLI process timed out")
+                time.sleep(0.01)
+            os.set_blocking(master, True)
+            while True:
+                try:
+                    chunk = os.read(master, 64 * 1024)
+                except BlockingIOError:
+                    break
+                except OSError as error:
+                    if error.errno == errno.EIO:
+                        break
+                    raise
+                if not chunk:
+                    break
+                output.extend(chunk)
+
+            try:
+                connection, _ = proxy.accept()
+            except BlockingIOError:
+                update_requested = False
+            else:
+                update_requested = True
+                connection.close()
+            return (
+                process.returncode,
+                output.decode("utf-8", errors="replace"),
+                home,
+                cache,
+                update_requested,
+                original_home,
+            )
+        finally:
+            if slave >= 0:
+                os.close(slave)
+            os.close(master)
+            proxy.close()
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
+
+    def test_declined_setup_variants_and_claude_connect_leave_no_writes_or_update_request(
+        self,
+    ):
+        scenarios = (
+            (
+                "default Claude setup",
+                ["setup", "--project-knowledge", "local"],
+                (".claude",),
+            ),
+            (
+                "setup without Claude",
+                ["setup", "--skip-claude", "--project-knowledge", "local"],
+                (),
+            ),
+            (
+                "explicit client setup",
+                [
+                    "setup",
+                    "--client",
+                    "omp",
+                    "--omp-agent-dir",
+                    "{home}/.omp/agent",
+                    "--project-knowledge",
+                    "local",
+                ],
+                (".omp/agent",),
+            ),
+            (
+                "Claude connect",
+                ["connect", "claude", "--config-dir", "{home}/.claude"],
+                (".claude",),
+            ),
+        )
+        for name, unformatted_argv, home_directories in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                expected_home = root / "home"
+                argv = [
+                    argument.format(home=expected_home)
+                    for argument in unformatted_argv
+                ]
+                (
+                    code,
+                    output,
+                    home,
+                    cache,
+                    update_requested,
+                    original_home,
+                ) = self.run_real_tty(
+                    root,
+                    argv,
+                    stdin=b"n\n",
+                    home_directories=home_directories,
+                )
+
+                self.assertEqual(code, 0, output)
+                self.assertIn("변경하지 않았습니다.", output)
+                self.assertEqual(self._tree_bytes(root / "workspace"), {})
+                self.assertEqual(self._tree_bytes(home), original_home)
+                self.assertFalse(cache.exists())
+                self.assertFalse(update_requested)
+
+    def test_real_tty_setup_dry_run_leaves_no_writes_or_update_request(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (
+                code,
+                output,
+                home,
+                cache,
+                update_requested,
+                original_home,
+            ) = self.run_real_tty(
+                root,
+                [
+                    "setup",
+                    "--dry-run",
+                    "--skip-claude",
+                    "--project-knowledge",
+                    "local",
+                ],
+            )
+
+            self.assertEqual(code, 0, output)
+            self.assertEqual(self._tree_bytes(root / "workspace"), {})
+            self.assertEqual(self._tree_bytes(home), original_home)
+            self.assertFalse(cache.exists())
+            self.assertFalse(update_requested)
+
     def invoke_process(self, argv, *, tty=True, handler_result=0):
         stdout = TerminalBuffer(tty=False)
         stderr = TerminalBuffer(tty=tty)
@@ -324,26 +541,34 @@ class AutomaticCliIntegrationTests(unittest.TestCase):
             code = cli.main()
         return code, stdout.getvalue(), stderr.getvalue(), notice
 
-    def test_successful_real_tty_command_checks_after_handler(self):
-        stderr = TerminalBuffer(tty=True)
-        stdout = TerminalBuffer(tty=False)
 
-        def write_notice(installed, *, stderr):
-            stderr.write("notice\n")
+    def test_approved_real_tty_setup_remains_update_eligible(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (
+                code,
+                output,
+                home,
+                cache,
+                update_requested,
+                original_home,
+            ) = self.run_real_tty(
+                root,
+                [
+                    "setup",
+                    "--yes",
+                    "--skip-claude",
+                    "--project-knowledge",
+                    "local",
+                ],
+            )
 
-        with mock.patch.object(sys, "argv", ["didim", "status"]), mock.patch(
-            "didimlog.cli._status",
-            side_effect=lambda args: print("status") or 0,
-        ), mock.patch(
-            "didimlog.cli.automatic_update_notice",
-            side_effect=write_notice,
-        ) as notice, contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            code = cli.main()
-
-        self.assertEqual(code, 0)
-        self.assertEqual(stdout.getvalue(), "status\n")
-        self.assertEqual(stderr.getvalue(), "notice\n")
-        notice.assert_called_once_with(didimlog_version(), stderr=stderr)
+            self.assertEqual(code, 0, output)
+            self.assertIn("Didimlog 준비를 마쳤습니다.", output)
+            self.assertNotEqual(self._tree_bytes(home), original_home)
+            self.assertTrue((home / "knowledge/MY-RULES.md").is_file())
+            self.assertTrue(cache.is_dir())
+            self.assertTrue(update_requested)
 
     def test_unexpected_checker_failure_preserves_successful_command(self):
         stdout = TerminalBuffer(tty=False)

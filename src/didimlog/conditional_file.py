@@ -17,6 +17,10 @@ from didimlog.file_io import (
 from didimlog.locking import acquire_directory_lock
 
 
+class ConditionalWriteRecoveryError(ValueError):
+    """A published file could not be safely recovered after write failure."""
+
+
 def _target_path(path: Path) -> Path:
     try:
         target = Path(path)
@@ -168,6 +172,7 @@ def write_regular_file_at_if_unchanged(
     lock_descriptor: int | None = None
     temporary_name: str | None = None
     ownership_descriptor: int | None = None
+    publication_revision: tuple[int, ...] | None = None
     published = False
     try:
         lock_descriptor = acquire_directory_lock(parent_descriptor)
@@ -191,6 +196,7 @@ def write_regular_file_at_if_unchanged(
             published = True
             os.unlink(temporary_name, dir_fd=parent_descriptor)
             temporary_name = None
+            publication_revision = _revision(os.fstat(ownership_descriptor))
             os.fsync(parent_descriptor)
             published = False
             result = ownership_descriptor
@@ -216,18 +222,30 @@ def write_regular_file_at_if_unchanged(
     except ValueError:
         raise
     except (OSError, UnsafePathError):
-        if published and ownership_descriptor is not None:
+        recovery_complete = False
+        if (
+            published
+            and ownership_descriptor is not None
+            and publication_revision is not None
+        ):
             try:
-                current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+                current = _read_target(parent_descriptor, name, len(intended))
                 owned = os.fstat(ownership_descriptor)
                 if (
-                    current.st_dev == owned.st_dev
-                    and current.st_ino == owned.st_ino
+                    current is not None
+                    and current[0] == intended
+                    and _revision(current[1]) == publication_revision
+                    and _revision(owned) == publication_revision
                 ):
                     os.unlink(name, dir_fd=parent_descriptor)
                     os.fsync(parent_descriptor)
-            except OSError:
+                    recovery_complete = True
+            except (OSError, ValueError):
                 pass
+        if published and not recovery_complete:
+            raise ConditionalWriteRecoveryError(
+                "target could not be written atomically"
+            ) from None
         raise ValueError("target could not be written atomically") from None
     finally:
         if temporary_name is not None:
