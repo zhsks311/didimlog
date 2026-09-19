@@ -7,7 +7,9 @@ from unittest import mock
 
 from didimlog import conditional_file
 from didimlog.conditional_file import (
+    ConditionalWriteRecoveryError,
     read_optional_regular_file,
+    write_regular_file_at_if_unchanged,
     write_regular_file_if_unchanged,
 )
 
@@ -257,6 +259,89 @@ class ConditionalWriteTests(unittest.TestCase):
                 [entry.name for entry in target.parent.iterdir()],
                 ["target"],
             )
+
+    def test_owned_create_cleanup_preserves_concurrent_in_place_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "target"
+            intended = b"managed bytes\n"
+            concurrent = b"independent user bytes\n"
+            parent_descriptor = os.open(
+                root,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            real_fsync = os.fsync
+            injected = False
+
+            def edit_during_parent_sync(descriptor):
+                nonlocal injected
+                if descriptor == parent_descriptor and not injected:
+                    injected = True
+                    target.write_bytes(concurrent)
+                    raise OSError("synthetic parent sync failure")
+                return real_fsync(descriptor)
+
+            try:
+                with (
+                    mock.patch.object(
+                        conditional_file.os,
+                        "fsync",
+                        side_effect=edit_during_parent_sync,
+                    ),
+                    self.assertRaises(ConditionalWriteRecoveryError),
+                ):
+                    write_regular_file_at_if_unchanged(
+                        parent_descriptor,
+                        target.name,
+                        None,
+                        intended,
+                    )
+            finally:
+                os.close(parent_descriptor)
+
+            self.assertEqual(target.read_bytes(), concurrent)
+
+    def test_owned_create_cleanup_removes_unchanged_publication(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "target"
+            parent_descriptor = os.open(
+                root,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            real_fsync = os.fsync
+            failed = False
+
+            def fail_first_parent_sync(descriptor):
+                nonlocal failed
+                if descriptor == parent_descriptor and not failed:
+                    failed = True
+                    raise OSError("synthetic parent sync failure")
+                return real_fsync(descriptor)
+
+            try:
+                with (
+                    mock.patch.object(
+                        conditional_file.os,
+                        "fsync",
+                        side_effect=fail_first_parent_sync,
+                    ),
+                    self.assertRaises(ValueError) as raised,
+                ):
+                    write_regular_file_at_if_unchanged(
+                        parent_descriptor,
+                        target.name,
+                        None,
+                        b"managed bytes\n",
+                    )
+            finally:
+                os.close(parent_descriptor)
+
+            self.assertNotIsInstance(
+                raised.exception,
+                ConditionalWriteRecoveryError,
+            )
+            self.assertFalse(target.exists())
 
     def test_temporary_unlink_failure_preserves_created_target_and_closes_fd(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

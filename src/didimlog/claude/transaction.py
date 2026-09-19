@@ -14,7 +14,6 @@ from didimlog.file_io import (
     read_regular_file_at_with_stat,
     replace_regular_file_at_if_unchanged,
 )
-import stat
 
 
 _ABSENT = "ABSENT"
@@ -55,12 +54,27 @@ class InstallJournal:
         }
         self._save()
 
-    def record_installed(self, name: str, data: bytes) -> None:
+    def record_installed(
+        self,
+        name: str,
+        data: bytes,
+        *,
+        parent_descriptor: int | None = None,
+    ) -> None:
         target = self._targets()[name]
         path = Path(target["path"])
         target["installed"] = _digest(data)
         target["installed_size"] = len(data)
-        target["installed_parent"] = self._parent_identity(path)
+        if parent_descriptor is None:
+            target["installed_parent"] = self._parent_identity(path)
+        else:
+            info = os.fstat(parent_descriptor)
+            if not stat.S_ISDIR(info.st_mode):
+                raise ValueError("installed parent is not a directory")
+            target["installed_parent"] = {
+                "device": info.st_dev,
+                "inode": info.st_ino,
+            }
         target["phase"] = "installed"
         self._save()
 
@@ -78,12 +92,18 @@ class InstallJournal:
             return "installed" if installed == target["installed"] else "concurrent"
         return "concurrent"
 
-    def rollback(self) -> None:
+    def rollback(self) -> tuple[str, ...]:
+        failed: list[str] = []
         for name in reversed(tuple(self._targets())):
             try:
-                self._rollback_target(name)
+                target = self._targets()[name]
+                if target.get("phase") != "installed":
+                    continue
+                if not self._rollback_target(name):
+                    failed.append(name)
             except (OSError, KeyError, ValueError):
-                continue
+                failed.append(name)
+        return tuple(failed)
 
     def _rollback_target(self, name: str) -> bool:
         target = self._targets()[name]

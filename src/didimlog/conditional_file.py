@@ -12,8 +12,13 @@ from didimlog.file_io import (
     open_directory_path,
     read_regular_file_at_with_stat,
     replace_regular_file_at_if_unchanged,
+    replace_regular_file_at_if_unchanged_with_ownership,
 )
 from didimlog.locking import acquire_directory_lock
+
+
+class ConditionalWriteRecoveryError(ValueError):
+    """A published file could not be safely recovered after write failure."""
 
 
 def _target_path(path: Path) -> Path:
@@ -142,6 +147,116 @@ def _write_all_and_sync(descriptor: int, content: bytes) -> None:
             raise OSError("short write")
         remaining = remaining[written:]
     os.fsync(descriptor)
+
+
+def write_regular_file_at_if_unchanged(
+    parent_descriptor: int,
+    name: str,
+    original: bytes | None,
+    intended: bytes,
+) -> int | None:
+    """Publish through a pinned parent and return an fd proving ownership."""
+    if (
+        not isinstance(name, str)
+        or name in ("", ".", "..")
+        or "/" in name
+        or "\\" in name
+        or "\x00" in name
+    ):
+        raise ValueError("target name is invalid")
+    if original is not None and not isinstance(original, bytes):
+        raise ValueError("original content must be bytes or None")
+    if not isinstance(intended, bytes):
+        raise ValueError("intended content must be bytes")
+
+    lock_descriptor: int | None = None
+    temporary_name: str | None = None
+    ownership_descriptor: int | None = None
+    publication_revision: tuple[int, ...] | None = None
+    published = False
+    try:
+        lock_descriptor = acquire_directory_lock(parent_descriptor)
+        maximum_bytes = 0 if original is None else len(original)
+        current = _read_target(parent_descriptor, name, maximum_bytes)
+        if original is None:
+            if current is not None:
+                raise ValueError("target was created after planning")
+            temporary_name, ownership_descriptor = _temporary_file(
+                parent_descriptor,
+                0o600,
+            )
+            _write_all_and_sync(ownership_descriptor, intended)
+            os.link(
+                temporary_name,
+                name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            published = True
+            os.unlink(temporary_name, dir_fd=parent_descriptor)
+            temporary_name = None
+            publication_revision = _revision(os.fstat(ownership_descriptor))
+            os.fsync(parent_descriptor)
+            published = False
+            result = ownership_descriptor
+            ownership_descriptor = None
+            return result
+
+        if current is None or current[0] != original:
+            raise ValueError("target changed after planning")
+        if intended == original:
+            return None
+        publication = replace_regular_file_at_if_unchanged_with_ownership(
+            parent_descriptor,
+            name,
+            original,
+            intended,
+            stat.S_IMODE(current[1].st_mode),
+            expected_info=current[1],
+        )
+        if publication is None:
+            raise ValueError("target changed before write")
+        _published_info, result = publication
+        return result
+    except ValueError:
+        raise
+    except (OSError, UnsafePathError):
+        recovery_complete = False
+        if (
+            published
+            and ownership_descriptor is not None
+            and publication_revision is not None
+        ):
+            try:
+                current = _read_target(parent_descriptor, name, len(intended))
+                owned = os.fstat(ownership_descriptor)
+                if (
+                    current is not None
+                    and current[0] == intended
+                    and _revision(current[1]) == publication_revision
+                    and _revision(owned) == publication_revision
+                ):
+                    os.unlink(name, dir_fd=parent_descriptor)
+                    os.fsync(parent_descriptor)
+                    recovery_complete = True
+            except (OSError, ValueError):
+                pass
+        if published and not recovery_complete:
+            raise ConditionalWriteRecoveryError(
+                "target could not be written atomically"
+            ) from None
+        raise ValueError("target could not be written atomically") from None
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
+            except OSError:
+                pass
+        if ownership_descriptor is not None:
+            os.close(ownership_descriptor)
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
 
 
 def read_optional_regular_file(

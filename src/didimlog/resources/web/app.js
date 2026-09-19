@@ -180,6 +180,9 @@ function renderHealth(health) {
     tokenSurface("프로젝트 근거 index", health.project.index),
     tokenSurface("Claude 연결", health.claude),
   );
+  for (const [client, surface] of Object.entries(health.connections || {})) {
+    content.append(tokenSurface(`${client.toUpperCase()} 연결`, surface));
+  }
   const projectName = health.project.name || "현재 프로젝트 없음";
   content.prepend(
     element("div", { className: "health-surface" }, [
@@ -203,7 +206,14 @@ function renderHealth(health) {
   const indicesCurrent = health.personal_index.current && (
     health.project.index.current || health.project.index.state === "unconfigured"
   );
-  const allHealthy = indicesCurrent && health.claude.state !== "problem";
+  const selectedConnections = [
+    health.claude,
+    ...Object.values(health.connections || {}),
+  ];
+  const connectionProblem = selectedConnections.find(
+    (surface) => !["current", "disabled", "unselected"].includes(surface.state),
+  );
+  const allHealthy = indicesCurrent && !connectionProblem && health.issues.length === 0;
   const button = document.querySelector("#health-button");
   button.classList.toggle("is-current", allHealthy);
   button.classList.toggle("is-warning", !allHealthy);
@@ -216,7 +226,11 @@ function renderHealth(health) {
             ? health.project.index.token
             : health.personal_index.token
         )
-        : health.claude.token
+        : (
+          connectionProblem?.token
+          || health.issues[0]?.token
+          || "STATUS_UNKNOWN"
+        )
     );
 }
 

@@ -12,10 +12,14 @@ import secrets
 import stat
 from collections.abc import Mapping
 
+from didimlog import conditional_file as conditional_file_module
 from didimlog.conditional_file import (
+    ConditionalWriteRecoveryError,
     read_optional_regular_file,
     write_regular_file_if_unchanged,
+    write_regular_file_at_if_unchanged,
 )
+from didimlog.errors import DidimError, EXIT_POLICY
 from didimlog.file_io import (
     UnsafePathError,
     open_directory_path,
@@ -231,22 +235,65 @@ def _apply_writes(plan: ClaudeChangePlan, journal: InstallJournal) -> None:
             change.original,
             backup,
         )
-        write_regular_file_if_unchanged(
-            change.path,
-            change.original,
-            change.intended,
-        )
-        journal.record_installed(change.name, change.intended)
+        target = conditional_file_module._target_path(change.path)
+        parent_descriptor = conditional_file_module._open_parent(target)
+        ownership: int | None = None
+        try:
+            conditional_file_module._verify_parent(target, parent_descriptor)
+            ownership = write_regular_file_at_if_unchanged(
+                parent_descriptor,
+                target.name,
+                change.original,
+                change.intended,
+            )
+            if ownership is None:
+                raise ValueError("Claude connect change was not published")
+            try:
+                conditional_file_module._verify_parent(target, parent_descriptor)
+            except BaseException:
+                if ownership is not None:
+                    journal.record_installed(
+                        change.name,
+                        change.intended,
+                        parent_descriptor=parent_descriptor,
+                    )
+                raise
+            journal.record_installed(
+                change.name,
+                change.intended,
+                parent_descriptor=parent_descriptor,
+            )
+        finally:
+            if ownership is not None:
+                os.close(ownership)
+            os.close(parent_descriptor)
 
 
-def apply_connect(plan: ClaudeChangePlan, journal: InstallJournal) -> None:
+def apply_connect(
+    plan: ClaudeChangePlan,
+    journal: InstallJournal,
+    *,
+    rollback_on_error: bool = True,
+) -> None:
     """Apply an approved connect plan and rollback only unchanged owned bytes."""
     if not isinstance(plan, ClaudeChangePlan):
         raise ValueError("invalid Claude connect plan")
     try:
         _apply_writes(plan, journal)
-    except BaseException:
-        journal.rollback()
+    except BaseException as error:
+        failed = journal.rollback() if rollback_on_error else ()
+        if failed or isinstance(error, ConditionalWriteRecoveryError):
+            raise DidimError(
+                "CONNECTION_ROLLBACK_INCOMPLETE",
+                exit_code=EXIT_POLICY,
+                help_text=(
+                    "연결 파일을 보존했지만 변경을 완전히 되돌렸는지 확인할 수 없습니다. "
+                    "didim doctor로 상태를 확인하세요."
+                ),
+                details=tuple(
+                    "대상: " + name for name in sorted(set(failed))
+                ),
+            ) from error
         raise
 
 
@@ -378,6 +425,83 @@ def plan_disconnect(
             changes.append("관리 지침 제거: {}".format(path))
 
     return ClaudeChangePlan(selected, tuple(changes), tuple(file_changes))
+
+
+def managed_connection_present(
+    explicit=None,
+    *,
+    environ: Mapping[str, str] | None = None,
+    home: Path | None = None,
+) -> bool | None:
+    """Return True for managed wiring, False for absence, or None when unreadable."""
+    try:
+        selected, selected_home = _selected_config(
+            explicit,
+            environ=environ,
+            home=home,
+        )
+    except ValueError:
+        environment = os.environ if environ is None else environ
+        try:
+            selected_home = Path.home() if home is None else Path(home)
+            configured = environment.get("CLAUDE_CONFIG_DIR")
+            candidate = Path(configured) if configured else selected_home / ".claude"
+            candidate.expanduser().lstat()
+        except FileNotFoundError:
+            return False
+        except (OSError, RuntimeError, TypeError):
+            return None
+        return None
+
+    unknown = False
+    try:
+        resource_directory_exists = _resource_directory_exists(selected)
+    except (OSError, ValueError):
+        resource_directory_exists = False
+        unknown = True
+    if resource_directory_exists:
+        for name, _packaged in _packaged_resources():
+            try:
+                path = _target(selected, "didimlog/" + name, selected_home)
+                path.lstat()
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError):
+                unknown = True
+                continue
+            return True
+
+    try:
+        claude_path = _target(selected, "CLAUDE.md", selected_home)
+        claude_original = read_optional_regular_file(
+            claude_path,
+            _MANAGED_FILE_MAXIMUM_BYTES,
+        )
+    except (OSError, ValueError):
+        claude_original = None
+        unknown = True
+    if claude_original is not None and (
+        config_module._START_PREFIX in claude_original
+        or config_module._END_PREFIX in claude_original
+    ):
+        return True
+
+    try:
+        settings_path = _target(selected, "settings.json", selected_home)
+        settings_original = read_optional_regular_file(
+            settings_path,
+            _MANAGED_FILE_MAXIMUM_BYTES,
+        )
+    except (OSError, ValueError):
+        settings_original = None
+        unknown = True
+    if settings_original is not None:
+        try:
+            if _remove_managed_hooks(settings_original) != settings_original:
+                return True
+        except ValueError:
+            unknown = True
+    return None if unknown else False
 
 
 def _delete_unchanged(change: _FileChange) -> None:

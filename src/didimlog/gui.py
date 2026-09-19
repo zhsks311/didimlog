@@ -93,6 +93,12 @@ def _state(token: str) -> str:
         return "problem"
     if token.endswith("_NOT_CONFIGURED"):
         return "unconfigured"
+    if token.endswith("_DISABLED"):
+        return "disabled"
+    if token.endswith("_UNSELECTED"):
+        return "unselected"
+    if token.endswith("_RESIDUAL_DISCOVERY"):
+        return "problem"
     return "unknown"
 
 
@@ -102,6 +108,28 @@ def _personal_index_payload(token: str) -> dict[str, object]:
         "state": _state(token),
         "current": token == "PERSONAL_INDEX_CURRENT",
     }
+
+
+def _connection_payloads(snapshot: StatusSnapshot) -> dict[str, dict[str, str]]:
+    payloads = {}
+    for client in ("omp", "codex"):
+        tokens = {
+            status.token
+            for status in snapshot.client_statuses
+            if status.client == client
+        }
+        if not tokens:
+            continue
+        if any(token.endswith("_CONNECTION_BROKEN") for token in tokens):
+            token = f"{client.upper()}_CONNECTION_BROKEN"
+        elif any(token.endswith("_RESIDUAL_DISCOVERY") for token in tokens):
+            token = f"{client.upper()}_RESIDUAL_DISCOVERY"
+        elif all(token.endswith("_DISABLED") for token in tokens):
+            token = f"{client.upper()}_DISABLED"
+        else:
+            token = f"{client.upper()}_INSTALLED_UNVERIFIED"
+        payloads[client] = {"token": token, "state": _state(token)}
+    return payloads
 
 
 def _health_payload(snapshot: StatusSnapshot) -> dict[str, object]:
@@ -120,6 +148,7 @@ def _health_payload(snapshot: StatusSnapshot) -> dict[str, object]:
             "token": snapshot.claude_token,
             "state": _state(snapshot.claude_token),
         },
+        "connections": _connection_payloads(snapshot),
         "issues": [asdict(problem) for problem in snapshot.problems],
         "read_only": True,
     }
